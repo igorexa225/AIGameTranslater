@@ -245,7 +245,7 @@
 - дуо (чего нет, то как соло)
 <img width="932" height="884" alt="image" src="https://github.com/user-attachments/assets/c88b3ff5-ddcf-412f-9c8d-c1a37538cc9f" />
 
-### И нагрзука до и после
+### И нагрузка до и после
 - до
 <img width="1155" height="699" alt="Снимок экрана 2025-11-10 191704" src="https://github.com/user-attachments/assets/f7344b7d-bb10-4ce9-b233-1d08d5ae5574" />
 
