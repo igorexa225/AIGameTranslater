@@ -28,6 +28,7 @@ class LLMConfig:
 
     # лор
     lore_path: str = "assets/game_bible_exilium.txt"
+    phrasebook_path: str | None = None
     max_ctx_chars: int = 30000
 
     # прогрев
@@ -64,27 +65,49 @@ def _build_system_prompt(lore_text: str) -> str:
     return (
         "You are a professional game localizer.\n"
         "HARD RULES:\n"
-        "- Translate into Russian, except for words that are not translated (see the game_bible file).\n"
-        "- Don't change the meaning, do not invent characters,\n"
-        "- Use the hints in the game_bible file.\n"
-        "- Adapt the text for literary reading,\n"
-        "- Refer to the rules of the Russian language for translation, \n"
-        "  factions or items. Do not replace common nouns with lore entities.\n"
-        "- Use LORE to resolve proper names, titles, and the SPEAKER'S GENDER.\n"
-        "- If a female speaker is known from LORE or the name in the line, use feminine forms in Russian.\n"
+        "OUTPUT\n"
+        "- Russian only (Cyrillic). No English, no comments.\n"
         "- Keep the SAME number of sentences and line breaks as in the source.\n"
-        "- Use the glossary exactly when a source token matches its key.\n"
-        "- Use the current frame and the previous frame to ensure the most accurate translation in the context of the dialogue.\n"
-        "- If the exact same source text appears repeatedly, reuse the same Russian translation verbatim.\n"
-        "- When translating a dialogue, take into account who is speaking using the lore. If a female character is speaking, change the endings of the words to the appropriate ones.\n"
-        "- For personal names from the lore adapt gender/case (e.g. “Mayling wrote” → “Мейлинг написала”).\n"
-        "- Read ONLY text from Image.\n"
-        "- If the text is not complete, translate it anyway.\n"
-        "- Output translation ONLY (no source, no comments).\n"
-        "- If you receive an image with the same text, DON'T translate it.\n"
-        "- If the text for translation is not visible, display the word ((ЗАТУП...)).\n"
+        "- Do not add quotation marks unless they exist in the source.\n"
+        "SCOPE & FIDELITY\n"
+        "- Translate ONLY the visible text from the image; do not invent missing content.\n"
+        "- Preserve meaning and tone. Write NATURAL, IDIOMATIC Russian: allow rewording, change word order, and choose Russian collocations if it improves readability without adding information.\n"
+        "- Keep placeholders/tags exactly as is.\n"
+        "LORE & NAMES\n"
+        "- Use LORE as the single source of truth for names, titles, factions, and terms.\n"
+        "- Keep canonical forms from LORE; decline personal names correctly in Russian.\n"
+        "- Determine the SPEAKER’S GENDER from LORE or the name and use correct feminine/masculine forms.\n"
+        "CONSISTENCY\n"
+        "- If the exact same English text repeats, return EXACTLY the same Russian translation as before.\n"
+        "- If only minor changes between current and previous frames, keep terminology and style consistent.\n"
+        "CLASSIFY & STYLE (do not print labels)\n"
+        "1) Decide internally: DIALOGUE vs VOICEOVER.\n"
+        "   DIALOGUE — name/nameplate nearby (top/left), speaker portrait, bubble tail, name label, “Name: …”, alternating lines.\n"
+        "   VOICEOVER — centered line with no name, system/narration (“Mission updated”, “Victory”), HUD messages, no visible speaker.\n"
+        "   If unsure: name/faction present ⇒ DIALOGUE; bare prompt/stage remark ⇒ VOICEOVER.\n"
+        "2) Apply style:\n"
+        "   - DIALOGUE: natural conversational Russian; respect speaker’s gender; keep sentence/line count.\n"
+        "   - VOICEOVER: neutral narrative/system style, concise, without adding quotation marks.\n"
+        "RUSSIAN STYLE RULES\n"
+        "- Prefer fluent Russian over word-for-word calques.\n"
+        "- Convert awkward English passives to natural Russian actives where appropriate.\n"
+        "- Follow Russian punctuation and capitalization..\n"
+        "PHRASEOLOGY POLICY\n"
+        "- Write NATURAL, IDIOMATIC Russian; never do word-for-word calques if there is a common Russian phrasing.\n"
+        "- Keep meaning and the number of sentences/line breaks.\n"
+        "- Prefer Russian actives to clumsy English passives when appropriate\n"
+        "- Never drop content. If a phrase is unknown, translate plainly and neutrally.\n"
+        "PHRASEBOOK (apply conservatively)\n"
+        "- Apply the following mappings only on exact matches in the source (case-insensitive, whole words/phrases), not inside names/tags.\n"
+        "- If multiple Russian options are given, choose the most neutral for the context.\n"
+        "ROBUSTNESS\n"
+        "- If the text is truncated/partial, translate the visible part anyway.\n"
+        "- If no readable text is present, output exactly: (ЗАТУП...)\n"
         "Context (optional):\n"
         "Use game lore as authoritative canon for names/factions/terms.\n\n"
+        "=== PHRASEBOOK START ===\n"
+        "{{PHRASEBOOK}}\n"
+        "=== PHRASEBOOK END ===\n"
         "=== LORE START ===\n"
         f"{(lore_text or '(empty)')[:30000]}\n"
         "=== LORE END ==="
@@ -102,21 +125,23 @@ def init_lore_once(cfg: LLMConfig) -> bool:
             text = _read_file(cfg.lore_path).strip()
             _LORE_TEXT = (text or "")[:cfg.max_ctx_chars]
 
+            # NEW: читаем phrasebook (если указан)
+            pb_text = _read_file(getattr(cfg, "phrasebook_path", "")).strip() if getattr(cfg, "phrasebook_path", None) else ""
+
             if cfg.system_override:
                 sys_override = cfg.system_override
-                if "{{LORE}}" in sys_override:
-                    sys_prompt = sys_override.replace("{{LORE}}", _LORE_TEXT)
-                    print("[LLM] system: override + LORE injected")
-                else:
-                    sys_prompt = sys_override
-                    print("[LLM] system: override (no lore)")
+                # подстановка и LORE, и PHRASEBOOK
+                sys_prompt = sys_override.replace("{{LORE}}", _LORE_TEXT).replace("{{PHRASEBOOK}}", pb_text)
+                print("[LLM] system: override + injected LORE/PHRASEBOOK")
             else:
                 sys_prompt = _build_system_prompt(_LORE_TEXT)
-                print("[LLM] system: default builder with lore")
+                # подставляем PHRASEBOOK в билдер
+                sys_prompt = sys_prompt.replace("{{PHRASEBOOK}}", pb_text)
+                print("[LLM] system: default builder with lore + phrasebook")
 
             _SYSTEM_PROMPT = sys_prompt
             _LORE_INIT = True
-            print(f"[LLM] lore loaded once: {len(_LORE_TEXT)} chars from {cfg.lore_path or '(none)'}")
+            print(f"[LLM] lore loaded once: {len(_LORE_TEXT)} chars from {cfg.lore_path or '(none)'}; phrasebook: {len(pb_text)} chars")
             return True
     except Exception as e:
         print("[LLM] lore init error:", e)
@@ -126,11 +151,10 @@ def init_lore_once(cfg: LLMConfig) -> bool:
         return False
 
 def get_system_preview(cfg: LLMConfig) -> str:
-    """Возвращает текст активного system-prompt (с учётом override и текущего лора)."""
     lore_text = (_read_file(cfg.lore_path) or "")[: cfg.max_ctx_chars]
-    if cfg.system_override:
-        return cfg.system_override.replace("{{LORE}}", lore_text)
-    return _build_system_prompt(lore_text)
+    pb_text = _read_file(getattr(cfg, "phrasebook_path", "")).strip() if getattr(cfg, "phrasebook_path", None) else ""
+    base = (cfg.system_override or _build_system_prompt(lore_text))
+    return base.replace("{{LORE}}", lore_text).replace("{{PHRASEBOOK}}", pb_text)
 
 
 # ===================== Прогрев кэша =======================

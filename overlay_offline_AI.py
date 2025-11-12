@@ -2,18 +2,19 @@
 # Требует: PySide6, pywin32, numpy, opencv-python, requests
 # Запуск: python overlay_offline_AI.py
 
-import sys, os, time, re, subprocess, base64, difflib, ctypes, json
+import sys, os, time, re, subprocess, base64, difflib, ctypes, json, requests
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 import numpy as np
 import cv2
+from difflib import SequenceMatcher
 
 from PySide6.QtCore import (Qt, QRect, QPoint, QTimer, QEvent, QThread, Signal, QAbstractNativeEventFilter)
 from PySide6.QtGui  import (QPainter, QColor, QPen, QFont, QKeySequence, QShortcut, QGuiApplication, QImage)
 from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QDialog,
     QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox,
-    QFontComboBox, QFileDialog, QPlainTextEdit, QHBoxLayout, QVBoxLayout, QFormLayout, QGroupBox)
+    QFontComboBox, QFileDialog, QPlainTextEdit, QHBoxLayout, QVBoxLayout, QFormLayout, QGroupBox, QScrollArea, QTreeWidget, QTreeWidgetItem, QProgressBar, QHeaderView)
 
 import win32con, win32gui, win32ui, win32api, win32process
 import ctypes.wintypes as wt
@@ -22,15 +23,13 @@ import ctypes.wintypes as wt
 
 # захват/обновление
 MAX_OCR_FPS       = 1.0        # 0.5–2.0 кадров/сек
-STALE_RECHECK_SEC = 2.1
-STABILITY_HITS    = 1
-MIN_CHAR_DIFF_FOR_UPDATE = 0
 THUMB_SIZE        = (64, 24)
-MIN_THUMB_DELTA   = 0.010
 
 # UI/поведение
 RENDER_MODE       = "smooth"   # "smooth" | "instant"
 HANDLE            = 15
+BORDER_WIDTH      = 4
+SPLIT_BORDER_WIDTH = 4
 REQUIRE_BOUND_WINDOW = True
 
 # Пути
@@ -71,6 +70,18 @@ SERVER_EXE = _pick_server_exe()
 # Адаптер LLM
 from llm_adapter import LLMConfig, preload_prompt_cache, vision_translate_from_images, reset_lore_cache, get_system_preview, init_lore_once
 
+try:
+    from llm_adapter_dual import (
+        LLMConfig as LLMConfigDual,
+        extract_en_from_image,
+        translate_en_to_ru_text,
+        preload_prompt_cache_ocr,
+        preload_prompt_cache_tr,
+        reset_tr_system_cache,
+    )
+except Exception:
+    LLMConfigDual = None
+
 llm_cfg = LLMConfig(
     enabled=True,
     server="http://127.0.0.1:8080",
@@ -79,7 +90,6 @@ llm_cfg = LLMConfig(
     slot_id=0, use_prompt_cache=True,
     lore_path=str(BASE_DIR / "assets" / "game_bible_exilium.txt"), max_ctx_chars=30000,
 )
-
 # ====================== Утилиты/канон ====================
 
 _WS_RX   = re.compile(r"\s+")
@@ -111,11 +121,6 @@ def _thumb(gray: np.ndarray) -> np.ndarray:
     th = cv2.resize(gray, THUMB_SIZE, interpolation=cv2.INTER_AREA)
     return th.astype(np.float32)/255.0
 
-def _thumb_delta(a: np.ndarray, b: np.ndarray) -> float:
-    if a is None or b is None or a.shape != b.shape:
-        return 1.0
-    return float(np.mean(np.abs(a-b)))
-
 def _bgr_to_png_b64(img, max_side: int = 1400) -> str:
     h, w = img.shape[:2]
     if max(h, w) > max_side:
@@ -125,6 +130,218 @@ def _bgr_to_png_b64(img, max_side: int = 1400) -> str:
     if not ok: return ""
     return base64.b64encode(enc).decode("ascii")
 
+#====================== Загрузчик =======================
+
+class DownloadWorker(QThread):
+    progress = Signal(int)         # %
+    status   = Signal(str)         # текст статуса
+    done     = Signal(bool, str)   # ok, msg
+
+    def __init__(self, url: str, dest_path: str, chunk: int = 1<<20):
+        super().__init__()
+        self.url = url
+        self.dest_path = dest_path
+        self.chunk = chunk
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            self.status.emit("Запрос...")
+            with requests.get(self.url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length") or 0)
+                tmp = self.dest_path + ".part"
+                got = 0
+                with open(tmp, "wb") as f:
+                    for ch in r.iter_content(chunk_size=self.chunk):
+                        if self._cancel:
+                            self.status.emit("Отменено")
+                            try: os.remove(tmp)
+                            except: pass
+                            self.done.emit(False, "Отменено")
+                            return
+                        if ch:
+                            f.write(ch)
+                            got += len(ch)
+                            if total:
+                                self.progress.emit(int(got * 100 / total))
+                os.replace(tmp, self.dest_path)
+            self.progress.emit(100)
+            self.done.emit(True, "Готово")
+        except Exception as e:
+            self.done.emit(False, f"Ошибка: {e}")
+
+#==================== Окно загрузчика =========================
+
+class ModelHubDialog(QDialog):
+    def __init__(self, parent=None, default_models_dir:str=""):
+        super().__init__(parent)
+        self.setWindowTitle("Скачать модели (GGUF / mmproj)")
+        self.setModal(True)
+        self.resize(1260, 520)
+
+        self.default_dir = default_models_dir or str((BASE_DIR / "models" / "llm").resolve())
+        os.makedirs(self.default_dir, exist_ok=True)
+
+        lay = QVBoxLayout(self)
+
+        # Пресеты
+        gb = QGroupBox("Рекомендованные пресеты")
+        v = QVBoxLayout(gb)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Название", "Тип", "Формат", "Примечание", "Размер"])
+        v.addWidget(self.tree)
+        lay.addWidget(gb)
+
+        # — наполняем пресеты (URL — примеры-плейсхолдеры; подставьте свои)
+        presets = [
+            # OCR / VL
+            {"name": "Qwen3-VL-2B-Instruct (OCR)", "kind": "OCR (VL)", "fmt": "GGUF Q4_K_M", "note":"Vision-модель для OCR (распознавалка текста)", "size": "~1.1 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3-VL-2B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-VL-2B-Instruct (OCR).gguf"},
+            {"name": "Qwen3-VL-2B-mmproj", "kind": "mmproj", "fmt": "F16/BF16", "note":"Проектор к Qwen-VL-2B (название будет просто mmproj-F16!!!) (необходим для Qwen-B2)", "size": "~800 MB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-VL-2B-mmproj.gguf"},
+            {"name": "Nanonets-OCR2-3B", "kind": "OCR (VL)", "fmt": "GGUF Q4_K_M", "note":"Альтернативная OCR (Качество примерно такое же)", "size": "~2 GB",
+             "url":"https://huggingface.co/mradermacher/Nanonets-OCR2-3B-GGUF/resolve/main/Nanonets-OCR2-3B.Q4_K_M.gguf?download=true", "filename":"Nanonets-OCR2-3B.gguf"},
+            {"name": "Nanonets-OCR2-3B-mmproj", "kind": "mmproj", "fmt": "Q8_0", "note":"Проектор к Nanonets", "size": "~850 MB",
+             "url":"https://huggingface.co/mradermacher/Nanonets-OCR2-3B-GGUF/resolve/main/Nanonets-OCR2-3B.mmproj-Q8_0.gguf?download=true", "filename":"Nanonets-OCR2-3B-mmproj.gguf"},
+            # Translator / TEXT
+            {"name": "Qwen3-4B-Instruct", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_K_M", "note":"Только текст для дуал режима", "size": "~2.5 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true", "filename":"Qwen3-4B-Instruct.gguf"},
+            {"name": "Qwen3-4B-Instruct", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_NL", "note":"Только текст для дуал режима (ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~2.4 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-IQ4_NL.gguf?download=true", "filename":"Qwen3-4B-Instruct.gguf"},
+            # Всё в одном
+            {"name": "Qwen3-8B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_K_M", "note":"Модель для соло режима (И читает и переводит)", "size": "~5 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct.gguf"},
+            {"name": "Qwen3-8B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_NL", "note":"Модель для соло режима (И читает и переводит)(ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~4.8 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct.gguf"},
+            {"name": "Qwen3-8B-VL-Instruct-mmproj", "kind": "Translator/OCR (All in one)", "fmt": "GGUF F16", "note":"Гляделка для модели 8B", "size": "~1.2 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct-mmproj.gguf"},
+            {"name": "Qwen3-4B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_K_M", "note":"Альтернатива для соло 8B (лечге и хуже по качеству)(ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~2.4 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-4B-Instruct-GGUF/resolve/main/Qwen3-VL-4B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-4B-VL-Instruct.gguf"},
+            {"name": "Qwen3-4B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_NL", "note":"Альтернатива для соло 8B (лечге и хуже по качеству)", "size": "~2.5 GB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-4B-Instruct-GGUF/resolve/main/Qwen3-VL-4B-Instruct-IQ4_NL.gguf?download=true", "filename":"Qwen3-4B-VL-Instruct.gguf"},
+            {"name": "Qwen3-4B-VL-Instruct-mmproj", "kind": "Translator/OCR (All in one)", "fmt": "GGUF F16", "note":"Гляделка для 4B", "size": "~800 MB",
+             "url":"https://huggingface.co/unsloth/Qwen3-VL-4B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-4B-VL-Instruct-mmproj.gguf"},
+        ]
+        self._presets = presets
+        for p in presets:
+            it = QTreeWidgetItem([p["name"], p["kind"], p["fmt"], p["note"], p["size"]])
+            it.setData(0, Qt.UserRole, p)
+            self.tree.addTopLevelItem(it)
+            self._autosize_columns()
+            self.tree.setUniformRowHeights(True)                 # быстрее
+            self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # Поля URL/путь
+        form = QFormLayout()
+        self.edUrl = QLineEdit()
+        self.edPath = QLineEdit(os.path.join(self.default_dir, ""))  # папка
+        self.btnBrowse = QPushButton("…")
+        row = QHBoxLayout()
+        row.addWidget(self.edPath, 1)
+        row.addWidget(self.btnBrowse)
+        form.addRow("URL файла:", self.edUrl)
+        form.addRow("Папка сохранения:", QWidget())
+        form.itemAt(form.rowCount()-1, QFormLayout.FieldRole).widget().setLayout(row)
+        lay.addLayout(form)
+
+        # Кнопки действий
+        row2 = QHBoxLayout()
+        self.btnFill = QPushButton("Из пресета")
+        self.btnDl   = QPushButton("Скачать")
+        self.btnClose= QPushButton("Закрыть")
+        row2.addWidget(self.btnFill)
+        row2.addStretch(1)
+        row2.addWidget(self.btnDl)
+        row2.addWidget(self.btnClose)
+        lay.addLayout(row2)
+
+        # Прогресс
+        self.pb = QProgressBar()
+        self.pb.setRange(0, 100)
+        self.pb.setValue(0)
+        self.lab = QLabel("")
+        lay.addWidget(self.pb)
+        lay.addWidget(self.lab)
+
+        # Сигналы
+        self.btnBrowse.clicked.connect(self._choose_dir)
+        self.btnFill.clicked.connect(self._fill_from_selected)
+        self.btnDl.clicked.connect(self._start_download)
+        self.btnClose.clicked.connect(self.reject)
+
+        self._worker: DownloadWorker|None = None
+        
+    def _autosize_columns(self):
+        h = self.tree.header()
+        h.setStretchLastSection(False)
+        h.setSectionsMovable(True)
+        h.setMinimumSectionSize(80)
+
+        # 0: Название, 1: Тип, 2: Формат, 3: Примечание, 4: Размер
+        # сначала поджимаем по содержимому
+        for i in range(self.tree.columnCount()):
+            h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+
+        # чуть «подпухлить» узкие колонки и ограничить сверхширокие
+        QTimer.singleShot(0, lambda: self._finalize_columns())
+
+    def _finalize_columns(self):
+        # немного паддинга и ограничение максимальной ширины узких колонок
+        for i in (0, 1, 2, 4):
+            w = min(self.tree.sizeHintForColumn(i) + 24, 600)
+            self.tree.setColumnWidth(i, w)
+
+        # "Примечание" растягиваем на оставшееся место
+        h = self.tree.header()
+        h.setSectionResizeMode(3, QHeaderView.Stretch)
+        # чтобы пользователь мог потом руками двигать
+        for i in range(self.tree.columnCount()):
+            if i != 3:
+                h.setSectionResizeMode(i, QHeaderView.Interactive)
+
+    def _choose_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Куда сохранить", self.edPath.text() or self.default_dir)
+        if d:
+            self.edPath.setText(d)
+
+    def _fill_from_selected(self):
+        it = self.tree.currentItem()
+        if not it:
+            QMessageBox.information(self, "Модели", "Выберите пресет в списке.")
+            return
+        p = it.data(0, Qt.UserRole) or {}
+        self.edUrl.setText(p.get("url",""))
+        # Папку не трогаем — пользователь сам управляет
+
+    def _start_download(self):
+        url = (self.edUrl.text() or "").strip()
+        if not url:
+            QMessageBox.warning(self, "Модели", "Введите URL модели или выберите пресет.")
+            return
+        folder = (self.edPath.text() or "").strip() or self.default_dir
+        os.makedirs(folder, exist_ok=True)
+        # имя берём из URL
+        fname = url.split("/")[-1].split("?")[0] or "model.gguf"
+        dest = os.path.join(folder, fname)
+
+        self.pb.setValue(0)
+        self.lab.setText("Подключение...")
+        self._worker = DownloadWorker(url, dest)
+        self._worker.progress.connect(self.pb.setValue)
+        self._worker.status.connect(self.lab.setText)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_done(self, ok: bool, msg: str):
+        self.lab.setText(msg)
+        if ok:
+            QMessageBox.information(self, "Модели", "Загрузка завершена.")
+        else:
+            QMessageBox.critical(self, "Модели", msg)
 
 # ================= Windows blur / PrintWindow =============
 
@@ -337,11 +554,14 @@ class CaptureWorker(QThread):
                 idx = self._rr % len(self.overlay.regions); self._rr += 1
                 r = self.overlay.regions[idx]
 
-                now = time.monotonic()
-                min_interval = 1.0 / MAX_OCR_FPS
-                stale = (now - r.last_ocr_ts) >= STALE_RECHECK_SEC
-                if (now - r.last_ocr_ts) < min_interval and not stale:
-                    self.msleep(self.interval_ms); continue
+                now = time.perf_counter()
+                min_interval = 1.0 / max(0.1, float(MAX_OCR_FPS))  # защита от деления на 0
+                elapsed = now - r.last_ocr_ts
+                if elapsed < min_interval:
+                    # доспим ровно до нужного FPS
+                    rem_ms = int(max(1, (min_interval - elapsed) * 1000))
+                    self.msleep(rem_ms)
+                    continue
 
                 cap = r.capture_rect if r.split_mode else r.display_rect
                 px, py, pw, ph = _logical_to_physical(cap, self.overlay)
@@ -364,12 +584,7 @@ class CaptureWorker(QThread):
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 th = _thumb(gray)
                 changed = True
-                if r.last_thumb is not None:
-                    delta = _thumb_delta(th, r.last_thumb)
-                    changed = (delta >= MIN_THUMB_DELTA)
-
-                if not changed and not stale:
-                    self.msleep(self.interval_ms); continue
+                now = time.perf_counter()
 
                 r.last_thumb = th
                 r.last_ocr_ts = now
@@ -377,47 +592,25 @@ class CaptureWorker(QThread):
                 # LLM: одна картинка (регион) → перевод
                 reg_b64  = _bgr_to_png_b64(frame, max_side=1024)
                 full_b64 = None
-                ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
+                r.last_ocr_ts = time.perf_counter()
+                if getattr(self.overlay, "dual_mode", False) and LLMConfigDual is not None:
+                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
+                    ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual) if en else ""
+                else:
+                    ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
                 print(f"[LLM-OCR] got {len(ru) if ru else 0} chars")
 
                 if ru:
-                    try:
-                        ru_canon = canon_ru(ru)
-                    except Exception:
-                        ru_canon = (ru or "").strip().lower()
-
-                    # если первый раз — выводим сразу
-                    if not (r.last_sent_ru_raw or r.pending_ru_raw):
-                        r.last_sent_ru_raw   = ru
-                        r.last_sent_ru_canon = ru_canon
-                        r.pending_ru_raw = r.pending_ru_canon = ""
-                        r.pending_hits = 0
-                        self.textReady.emit(idx, ru)
-                        self.msleep(self.interval_ms); continue
-
-                    # Запрет микродёрганий — если отличий почти нет
-                    prev_last = getattr(r, "last_sent_ru_canon", "") or ""
-                    prev_pend = getattr(r, "pending_ru_canon", "") or ""
-                    from difflib import SequenceMatcher
-                    sim = SequenceMatcher(None, prev_last, ru_canon).ratio() if prev_last else 0.0
-                    if sim >= 0.995:
-                        self.msleep(self.interval_ms); continue
-
-                    # Стабилизация: нужен одинаковый канон ровно STABILITY_HITS раз
-                    if r.pending_ru_canon == ru_canon:
-                        r.pending_hits += 1
-                    else:
-                        r.pending_ru_canon = ru_canon
-                        r.pending_ru_raw   = ru
-                        r.pending_hits = 1
-
-                    if r.pending_hits < STABILITY_HITS:
-                        self.msleep(self.interval_ms); continue
-
-                    r.last_sent_ru_canon = ru_canon
-                    r.last_sent_ru_raw   = ru
-                    r.pending_hits = 0
+                    # сырой режим: сразу в оверлей, без проверок/стабилизаций
                     self.textReady.emit(idx, ru)
+                    # (только обновим последние значения, чтобы UI знал, что мы уже что-то показали)
+                    try:
+                        r.last_sent_ru_raw   = ru
+                        r.last_sent_ru_canon = canon_ru(ru)
+                    except Exception:
+                        r.last_sent_ru_canon = (ru or "").strip().lower()
+                    r.pending_ru_raw = r.pending_ru_canon = ""
+                    r.pending_hits = 0
 
                 self.msleep(self.interval_ms)
             except Exception as e:
@@ -481,6 +674,11 @@ class Overlay(QWidget):
         self.paused=False
         self.bound_hwnd: Optional[int]=None
         self.edit_target='display'
+        self.border_w = BORDER_WIDTH
+        self.split_border_w = SPLIT_BORDER_WIDTH
+        self.dual_mode = False
+        self.ocr_cfg_dual = None
+        self.tr_cfg_dual  = None
 
         # шрифт панели
         self.font_family = "Segoe UI"
@@ -591,10 +789,14 @@ class Overlay(QWidget):
         if not self.enabled_overlay or not self.edit_mode: return
         p=QPainter(self); p.setRenderHint(QPainter.Antialiasing,True)
         for r in self.regions:
-            pen=QPen(QColor(0,200,255,230) if r.selected else QColor(255,255,255,120)); pen.setWidth(4); p.setPen(pen)
+            pen=QPen(QColor(0,200,255,230) if r.selected else QColor(255,255,255,120))
+            pen.setWidth(int(getattr(self, "border_w", BORDER_WIDTH)))
+            p.setPen(pen)
             p.drawRect(r.display_rect); self._handles(p, r.display_rect, QColor(0,200,255,230))
             if r.split_mode:
-                pen2=QPen(QColor(255,165,0,220)); pen2.setStyle(Qt.DashLine); pen2.setWidth(4); p.setPen(pen2)
+                pen2=QPen(QColor(255,165,0,220)); pen2.setStyle(Qt.DashLine)
+                pen2.setWidth(int(getattr(self, "split_border_w", SPLIT_BORDER_WIDTH)))
+                p.setPen(pen2)
                 p.drawRect(r.capture_rect); self._handles(p, r.capture_rect, QColor(255,165,0,220))
             tip=QRect(r.display_rect.left(), r.display_rect.top()-24, 900, 20)
             p.fillRect(tip, QColor(0,0,0,110))
@@ -869,6 +1071,10 @@ class Overlay(QWidget):
             _stop_llama_server()
         except Exception:
             pass
+        try:
+            _stop_llama_server2()
+        except Exception:
+            pass
         # 3) вернуть оверлей в режим редактирования (область остаётся)
         self.enabled_overlay = True
         self.edit_mode = True
@@ -880,7 +1086,7 @@ class Overlay(QWidget):
             r.panel.set_geometry(r.display_rect)
             r.panel.sync_text(r.display_text)
         # 4) показать оверлей (на случай, если был спрятан) и вернуть окно настроек
-        self.show()
+        self.hide()
         if callable(self._on_quit):
             try:
                 self._on_quit()
@@ -903,13 +1109,19 @@ def scan_gguf(roots: List[Path]) -> Tuple[List[str], List[str]]:
     models.sort(); projs.sort()
     return models, projs
 
-def rebuild_server_cmd(server_exe: Path, model_path:str, mmproj_path:str,
-                       host:str, port:int, ctx:int, batch:int, ubatch:int, parallel:int, ngl:int) -> str:
-    cmd = f"{_q(server_exe)} "
-    if model_path:  cmd += f"-m {_q(model_path)} "
-    if mmproj_path: cmd += f"--mmproj {_q(mmproj_path)} "
-    cmd += f"-ngl {ngl} --ctx-size {ctx} --batch-size {batch} --ubatch-size {ubatch} --parallel {parallel} "
-    cmd += f"--host {host} --port {port}"
+def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, parallel, ngl):
+    cmd = [exe, "-m", model]
+    if mmproj:
+        cmd += ["--mmproj", mmproj]
+    cmd += [
+        "-ngl", str(int(ngl)),
+        "--ctx-size", str(int(ctx)),
+        "--batch-size", str(int(batch)),
+        "--ubatch-size", str(int(ubatch)),
+        "--parallel", str(int(parallel)),
+        "--host", str(host),
+        "--port", str(int(port)),
+    ]
     return cmd
 
 def _ping_llama(url: str, timeout: float = 0.5) -> bool:
@@ -926,46 +1138,68 @@ def _ping_llama(url: str, timeout: float = 0.5) -> bool:
             return False
 
 _LLAMA_PROC = None
+_LLAMA_PROC2 = None
 
-def _ensure_llama_server(cmd: str, server_url: str):
-    """Стартуем сервер, если не отвечает; ждём, прогреваем промпт."""
+def _spawn(cmd_list):
+    # не используем shell, даём список аргументов
+    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+             | getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+    return subprocess.Popen(cmd_list, shell=False, creationflags=flags)
+
+def _ensure_llama_server(cmd_list, server_url):
     global _LLAMA_PROC
     if _ping_llama(server_url):
         print(f"[LLM] server ok @ {server_url}")
         return
-    if not cmd:
-        print("[LLM] LLAMA_SERVER_CMD is empty — skip autostart"); return
-    try:
-        flags = (
-            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-        )
-        _LLAMA_PROC = subprocess.Popen(cmd, shell=True, creationflags=flags)
-        print(f"[LLM] llama-server started (pid={_LLAMA_PROC.pid})")
-        for _ in range(120):
-            time.sleep(0.5)
-            if _ping_llama(server_url):
-                print("[LLM] llama-server поднялся")
-                break
-            if _LLAMA_PROC.poll() is not None:
-                print("[LLM] llama-server exited early code", _LLAMA_PROC.returncode)
-                break
-    except Exception as e:
-        print("[LLM] автозапуск не удался:", e)
+    print("[LLM] spawn:", cmd_list)
+    _LLAMA_PROC = _spawn(cmd_list)
+    print(f"[LLM] llama-server started (pid={_LLAMA_PROC.pid})")
+    for _ in range(120):
+        time.sleep(0.5)
+        if _ping_llama(server_url):
+            print("[LLM] llama-server поднялся")
+            return
+        if _LLAMA_PROC.poll() is not None:
+            print("[LLM] llama-server exited early code", _LLAMA_PROC.returncode)
+            return
 
 def _stop_llama_server():
     global _LLAMA_PROC
     if _LLAMA_PROC and _LLAMA_PROC.poll() is None:
         try:
             _LLAMA_PROC.terminate()
-            try:
-                _LLAMA_PROC.wait(timeout=3)
-            except Exception:
-                _LLAMA_PROC.kill()
-        except Exception:
-            pass
+            try: _LLAMA_PROC.wait(timeout=3)
+            except Exception: _LLAMA_PROC.kill()
+        except Exception: pass
     _LLAMA_PROC = None
 
+def _ensure_llama_server2(cmd_list, server_url):
+    global _LLAMA_PROC2
+    if _ping_llama(server_url):
+        print(f"[LLM] server2 ok @ {server_url}")
+        return
+    print("[LLM] spawn#2:", cmd_list)
+    _LLAMA_PROC2 = _spawn(cmd_list)
+    print(f"[LLM] llama-server#2 started (pid={_LLAMA_PROC2.pid})")
+    for _ in range(120):
+        time.sleep(0.5)
+        if _ping_llama(server_url):
+            print("[LLM] llama-server#2 поднялся")
+            return
+        if _LLAMA_PROC2.poll() is not None:
+            print("[LLM] llama-server#2 exited early code", _LLAMA_PROC2.returncode)
+            return
+
+def _stop_llama_server2():
+    global _LLAMA_PROC2
+    if _LLAMA_PROC2 and _LLAMA_PROC2.poll() is None:
+        try:
+            _LLAMA_PROC2.terminate()
+            try: _LLAMA_PROC2.wait(timeout=3)
+            except Exception: _LLAMA_PROC2.kill()
+        except Exception: pass
+    _LLAMA_PROC2 = None
 
 # ====================== Настроечный GUI ===================
 
@@ -977,6 +1211,7 @@ class ConfigWindow(QWidget):
 
         # --- controls ---
         self.btnStart = QPushButton("Начать перевод")
+        self.cbDual = QCheckBox("Двойной режим (OCR + Переводчик)")
 
         # окна/процессы
         self.cbWindow = QComboBox(); self.btnRefreshWin=QPushButton("Обновить список")
@@ -1015,48 +1250,148 @@ class ConfigWindow(QWidget):
 
         # константы/поведение
         self.spFps    = QDoubleSpinBox(); self.spFps.setRange(0.1, 5.0); self.spFps.setSingleStep(0.1); self.spFps.setValue(float(MAX_OCR_FPS))
-        self.spDelta  = QDoubleSpinBox(); self.spDelta.setRange(0.001, 0.2); self.spDelta.setSingleStep(0.001); self.spDelta.setValue(float(MIN_THUMB_DELTA))
+        self.spRetr = QDoubleSpinBox(); self.spRetr.setRange(0.0, 600.0); self.spRetr.setSingleStep(0.5); self.spRetr.setDecimals(1); self.spRetr.setValue(0.0)
+        self.spThumbW = QSpinBox(); self.spThumbW.setRange(8, 256); self.spThumbW.setValue(THUMB_SIZE[0])
+        self.spThumbH = QSpinBox(); self.spThumbH.setRange(8, 256); self.spThumbH.setValue(THUMB_SIZE[1])
+        thumbRow = QWidget(); hl = QHBoxLayout(thumbRow); hl.setContentsMargins(0,0,0,0)
+        hl.addWidget(QLabel("W")); hl.addWidget(self.spThumbW); hl.addSpacing(8)
+        hl.addWidget(QLabel("H")); hl.addWidget(self.spThumbH)
+        self.spBorder = QSpinBox(); self.spBorder.setRange(1, 16); self.spBorder.setValue(BORDER_WIDTH)
+        self.spBorder.valueChanged.connect(lambda v: (setattr(self.overlay, "border_w", int(v)), self.overlay.update()))
+        self.spSplit  = QSpinBox(); self.spSplit.setRange(1, 16); self.spSplit.setValue(SPLIT_BORDER_WIDTH)
+        self.spSplit.valueChanged.connect(lambda v: (setattr(self.overlay, "split_border_w", int(v)), self.overlay.update()))
         self.cbSmooth = QCheckBox("Плавный вывод (smooth)"); self.cbSmooth.setChecked(RENDER_MODE=="smooth")
         self.spHandle = QSpinBox(); self.spHandle.setRange(6, 30); self.spHandle.setValue(int(HANDLE))
+        self.spHandle.valueChanged.connect(lambda v: (globals().__setitem__("HANDLE", int(v)), self.overlay.update()))
 
         # лор
         self.edLore  = QLineEdit(str(llm_cfg.lore_path or ""))
         self.btnLore = QPushButton("Выбрать…")
+        self.edPB  = QLineEdit("")          # путь к phrasebook.txt
+        self.btnPB = QPushButton("Выбрать…")
+        
 
         # промпт
         self.btnPrompt  = QPushButton("Настроить промпт…")
         self.btnPreview = QPushButton("Предпросмотр system…")
+        self.btnEditOCR = QPushButton("Настроить промпт (OCR)")
+        self.btnPrevOCR = QPushButton("Предпросмотр (OCR)")
+        self.btnEditOCR.clicked.connect(self._edit_ocr_prompt)
+        self.btnPrevOCR.clicked.connect(self._preview_ocr)
 
         # --- layout ---
         top = QVBoxLayout(self)
+        
         top.addWidget(self.btnStart)
+        top.addWidget(self.cbDual)
+        
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        inner = QWidget(scroll)
+        form = QVBoxLayout(inner)
 
         gbWin = QGroupBox("Окно для захвата"); lw = QHBoxLayout(gbWin)
         lw.addWidget(QLabel("Окно:")); lw.addWidget(self.cbWindow, 1); lw.addWidget(self.btnRefreshWin)
-        top.addWidget(gbWin)
+        form.addWidget(gbWin)
 
-        gbModel = QGroupBox("Модель и mmproj"); fm = QFormLayout(gbModel)
+        self.gbModel = QGroupBox("Модель и mmproj")
+        fm = QFormLayout(self.gbModel)
         fm.addRow("Модель .gguf:", self.cbModel)
         fm.addRow("mmproj .gguf:", self.cbMmproj)
-        fm.addRow(self.btnRescan)
-        top.addWidget(gbModel)
+        form.addWidget(self.gbModel)
+        
+        self.gbOCR = QGroupBox("OCR-сервер (vision)")
+        self.cbModelOCR  = QComboBox()
+        self.cbMmprojOCR = QComboBox()
+        self.edHost1 = QLineEdit("127.0.0.1"); self.spPort1 = QSpinBox(); self.spPort1.setRange(1,65535); self.spPort1.setValue(8080)
+        self.spCtx1  = QSpinBox(); self.spCtx1.setRange(1024,65536); self.spCtx1.setValue(8192)
+        self.spBatch1= QSpinBox(); self.spBatch1.setRange(1,4096); self.spBatch1.setValue(256)
+        self.spUB1   = QSpinBox(); self.spUB1.setRange(1,4096); self.spUB1.setValue(64)
+        self.spPar1  = QSpinBox(); self.spPar1.setRange(1,16); self.spPar1.setValue(1)
+        self.spNGL1  = QSpinBox(); self.spNGL1.setRange(0,999); self.spNGL1.setValue(999)
+        self.spSeed1 = QSpinBox(); self.spSeed1.setRange(0, 2_000_000_000); self.spSeed1.setValue(0)
+        self.spSlot1 = QSpinBox(); self.spSlot1.setRange(0,7); self.spSlot1.setValue(0)
+        self.spMaxTok1 = QSpinBox()
+        self.spMaxTok1.setRange(64, 16384)
+        self.spMaxTok1.setSingleStep(64)
+        self.spMaxTok1.setValue(512)   # разумный потолок для OCR-выдачи
+        
+        f1 = QFormLayout(self.gbOCR)
+        f1.addRow("Модель .gguf:", self.cbModelOCR)
+        f1.addRow("mmproj .gguf:", self.cbMmprojOCR)
+        f1.addRow("host:", self.edHost1)
+        f1.addRow("port:", self.spPort1)
+        f1.addRow("max_tokens:", self.spMaxTok1)
+        f1.addRow("ctx-size:", self.spCtx1)
+        f1.addRow("batch-size:", self.spBatch1)
+        f1.addRow("ubatch-size:", self.spUB1)
+        f1.addRow("parallel:", self.spPar1)
+        f1.addRow("ngl:", self.spNGL1)
+        f1.addRow("seed:", self.spSeed1)
+        f1.addRow("slot_id:", self.spSlot1)
+        f1.addRow(self.btnEditOCR); f1.addRow(self.btnPrevOCR)
+        form.addWidget(self.gbOCR)
+        
+        self.gbTR = QGroupBox("Перевод-сервер (text)")
+        self.cbModelTR = QComboBox()
+        self.edHost2 = QLineEdit("127.0.0.1"); self.spPort2 = QSpinBox(); self.spPort2.setRange(1,65535); self.spPort2.setValue(8081)
+        self.spCtx2  = QSpinBox(); self.spCtx2.setRange(1024,65536); self.spCtx2.setValue(6000)
+        self.spBatch2= QSpinBox(); self.spBatch2.setRange(1,4096); self.spBatch2.setValue(256)
+        self.spUB2   = QSpinBox(); self.spUB2.setRange(1,4096); self.spUB2.setValue(64)
+        self.spPar2  = QSpinBox(); self.spPar2.setRange(1,16); self.spPar2.setValue(1)
+        self.spNGL2  = QSpinBox(); self.spNGL2.setRange(0,999); self.spNGL2.setValue(999)
+        self.spSeed2 = QSpinBox(); self.spSeed2.setRange(0, 2_000_000_000); self.spSeed2.setValue(0)
+        self.spSlot2 = QSpinBox(); self.spSlot2.setRange(0,7); self.spSlot2.setValue(1)
+        # TR max_tokens
+        self.spMaxTok2 = QSpinBox()
+        self.spMaxTok2.setRange(64, 16384)
+        self.spMaxTok2.setSingleStep(64)
+        self.spMaxTok2.setValue(1024)  # базовый лимит для перевода
+        
+        self.cbDual.toggled.connect(self._reflow_mode_ui)
+        
+        self.btnEditTR  = QPushButton("Настроить промпт (Переводчик)")
+        self.btnPrevTR  = QPushButton("Предпросмотр (Переводчик)")
+        self.btnEditTR.clicked.connect(self._edit_tr_prompt)
+        self.btnPrevTR.clicked.connect(self._preview_tr)
+
+        f2 = QFormLayout(self.gbTR)
+        f2.addRow("Модель .gguf:", self.cbModelTR)
+        f2.addRow("host:", self.edHost2)
+        f2.addRow("port:", self.spPort2)
+        f2.addRow("max_tokens:", self.spMaxTok2)
+        f2.addRow("ctx-size:", self.spCtx2)
+        f2.addRow("batch-size:", self.spBatch2)
+        f2.addRow("ubatch-size:", self.spUB2)
+        f2.addRow("parallel:", self.spPar2)
+        f2.addRow("ngl:", self.spNGL2)
+        f2.addRow("seed:", self.spSeed2)
+        f2.addRow("slot_id:", self.spSlot2)
+        f2.addRow(self.btnEditTR); f2.addRow(self.btnPrevTR)
+        form.addWidget(self.gbTR)
 
         gbLore = QGroupBox("Лор (game_bible)"); fl = QHBoxLayout(gbLore)
         fl.addWidget(QLabel("Файл лора:")); fl.addWidget(self.edLore, 1); fl.addWidget(self.btnLore)
-        top.addWidget(gbLore)
+        form.addWidget(gbLore)
+        gbPB = QGroupBox("Фразеологический словарик (phrasebook)")
+        fpb = QHBoxLayout(gbPB)
+        fpb.addWidget(QLabel("Файл phrasebook:"))
+        fpb.addWidget(self.edPB, 1)
+        fpb.addWidget(self.btnPB)
+        form.addWidget(gbPB)
 
         gbFont = QGroupBox("Шрифт панели"); ff = QFormLayout(gbFont)
         ff.addRow("Гарнитура:", self.fontFamily)
         ff.addRow("Размер:", self.fontSize)
         ff.addRow("", self.fontBold)
-        top.addWidget(gbFont)
+        form.addWidget(gbFont)
 
         gbLLM = QGroupBox("Настройки модели"); flm = QFormLayout(gbLLM)
         flm.addRow("max_tokens:", self.spMaxTok)
         flm.addRow("timeout, сек:", self.spTO)
         flm.addRow("temperature:", self.spTemp)
         flm.addRow("top_p:", self.spTopP)
-        top.addWidget(gbLLM)
+        form.addWidget(gbLLM)
         
         gbGen = QGroupBox("Доп. параметры генерации"); fgen = QFormLayout(gbGen)
         fgen.addRow("top_k:", self.spTopK)
@@ -1064,33 +1399,49 @@ class ConfigWindow(QWidget):
         fgen.addRow("seed:", self.spSeed)
         fgen.addRow("slot_id:", self.spSlot)
         fgen.addRow("", self.cbCache)
-        top.addWidget(gbGen)
+        form.addWidget(gbGen)
 
-        gbSrv = QGroupBox("Сервер (llama.cpp)"); fsrv = QFormLayout(gbSrv)
+        self.gbSrv = QGroupBox("Сервер (llama.cpp)")
+        fsrv = QFormLayout(self.gbSrv)
         fsrv.addRow("ctx-size:", self.spCtx)
         fsrv.addRow("batch-size:", self.spBatch)
         fsrv.addRow("ubatch-size:", self.spUBatch)
         fsrv.addRow("parallel:", self.spPar)
         fsrv.addRow("ngl:", self.spNGL)
-        fsrv.addRow("host:", self.edHost)
-        fsrv.addRow("port:", self.spPort)
-        top.addWidget(gbSrv)
+
+        rowSrv = QWidget()
+        h = QHBoxLayout(rowSrv); h.setContentsMargins(0,0,0,0)
+        h.addWidget(QLabel("host:")); h.addWidget(self.edHost); h.addSpacing(8)
+        h.addWidget(QLabel("port:")); h.addWidget(self.spPort)
+        fsrv.addRow(rowSrv)
+
+        form.addWidget(self.gbSrv)
 
         gbK = QGroupBox("Константы"); fk = QFormLayout(gbK)
         fk.addRow("FPS захвата:", self.spFps)
-        fk.addRow("MIN_THUMB_DELTA:", self.spDelta)
+        fk.addRow("THUMB_SIZE:", thumbRow)
         fk.addRow("", self.cbSmooth)
         fk.addRow("Размер ручек рамки:", self.spHandle)
-        top.addWidget(gbK)
+        fk.addRow("Толщина рамки (display):", self.spBorder)
+        fk.addRow("Толщина рамки (capture):", self.spSplit)
+        
+        self.btnModelHub = QPushButton("Скачать модели…")
+        fk.addRow(self.btnModelHub)
+        self.btnModelHub.clicked.connect(self._open_model_hub)
+        
+        form.addWidget(gbK)
 
-        top.addWidget(self.btnPrompt)
-        top.addWidget(self.btnPreview)
-        top.addStretch(1)
+        scroll.setWidget(inner)
+        top.addWidget(scroll, 1)
+
+        form.addWidget(self.btnPrompt)
+        form.addWidget(self.btnPreview)
 
         # events
         self.btnRefreshWin.clicked.connect(self._fill_windows)
         self.btnRescan.clicked.connect(self._rescan_models)
         self.btnLore.clicked.connect(self._browse_lore)
+        self.btnPB.clicked.connect(self._browse_phrasebook)
         self.btnPrompt.clicked.connect(self._edit_prompt)
         self.btnPreview.clicked.connect(self._preview_system)
         self.btnStart.clicked.connect(self._start)
@@ -1103,9 +1454,64 @@ class ConfigWindow(QWidget):
         self._rescan_models()
         self._fill_windows()
         self._load_prefs_into_ui()
+        self._reflow_mode_ui()
+    
+    def _open_model_hub(self):
+        # пытаемся угадать папку моделей
+        base = ""
+        try:
+            base = os.path.dirname(self.cbModel.currentText().strip() or "")
+            if not base:
+                base = str((BASE_DIR / "models" / "llm").resolve())
+        except Exception:
+            base = os.path.join(os.getcwd(), "models", "llm")
+
+        dlg = ModelHubDialog(self, default_models_dir=base)
+        dlg.exec()
+
+        # после закрытия — рескан моделей (если метод есть)
+        for name in ("_rescan_models", "_scan_models", "_scan_models_ui", "_rebuild_models_list"):
+            if hasattr(self, name):
+                try:
+                    getattr(self, name)()
+                    break
+                except Exception as e:
+                    print("[ModelHub] rescan error:", e)
+    
+    def _reflow_mode_ui(self, *args):
+        # защита от случайной реэнтерабельности
+        if getattr(self, "_reflow_in_progress", False):
+            return
+        self._reflow_in_progress = True
+        try:
+            dual = self.cbDual.isChecked() if hasattr(self, "cbDual") else False
+
+            # что показываем в одиночном режиме
+            single_widgets = [
+                getattr(self, "gbModel", None),
+                getattr(self, "gbSrv", None),
+                getattr(self, "btnPrompt", None),
+                getattr(self, "btnPreview", None),
+            ]
+            # что показываем в dual-режиме
+            dual_widgets = [
+                getattr(self, "gbOCR", None),
+                getattr(self, "gbTR", None),
+            ]
+
+            for w in single_widgets:
+                if w:
+                    w.setVisible(not dual)
+            for w in dual_widgets:
+                if w:
+                    w.setVisible(dual)
+        finally:
+            self._reflow_in_progress = False
     
     def _load_prefs_into_ui(self):
         p = _load_prefs()
+        dual = bool(p.get("dual_enabled", False))
+        self.cbDual.setChecked(dual)
         # шрифт
         fam = p.get("font_family")
         if fam:
@@ -1125,6 +1531,8 @@ class ConfigWindow(QWidget):
         # лор
         lore = p.get("lore_path")
         if lore: self.edLore.setText(lore)
+        pb = p.get("phrasebook_path")
+        if pb: self.edPB.setText(pb)
         # LLM
         self.spMaxTok.setValue(int(p.get("max_tokens", 15000)))
         self.spTO.setValue(float(p.get("timeout_s", 30.0)))
@@ -1144,11 +1552,48 @@ class ConfigWindow(QWidget):
         self.edHost.setText(p.get("host", "127.0.0.1"))
         try: self.spPort.setValue(int(p.get("port", 8080)))
         except Exception: pass
+        # OCR
+        if (m := p.get("dual_ocr_model","")):
+            i=self.cbModelOCR.findText(m);    self.cbModelOCR.setCurrentIndex(max(i,0))
+        if (mm := p.get("dual_ocr_mmproj","")):
+            i=self.cbMmprojOCR.findText(mm);  self.cbMmprojOCR.setCurrentIndex(max(i,0))
+        self.edHost1.setText(p.get("dual_ocr_host","127.0.0.1"))
+        try: self.spPort1.setValue(int(p.get("dual_ocr_port",8080)))
+        except: pass
+        try: self.spMaxTok1.setValue(int(p.get("dual_ocr_max_tokens", 512)))
+        except: pass
+        self.spCtx1.setValue(int(p.get("dual_ocr_ctx",8192)))
+        self.spBatch1.setValue(int(p.get("dual_ocr_batch",256)))
+        self.spUB1.setValue(int(p.get("dual_ocr_ubatch",64)))
+        self.spPar1.setValue(int(p.get("dual_ocr_parallel",1)))
+        self.spNGL1.setValue(int(p.get("dual_ocr_ngl",999)))
+        self.spSeed1.setValue(int(p.get("dual_ocr_seed",0)))
+        self.spSlot1.setValue(int(p.get("dual_ocr_slot",0)))
+        self._ocr_prompt_override = p.get("dual_ocr_system_override","")
+        # TR
+        if (m := p.get("dual_tr_model","")):
+            i=self.cbModelTR.findText(m);     self.cbModelTR.setCurrentIndex(max(i,0))
+        self.edHost2.setText(p.get("dual_tr_host","127.0.0.1"))
+        try: self.spPort2.setValue(int(p.get("dual_tr_port",8081)))  
+        except: pass
+        try: self.spMaxTok2.setValue(int(p.get("dual_tr_max_tokens", 1024)))
+        except: pass
+        self.spCtx2.setValue(int(p.get("dual_tr_ctx",6000)))
+        self.spBatch2.setValue(int(p.get("dual_tr_batch",256)))
+        self.spUB2.setValue(int(p.get("dual_tr_ubatch",64)))
+        self.spPar2.setValue(int(p.get("dual_tr_parallel",1)))
+        self.spNGL2.setValue(int(p.get("dual_tr_ngl",999)))
+        self.spSeed2.setValue(int(p.get("dual_tr_seed",0)))
+        self.spSlot2.setValue(int(p.get("dual_tr_slot",1)))
+        self._tr_prompt_override = p.get("dual_tr_system_override","")
         # константы
         self.spFps.setValue(float(p.get("fps", 1.0)))
-        self.spDelta.setValue(float(p.get("min_thumb_delta", 0.01)))
         self.cbSmooth.setChecked(p.get("render_mode", "smooth") == "smooth")
         self.spHandle.setValue(int(p.get("handle", 15)))
+        self.spThumbW.setValue(int(p.get("thumb_w", THUMB_SIZE[0])))
+        self.spThumbH.setValue(int(p.get("thumb_h", THUMB_SIZE[1])))
+        self.spBorder.setValue(int(p.get("border_w", BORDER_WIDTH)))
+        self.spSplit.setValue(int(p.get("split_border_w", SPLIT_BORDER_WIDTH)))
         # окно
         want = p.get("window_title", "")
         if want:
@@ -1174,12 +1619,16 @@ class ConfigWindow(QWidget):
             "model_path": self.cbModel.currentText().strip(),
             "mmproj_path": self.cbMmproj.currentText().strip(),
             "lore_path": self.edLore.text().strip(),
+            "phrasebook_path": self.edPB.text().strip(),
             "max_tokens": int(self.spMaxTok.value()),
             "timeout_s": float(self.spTO.value()),
             "temp": float(self.spTemp.value()),
             "top_p": float(self.spTopP.value()),
             "fps": float(self.spFps.value()),
-            "min_thumb_delta": float(self.spDelta.value()),
+            "thumb_w": int(self.spThumbW.value()),
+            "thumb_h": int(self.spThumbH.value()),
+            "border_w": int(self.spBorder.value()),
+            "split_border_w": int(self.spSplit.value()),
             "render_mode": "smooth" if self.cbSmooth.isChecked() else "instant",
             "handle": int(self.spHandle.value()),
             "window_title": self.cbWindow.currentText().strip(),
@@ -1195,12 +1644,44 @@ class ConfigWindow(QWidget):
             "parallel": int(self.spPar.value()),
             "ngl": int(self.spNGL.value()),
             "host": self.edHost.text().strip(),
-            "port": int(self.spPort.value())
+            "port": int(self.spPort.value()),
         }
+
+        # dual-mode
+        prefs["dual_enabled"] = bool(self.cbDual.isChecked())
+        prefs["dual_ocr_model"]  = self.cbModelOCR.currentText().strip()
+        prefs["dual_ocr_mmproj"] = self.cbMmprojOCR.currentText().strip()
+        prefs["dual_ocr_host"]   = self.edHost1.text().strip()
+        prefs["dual_ocr_max_tokens"] = int(self.spMaxTok1.value())
+        prefs["dual_ocr_port"]   = int(self.spPort1.value())
+        prefs["dual_ocr_ctx"]    = int(self.spCtx1.value())
+        prefs["dual_ocr_batch"]  = int(self.spBatch1.value())
+        prefs["dual_ocr_ubatch"] = int(self.spUB1.value())
+        prefs["dual_ocr_parallel"]=int(self.spPar1.value())
+        prefs["dual_ocr_ngl"]    = int(self.spNGL1.value())
+        prefs["dual_ocr_seed"]   = int(self.spSeed1.value())
+        prefs["dual_ocr_slot"]   = int(self.spSlot1.value())
+        prefs["dual_ocr_system_override"] = getattr(self, "_ocr_prompt_override", "")
+
+        prefs["dual_tr_model"]  = self.cbModelTR.currentText().strip()
+        prefs["dual_tr_host"]   = self.edHost2.text().strip()
+        prefs["dual_tr_port"]   = int(self.spPort2.value())
+        prefs["dual_tr_max_tokens"]  = int(self.spMaxTok2.value())
+        prefs["dual_tr_ctx"]    = int(self.spCtx2.value())
+        prefs["dual_tr_batch"]  = int(self.spBatch2.value())
+        prefs["dual_tr_ubatch"] = int(self.spUB2.value())
+        prefs["dual_tr_parallel"]=int(self.spPar2.value())
+        prefs["dual_tr_ngl"]    = int(self.spNGL2.value())
+        prefs["dual_tr_seed"]   = int(self.spSeed2.value())
+        prefs["dual_tr_slot"]   = int(self.spSlot2.value())
+        prefs["dual_tr_system_override"] = getattr(self, "_tr_prompt_override", "")
+
+        # регионы
         try:
             prefs["regions"] = self.overlay.dump_regions_for_prefs()
         except Exception as e:
             print("[UI] dump regions prefs error:", e)
+
         return prefs
 
     def _back_from_overlay(self):
@@ -1212,6 +1693,7 @@ class ConfigWindow(QWidget):
             print("[UI] save on back error:", e)
         # Вызывается по Ctrl+Alt+Q из оверлея
         _stop_llama_server()
+        _stop_llama_server2()
         self.showNormal(); self.activateWindow(); self._fill_windows()
 
     def _fill_windows(self):
@@ -1231,6 +1713,9 @@ class ConfigWindow(QWidget):
         models, projs = scan_gguf(roots)
         for p in models: self.cbModel.addItem(p)
         for p in projs:  self.cbMmproj.addItem(p)
+        for p in models: self.cbModelOCR.addItem(p)
+        for p in projs:  self.cbMmprojOCR.addItem(p)
+        for p in models: self.cbModelTR.addItem(p)
 
     def _browse_lore(self):
         path,_ = QFileDialog.getOpenFileName(self,"Выберите файл лора", str(BASE_DIR), "Text (*.txt);;All (*.*)")
@@ -1241,6 +1726,19 @@ class ConfigWindow(QWidget):
                 except Exception: self.edLore.setText(str(p))
             except Exception:
                 self.edLore.setText(path)
+        
+    def _browse_phrasebook(self):
+        path,_ = QFileDialog.getOpenFileName(self, "Выберите phrasebook", str(BASE_DIR), "Text (*.txt);;All (*.*)")
+        if path:
+            try:
+                p = Path(path)
+                try:
+                    rel = p.relative_to(BASE_DIR)
+                    self.edPB.setText(str(rel))
+                except Exception:
+                    self.edPB.setText(str(p))
+            except Exception:
+                self.edPB.setText(path)
 
     def _edit_prompt(self):
         txt = getattr(llm_cfg, "system_override", "") or ""
@@ -1267,6 +1765,10 @@ class ConfigWindow(QWidget):
         if lore_path and not os.path.isabs(lore_path):
             lore_path = str((BASE_DIR / lore_path).resolve())
         llm_cfg.lore_path = lore_path
+        pb_path = (self.edPB.text() or "").strip()
+        if pb_path and not os.path.isabs(pb_path):
+            pb_path = str((BASE_DIR / pb_path).resolve())
+        llm_cfg.phrasebook_path = pb_path
         reset_lore_cache()
         try:
             init_lore_once(llm_cfg)
@@ -1279,11 +1781,64 @@ class ConfigWindow(QWidget):
         lay.addWidget(te)
         btn = QPushButton("Закрыть"); lay.addWidget(btn); btn.clicked.connect(dlg.close)
         dlg.setModal(True); dlg.resize(820,560); dlg.exec()
+        
+    def _edit_ocr_prompt(self):
+        txt = getattr(self, "_ocr_prompt_override", "")
+        dlg = QDialog(self); dlg.setWindowTitle("System (OCR) — редактирование")
+        lay = QVBoxLayout(dlg); te=QPlainTextEdit(txt); lay.addWidget(te)
+        btn=QPushButton("Сохранить"); lay.addWidget(btn)
+        def _save():
+            self._ocr_prompt_override = te.toPlainText().strip()
+            p = _load_prefs(); p["dual_ocr_system_override"]=self._ocr_prompt_override; _save_prefs(p)
+            QMessageBox.information(dlg,"OCR","Сохранено"); dlg.close()
+        btn.clicked.connect(_save); dlg.exec()
 
+    def _preview_ocr(self):
+        from llm_adapter_dual import _OCR_SYSTEM_DEFAULT
+        base = getattr(self, "_ocr_prompt_override", "") or _OCR_SYSTEM_DEFAULT
+        QMessageBox.information(self,"OCR system",base)
+
+    def _edit_tr_prompt(self):
+        txt = getattr(self, "_tr_prompt_override", "")
+        dlg = QDialog(self); dlg.setWindowTitle("System (Переводчик) — редактирование")
+        lay = QVBoxLayout(dlg); te=QPlainTextEdit(txt); lay.addWidget(te)
+        btn=QPushButton("Сохранить"); lay.addWidget(btn)
+        def _save():
+            self._tr_prompt_override = te.toPlainText().strip()
+            p = _load_prefs(); p["dual_tr_system_override"]=self._tr_prompt_override; _save_prefs(p)
+            try: reset_tr_system_cache()  # чтобы предпросмотр видел новые тексты
+            except Exception: pass
+            QMessageBox.information(dlg,"TR","Сохранено"); dlg.close()
+        btn.clicked.connect(_save); dlg.exec()
+
+    def _preview_tr(self):
+        # соберём system так же, как в адаптере (с LORE/PHRASEBOOK)
+        try:
+            from llm_adapter_dual import _ensure_tr_system
+            lp = (self.edLore.text() or "").strip()
+            if lp and not os.path.isabs(lp): lp = str((BASE_DIR / lp).resolve())
+            pb = (self.edPB.text() or "").strip()
+            if pb and not os.path.isabs(pb): pb = str((BASE_DIR / pb).resolve())
+            cfg = LLMConfigDual(
+                server="http://127.0.0.1:8081",
+                model=self.cbModelTR.currentText().strip(),
+                system_override=(getattr(self,"_tr_prompt_override","") or None),
+                lore_path=(lp or None),
+                phrasebook_path=(pb or None),
+            )
+            reset_tr_system_cache()
+            text = _ensure_tr_system(cfg)
+        except Exception as e:
+            text = f"(error: {e})"
+        dlg = QDialog(self); dlg.setWindowTitle("System (Переводчик) — предпросмотр")
+        lay = QVBoxLayout(dlg); te=QPlainTextEdit(text); te.setReadOnly(True); lay.addWidget(te)
+        btn=QPushButton("Закрыть"); lay.addWidget(btn); btn.clicked.connect(dlg.close)
+        dlg.exec()
+    
     def _start(self):
         # применяем настройки
-        global MAX_OCR_FPS, MIN_THUMB_DELTA, RENDER_MODE, HANDLE, SERVER_EXE
-
+        global MAX_OCR_FPS, RENDER_MODE, HANDLE, SERVER_EXE, THUMB_SIZE
+        
         sel = self.cbWindow.currentText(); hwnd = getattr(self, "_hwnd_map", {}).get(sel)
 
         llm_cfg.max_tokens = int(self.spMaxTok.value())
@@ -1295,17 +1850,27 @@ class ConfigWindow(QWidget):
         llm_cfg.seed           = int(self.spSeed.value())
         llm_cfg.slot_id        = int(self.spSlot.value())
         llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        dual = self.cbDual.isChecked()
 
         MAX_OCR_FPS    = float(self.spFps.value())
-        MIN_THUMB_DELTA= float(self.spDelta.value())
         RENDER_MODE    = "smooth" if self.cbSmooth.isChecked() else "instant"
         HANDLE         = int(self.spHandle.value())
+        THUMB_SIZE        = (int(self.spThumbW.value()), int(self.spThumbH.value()))
+        
+        self.overlay.border_w = int(self.spBorder.value())
+        self.overlay.split_border_w = int(self.spSplit.value())
 
         # применим лор
         lore_path = (self.edLore.text() or "").strip()
         if lore_path and not os.path.isabs(lore_path):
             lore_path = str((BASE_DIR / lore_path).resolve())
         llm_cfg.lore_path = lore_path
+        
+        pb_path = (self.edPB.text() or "").strip()
+        if pb_path and not os.path.isabs(pb_path):
+            pb_path = str((BASE_DIR / pb_path).resolve())
+        llm_cfg.phrasebook_path = pb_path
+        
         reset_lore_cache()
         
         host = (self.edHost.text() or "127.0.0.1").strip()
@@ -1332,22 +1897,106 @@ class ConfigWindow(QWidget):
             ngl=int(self.spNGL.value()),
         )
         print("[LLM] server exe:", SERVER_EXE)
-        print("[LLM] model:", model_path)
-        print("[LLM] mmproj:", mmproj_path)
-        try:
-            _save_prefs(self._collect_prefs())
-        except Exception as e:
-            print("[UI] save on start error:", e)
 
-        # спрячем конфиг, запустим сервер и прогрев, затем включим воркер
-        self.hide()
-        _ensure_llama_server(cmd, llm_cfg.server)
-        try:
-            if llm_cfg.enabled and llm_cfg.use_prompt_cache:
-                preload_prompt_cache(llm_cfg)
-        except Exception as e:
-            print("[LLM] warmup error:", e)
+        dual = self.cbDual.isChecked()
+        _stop_llama_server()
+        _stop_llama_server2()
 
+        if dual and LLMConfigDual is not None:
+            # -------- DUAL MODE: OCR + TR --------
+            host1 = (self.edHost1.text() or "127.0.0.1").strip()
+            port1 = int(self.spPort1.value())
+            host2 = (self.edHost2.text() or "127.0.0.1").strip()
+            port2 = int(self.spPort2.value())
+
+            ocr_model   = self.cbModelOCR.currentText().strip()
+            ocr_mmproj  = self.cbMmprojOCR.currentText().strip()
+            tr_model    = self.cbModelTR.currentText().strip()
+
+            cmd1 = rebuild_server_cmd(
+                SERVER_EXE, ocr_model, ocr_mmproj,
+                host=host1, port=port1,
+                ctx=int(self.spCtx1.value()),
+                batch=int(self.spBatch1.value()),
+                ubatch=int(self.spUB1.value()),
+                parallel=int(self.spPar1.value()),
+                ngl=int(self.spNGL1.value()),
+            )
+            cmd2 = rebuild_server_cmd(
+                SERVER_EXE, tr_model, "",          # <- переводчик БЕЗ mmproj
+                host=host2, port=port2,
+                ctx=int(self.spCtx2.value()),
+                batch=int(self.spBatch2.value()),
+                ubatch=int(self.spUB2.value()),
+                parallel=int(self.spPar2.value()),
+                ngl=int(self.spNGL2.value()),
+            )
+
+            print("[LLM] spawn OCR:", cmd1)
+            print("[LLM] spawn TR :", cmd2)
+
+            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
+            _ensure_llama_server2(cmd2, f"http://{host2}:{port2}")
+
+            # конфиги для воркера
+            self.overlay.dual_mode = True
+            self.overlay.ocr_cfg_dual = LLMConfigDual(
+                server=f"http://{host1}:{port1}",
+                model=ocr_model,
+                timeout_s=float(self.spTO.value()),
+                max_tokens=int(self.spMaxTok1.value()),
+                slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
+                system_override=(getattr(self,"_ocr_prompt_override","") or None),
+            )
+            self.overlay.tr_cfg_dual = LLMConfigDual(
+                server=f"http://{host2}:{port2}",
+                model=tr_model,
+                timeout_s=float(self.spTO.value()),
+                max_tokens=int(self.spMaxTok2.value()),
+                slot_id=int(self.spSlot2.value()), seed=int(self.spSeed2.value()),
+                system_override=(getattr(self,"_tr_prompt_override","") or None),
+                lore_path=(llm_cfg.lore_path or None),
+                phrasebook_path=(llm_cfg.phrasebook_path or None),
+            )
+
+            # прогрев (опционально)
+            try: preload_prompt_cache_ocr(self.overlay.ocr_cfg_dual)
+            except Exception as e: print("[DUAL] OCR warmup error:", e)
+            try: preload_prompt_cache_tr(self.overlay.tr_cfg_dual)
+            except Exception as e: print("[DUAL] TR warmup error:", e)
+
+        else:
+            # -------- SINGLE MODE ("всё в одном") --------
+            host = (self.edHost.text() or "127.0.0.1").strip()
+            port = int(self.spPort.value())
+            model_path  = self.cbModel.currentText().strip()
+            mmproj_path = self.cbMmproj.currentText().strip()
+
+            cmd = rebuild_server_cmd(
+                SERVER_EXE, model_path, mmproj_path,
+                host=host, port=port,
+                ctx=int(self.spCtx.value()),
+                batch=int(self.spBatch.value()),
+                ubatch=int(self.spUBatch.value()),
+                parallel=int(self.spPar.value()),
+                ngl=int(self.spNGL.value()),
+            )
+
+            print("[LLM] model:", model_path)
+            print("[LLM] mmproj:", mmproj_path)
+
+            llm_cfg.server = f"http://{host}:{port}"
+            _ensure_llama_server(cmd, llm_cfg.server)
+
+            # прогрев single
+            try:
+                if llm_cfg.enabled and llm_cfg.use_prompt_cache:
+                    preload_prompt_cache(llm_cfg)
+            except Exception as e:
+                print("[LLM] warmup error:", e)
+
+            self.overlay.dual_mode = False
+        
         # шрифт панели
         self.overlay.font_family = self.fontFamily.currentFont().family()
         self.overlay.font_size   = int(self.fontSize.value())
@@ -1360,6 +2009,7 @@ class ConfigWindow(QWidget):
         self.overlay.update()
         try:
             _save_prefs(self._collect_prefs())
+            self.hide()
         except Exception as e:
             print("[UI] save on start error:", e)
             
