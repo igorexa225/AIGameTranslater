@@ -1,7 +1,7 @@
 # llm_adapter.py — визуальный адаптер для llama.cpp (две картинки → перевод RU)
 # Требует llama.cpp server c vision (Qwen*-VL + mmproj).
 
-import os, time, json, base64, threading
+import os, time, json, base64, threading, re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -44,6 +44,18 @@ _LORE_TEXT = ""
 _SYSTEM_PROMPT = ""
 _LORE_INIT = False
 _LORE_LOCK = threading.Lock()
+_TM_LOCK = threading.Lock()
+_TM_EN2RU: dict[str, str] = {}
+_TM_ORDER: list[str] = []
+_TM_MAX = 512  # максимум записей в кэше
+
+_EN_WS_RX = re.compile(r"\s+")
+def _canon_en(s: str) -> str:
+    """Грубое нормирование английского текста для ключа TM."""
+    s = (s or "").replace("\ufeff", "")
+    s = s.lower()
+    s = _EN_WS_RX.sub(" ", s)
+    return s.strip()
 
 def reset_lore_cache():
     """Принудительно пересобрать лор/системный промпт при следующем init_lore_once()."""
@@ -64,47 +76,33 @@ def _read_file(path: str) -> str:
 def _build_system_prompt(lore_text: str) -> str:
     return (
         "You are a professional game localizer.\n"
-        "HARD RULES:\n"
-        "OUTPUT\n"
-        "- Russian only (Cyrillic). No English, no comments.\n"
+        "GOAL\n"
+        "- Read short in-game dialogue / UI text from images and translate it to Russian.\n"
+        "OUTPUT FORMAT\n"
+        "- When the user asks for JSON, you MUST respond with a SINGLE JSON object only.\n"
+        '- For this project the JSON shape is usually {"en": "...", "ru": "..."}. '
+        '"en" = original English text, "ru" = Russian translation.\n'
+        "- Do not add comments or extra fields.\n"
+        "RUSSIAN TRANSLATION RULES\n"
+        "- Russian only (Cyrillic) inside the \"ru\" field. No English there.\n"
         "- Keep the SAME number of sentences and line breaks as in the source.\n"
         "- Do not add quotation marks unless they exist in the source.\n"
         "SCOPE & FIDELITY\n"
         "- Translate ONLY the visible text from the image; do not invent missing content.\n"
-        "- Preserve meaning and tone. Write NATURAL, IDIOMATIC Russian: allow rewording, change word order, and choose Russian collocations if it improves readability without adding information.\n"
+        "- Preserve meaning and tone. Write NATURAL, IDIOMATIC Russian: allow rewording, "
+        "change word order, and choose Russian collocations if it improves readability "
+        "without adding information.\n"
         "- Keep placeholders/tags exactly as is.\n"
         "LORE & NAMES\n"
         "- Use LORE as the single source of truth for names, titles, factions, and terms.\n"
         "- Keep canonical forms from LORE; decline personal names correctly in Russian.\n"
-        "- Determine the SPEAKER’S GENDER from LORE or the name and use correct feminine/masculine forms.\n"
+        "- Determine the SPEAKER’S GENDER from LORE or the name and use correct "
+        "feminine/masculine forms.\n"
         "CONSISTENCY\n"
-        "- If the exact same English text repeats, return EXACTLY the same Russian translation as before.\n"
-        "- If only minor changes between current and previous frames, keep terminology and style consistent.\n"
-        "CLASSIFY & STYLE (do not print labels)\n"
-        "1) Decide internally: DIALOGUE vs VOICEOVER.\n"
-        "   DIALOGUE — name/nameplate nearby (top/left), speaker portrait, bubble tail, name label, “Name: …”, alternating lines.\n"
-        "   VOICEOVER — centered line with no name, system/narration (“Mission updated”, “Victory”), HUD messages, no visible speaker.\n"
-        "   If unsure: name/faction present ⇒ DIALOGUE; bare prompt/stage remark ⇒ VOICEOVER.\n"
-        "2) Apply style:\n"
-        "   - DIALOGUE: natural conversational Russian; respect speaker’s gender; keep sentence/line count.\n"
-        "   - VOICEOVER: neutral narrative/system style, concise, without adding quotation marks.\n"
-        "RUSSIAN STYLE RULES\n"
-        "- Prefer fluent Russian over word-for-word calques.\n"
-        "- Convert awkward English passives to natural Russian actives where appropriate.\n"
-        "- Follow Russian punctuation and capitalization..\n"
-        "PHRASEOLOGY POLICY\n"
-        "- Write NATURAL, IDIOMATIC Russian; never do word-for-word calques if there is a common Russian phrasing.\n"
-        "- Keep meaning and the number of sentences/line breaks.\n"
-        "- Prefer Russian actives to clumsy English passives when appropriate\n"
-        "- Never drop content. If a phrase is unknown, translate plainly and neutrally.\n"
-        "PHRASEBOOK (apply conservatively)\n"
-        "- Apply the following mappings only on exact matches in the source (case-insensitive, whole words/phrases), not inside names/tags.\n"
-        "- If multiple Russian options are given, choose the most neutral for the context.\n"
-        "ROBUSTNESS\n"
-        "- If the text is truncated/partial, translate the visible part anyway.\n"
-        "- If no readable text is present, output exactly: (ЗАТУП...)\n"
-        "Context (optional):\n"
-        "Use game lore as authoritative canon for names/factions/terms.\n\n"
+        "- If the exact same English text repeats, return EXACTLY the same Russian "
+        "translation as before.\n"
+        "- If only minor changes between current and previous frames, keep terminology "
+        "and style consistent.\n"
         "=== PHRASEBOOK START ===\n"
         "{{PHRASEBOOK}}\n"
         "=== PHRASEBOOK END ===\n"
@@ -212,8 +210,19 @@ def vision_translate_from_images(region_png_b64: str,
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
 
     def _content_variant(kind: str):
-        txt = {"type": "text",
-               "text": "This image is a cropped dialogue box. Read ONLY the visible text and return the Russian translation. Use LORE for names and gender. Output translation ONLY."}
+        txt = {
+            "type": "text",
+            "text": (
+                "This image is a cropped in-game dialogue or UI box.\n"
+                "1) Read ALL clearly visible ENGLISH text EXACTLY as it appears "
+                "(preserve line breaks).\n"
+                "2) Translate it into natural Russian, using the system instructions and LORE.\n"
+                "3) Respond with a SINGLE JSON object ONLY, in one line:\n"
+                '   {\"en\": \"<original English text>\", \"ru\": \"<Russian translation>\"}\n'
+                "- Use \\n inside strings for line breaks.\n"
+                "- Do NOT add comments, extra fields, or any text before/after the JSON."
+            ),
+        }
         if kind == "A":
             return [txt, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{region_png_b64}", "detail": "high"}}]
         if kind == "B":
@@ -248,11 +257,65 @@ def vision_translate_from_images(region_png_b64: str,
                 print(f"[LLM] vision kind={kind} http={r.status_code} in {dt:.0f} ms")
                 continue
             js = r.json()
-            out = (js.get("choices",[{}])[0].get("message",{}).get("content") or "").strip()
-            if out:
-                print(f"[LLM] vision ok kind={kind} {len(out)} chars in {dt:.0f} ms "
-                      f"(total {(time.perf_counter()-t0_all)*1000:.0f} ms)")
-                return out
+            out = (js.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+            if not out:
+                print(f"[LLM] vision empty kind={kind} in {dt:.0f} ms")
+                continue
+
+            # иногда модели заворачивают в ```json ... ```
+            txt = out.strip()
+            if txt.startswith("```"):
+                # убираем первую строку с ```...
+                first_nl = txt.find("\n")
+                if first_nl != -1:
+                    txt = txt[first_nl + 1:]
+                if txt.endswith("```"):
+                    txt = txt[:-3]
+                txt = txt.strip()
+
+            en_text: str = ""
+            ru_text: str = ""
+
+            try:
+                obj = json.loads(txt)
+                if isinstance(obj, dict):
+                    en_text = str(obj.get("en", "") or "").strip()
+                    ru_text = str(obj.get("ru", "") or "").strip()
+                else:
+                    # на всякий случай: если это массив/что-то ещё
+                    ru_text = str(obj).strip()
+            except Exception:
+                # не получилось распарсить как JSON — считаем, что это просто RU как раньше
+                ru_text = out.strip()
+
+            # --- Translation Memory по EN ---
+            if en_text:
+                key = _canon_en(en_text)
+                with _TM_LOCK:
+                    cached = _TM_EN2RU.get(key)
+                    if cached:
+                        # уже переводили этот английский — возвращаем канонический RU
+                        ru_final = cached
+                    else:
+                        ru_final = ru_text
+                        if ru_final:
+                            _TM_EN2RU[key] = ru_final
+                            _TM_ORDER.append(key)
+                            # LRU-чистка
+                            if len(_TM_ORDER) > _TM_MAX:
+                                old_key = _TM_ORDER.pop(0)
+                                _TM_EN2RU.pop(old_key, None)
+            else:
+                ru_final = ru_text
+
+            print(
+                f"[LLM] vision ok kind={kind} "
+                f"EN={len(en_text)} chars, RU={len(ru_final)} chars in {dt:.0f} ms "
+                f"(total {(time.perf_counter()-t0_all)*1000:.0f} ms)"
+            )
+
+            return ru_final
             print(f"[LLM] vision empty kind={kind} in {dt:.0f} ms")
         except Exception as e:
             print(f"[LLM] vision error kind={kind}:", e)

@@ -95,6 +95,52 @@ def reset_tr_system_cache():
         _LORE_INIT = False
         _TR_SYSTEM_CACHED = ""
 
+def _split_name_and_body(en_text: str) -> tuple[Optional[str], str]:
+    """
+    Делим сырой OCR-текст на:
+    - name_line: первая строка, если это похоже на имя/неймплейт;
+    - body: остальной текст (диалог/система).
+
+    НИЧЕГО не обрезаем в output — это только подготовка входа для LLM.
+    """
+    if not en_text:
+        return None, ""
+
+    # разбиваем на строки и обрезаем пустые сверху/снизу
+    lines = [ln.rstrip("\r") for ln in en_text.splitlines()]
+    lines = [ln for ln in lines]  # копия
+    # убираем leading/trailing пустые
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return None, ""
+
+    first = lines[0].strip()
+    rest_lines = lines[1:]
+
+    # если всего одна непустая строка — считаем, что это сразу текст
+    if not rest_lines:
+        return None, "\n".join(lines)
+
+    # эвристика: имя/роль
+    #  - короткое (<= 32 символов)
+    #  - до 3 слов
+    #  - нет явной "конца предложения" (.!?;:)
+    #  - не пустое
+    if (
+        first
+        and len(first) <= 32
+        and len(first.split()) <= 3
+        and not any(ch in first for ch in ".!?;:")
+    ):
+        body = "\n".join(rest_lines).lstrip("\n")
+        return first, body
+
+    # иначе считаем, что имя отдельно не выделено
+    return None, "\n".join(lines)
+
 # ===================== Прогрев cache_prompt ======================
 def preload_prompt_cache_ocr(cfg: LLMConfig) -> bool:
     if not cfg.use_prompt_cache:
@@ -171,20 +217,54 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
         print("[DUAL][OCR] http", r.status_code, "in", f"{dt:.0f} ms", (r.text or "")[:180])
         return ""
     js = r.json()
-    out = (js.get("choices",[{}])[0].get("message",{}).get("content") or "").strip()
-    print(f"[DUAL][OCR] {len(out)} chars in {dt:.0f} ms")
+    out = (js.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+    # --- Фильтр фантомных ответов (модель повторяет наш промпт) ---
+    bad_snippets = (
+        "Вы получили имя говорящего",            # кусок нашего system-prompt'а
+        "Переводите текст исключительно на русский язык",
+        "Translate the following text into natural Russian",  # на случай англ. эха
+    )
+    if any(snippet in out for snippet in bad_snippets):
+        print("[DUAL][TR] prompt echo detected, ignoring bad response")
+        return ""
+
+    print(f"[DUAL][TR] {len(out)} chars in {dt:.0f} ms")
     return out
 
 def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
     """Вызов на сервер перевода: EN -> RU (текст -> текст)."""
     system = _ensure_tr_system(cfg)
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
+
+    # --- НОВОЕ: отделяем имя от тела диалога ---
+    name_line, body = _split_name_and_body(en_text or "")
+    if not body:
+        body = en_text or ""
+
+    # Формируем user-сообщение в явном формате NAME + TEXT
+    if name_line:
+        user_content = (
+            "You are given a speaker NAME (context only) and English TEXT.\n"
+            "Use NAME only for gender, tone and style. Never output NAME.\n\n"
+            "NAME (context only, do NOT translate or output this line):\n"
+            f"{name_line}\n\n"
+            "TEXT TO TRANSLATE (output Russian only, keep the same line breaks as in this section):\n"
+            f"{body}"
+        )
+    else:
+        user_content = (
+            "Translate the following English text into Russian. "
+            "Keep the same line breaks. Do not add or remove lines.\n\n"
+            f"{body}"
+        )
+
     max_out = max(64, min(512, int(len(en_text) * 2.2) + 64))
     payload = {
         "model": cfg.model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": f"Translate to Russian, keep the same line breaks:\n{en_text}"}
+            {"role": "user", "content": user_content},
         ],
         "temperature": cfg.temp,
         "top_p": cfg.top_p,

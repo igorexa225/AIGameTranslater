@@ -10,20 +10,47 @@ import numpy as np
 import cv2
 from difflib import SequenceMatcher
 
-from PySide6.QtCore import (Qt, QRect, QPoint, QTimer, QEvent, QThread, Signal, QAbstractNativeEventFilter)
-from PySide6.QtGui  import (QPainter, QColor, QPen, QFont, QKeySequence, QShortcut, QGuiApplication, QImage)
+from PySide6.QtCore import (Qt, QRect, QPoint, QTimer, QEvent, QThread, Signal, QAbstractNativeEventFilter, QSize)
+from PySide6.QtGui  import (QPainter, QColor, QPen, QFont, QKeySequence, QShortcut, QGuiApplication, QImage, QIcon)
 from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QDialog,
     QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox,
-    QFontComboBox, QFileDialog, QPlainTextEdit, QHBoxLayout, QVBoxLayout, QFormLayout, QGroupBox, QScrollArea, QTreeWidget, QTreeWidgetItem, QProgressBar, QHeaderView)
+    QFontComboBox, QFileDialog, QPlainTextEdit, QHBoxLayout, QVBoxLayout, QFormLayout,
+    QGroupBox, QScrollArea, QTreeWidget, QTreeWidgetItem, QProgressBar, QHeaderView,
+    QSlider, QStackedWidget, QToolButton, QFrame)
 
 import win32con, win32gui, win32ui, win32api, win32process
 import ctypes.wintypes as wt
+
+#========================== Вызов EasyOCR ==============================
+
+try:
+    import easyocr
+    _EASYOCR_AVAILABLE = True
+except Exception:
+    easyocr = None
+    _EASYOCR_AVAILABLE = False
+
+_easyocr_reader = None
+
+def get_easyocr_reader():
+    """Ленивое создание EasyOCR-ридера (только на CPU, gpu=False)."""
+    global _easyocr_reader
+    if not _EASYOCR_AVAILABLE:
+        print("[OCR-BOXES] EasyOCR not available (import failed)")
+        return None
+    if _easyocr_reader is None:
+        try:
+            _easyocr_reader = easyocr.Reader(['en'], gpu=False)
+            print("[OCR-BOXES] EasyOCR reader initialised (gpu=False)")
+        except Exception as e:
+            print("[OCR-BOXES] EasyOCR init error:", e)
+            _easyocr_reader = None
+    return _easyocr_reader
 
 # ======================== CONFIG (по умолчанию) =========================
 
 # захват/обновление
 MAX_OCR_FPS       = 1.0        # 0.5–2.0 кадров/сек
-THUMB_SIZE        = (64, 24)
 
 # UI/поведение
 RENDER_MODE       = "smooth"   # "smooth" | "instant"
@@ -31,6 +58,11 @@ HANDLE            = 15
 BORDER_WIDTH      = 4
 SPLIT_BORDER_WIDTH = 4
 REQUIRE_BOUND_WINDOW = True
+DRAW_OVER_ORIGINAL = False
+PANEL_BG_MODE  = "blur"   # "blur" | "solid" | "none"
+PANEL_BG_ALPHA = 64       # 0–255, для blur = альфа tint'а, для solid = прозрачность чёрного фона
+BOX_BG_MODE  = "solid"    # "panel" | "solid" | "none"
+BOX_BG_ALPHA = 180        # 0–255, для solid = прозрачность чёрной подложки под строкой
 
 # Пути
 BASE_DIR = Path(__file__).resolve().parent
@@ -78,6 +110,7 @@ try:
         preload_prompt_cache_ocr,
         preload_prompt_cache_tr,
         reset_tr_system_cache,
+        _split_name_and_body,
     )
 except Exception:
     LLMConfigDual = None
@@ -99,6 +132,7 @@ _APO_RX   = re.compile(r"[’`´]")
 _DOTS_RX  = re.compile(r"[.…]+")
 _ZW_RX    = re.compile(r"[\u200B\u200C\u200D\u2060]")
 _NBSP_RX  = re.compile(r"\u00A0")
+_EN_WS_RX = re.compile(r"\s+")
 
 def norm_ru(s: str) -> str:
     s = (s or "").replace("\ufeff","")
@@ -117,9 +151,174 @@ def norm_ru(s: str) -> str:
 def canon_ru(s: str) -> str:
     return norm_ru(s).lower()
 
-def _thumb(gray: np.ndarray) -> np.ndarray:
-    th = cv2.resize(gray, THUMB_SIZE, interpolation=cv2.INTER_AREA)
-    return th.astype(np.float32)/255.0
+
+def canon_en(s: str) -> str:
+    s = (s or "").replace("\ufeff", "")
+    # нормализуем пробелы и регистр
+    s = _EN_WS_RX.sub(" ", s)
+    s = s.strip().lower()
+    if not s:
+        return ""
+    # выкидываем пунктуацию
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    # убираем простые артикли, которые часто "прыгают" в OCR/LLM
+    tokens = [t for t in s.split() if t not in ("a", "an", "the")]
+    return " ".join(tokens)
+
+def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, str]]:
+    """
+    Детектор прямоугольников с текстом на EasyOCR.
+    Возвращает список (x, y, w, h, text) в пикселях.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return []
+
+    h, w = frame_bgr.shape[:2]
+    if h < 10 or w < 10:
+        return []
+
+    reader = get_easyocr_reader()
+    if reader is None:
+        return []
+
+    try:
+        # EasyOCR ожидает RGB
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        # detail=1 -> bbox + text + conf, paragraph=False -> отдельные строки
+        results = reader.readtext(
+            rgb,
+            detail=1,
+            paragraph=False,
+        )
+
+        boxes: List[Tuple[int, int, int, int, str]] = []
+        # отсечём совсем мелкий шум: ~0.3% площади региона
+        min_area = (w * h) * 0.003
+
+        for res in results:
+            # формат результата: (bbox, text, conf) или [bbox, text, conf]
+            if not res or len(res) < 2:
+                continue
+
+            bbox = res[0]
+            text = str(res[1] or "").strip()
+            if not text:
+                # пустой текст нам не нужен
+                continue
+
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x0, y0 = min(xs), min(ys)
+            x1, y1 = max(xs), max(ys)
+            bw, bh = x1 - x0, y1 - y0
+
+            if bw < 5 or bh < 5:
+                continue
+
+            area = bw * bh
+            if area < min_area:
+                continue
+
+            # фильтр по форме:
+            # сильно "высокие и узкие" боксы (почти вертикальные) выкидываем,
+            # чтобы меньше цеплять перила/части одежды
+            aspect = bw / float(bh) if bh > 0 else 999.0
+            if aspect < 1.2 and bw < w * 0.4:
+                continue
+
+            boxes.append((int(x0), int(y0), int(bw), int(bh), text))
+
+        return boxes
+
+    except Exception as e:
+        print("[OCR-BOXES] detect_text_boxes_easyocr error:", e)
+        return []
+
+def _filter_boxes_by_llm_text(
+    boxes_with_text: List[Tuple[int, int, int, int, str]],
+    en_full: str,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Пытаемся выбрать только те боксы, которые соответствуют основному диалогу
+    из LLM-OCR (en_full), и выкинуть имя / мусор.
+
+    boxes_with_text: [(x, y, w, h, text), ...]
+    возвращаем:      [(x, y, w, h), ...]
+    """
+
+    if not boxes_with_text:
+        return []
+
+    en_full = en_full or ""
+
+    # 1) Разделяем полный текст на NAME + BODY той же логикой, что и в переводчике
+    try:
+        name_line, body = _split_name_and_body(en_full)
+    except Exception:
+        name_line, body = None, en_full
+
+    name_c = canon_en(name_line) if name_line else ""
+    body_c = canon_en(body) if body else canon_en(en_full)
+
+    if not body_c:
+        # если тело пустое — лучше вернуть все боксы как есть
+        return [(x, y, w, h) for (x, y, w, h, _t) in boxes_with_text]
+
+    first_body_word = body_c.split()[0] if body_c.split() else ""
+
+    good: List[Tuple[int, int, int, int]] = []
+
+    for (x, y, w, h, txt) in boxes_with_text:
+        t = (txt or "").strip()
+        if not t:
+            continue
+
+        t_c = canon_en(t)
+
+        # 2) Если этот бокс очень похож на строку NAME — выкидываем его
+        if name_c:
+            r_name = SequenceMatcher(None, t_c, name_c).ratio()
+            if r_name >= 0.8:
+                # почти точно nameplate
+                continue
+
+        # 3) Короткие подписи (1–3 слова, без точки и т.п.) — потенциальный мусор,
+        #    но если они явно совпадают с началом BODY, считаем диалогом
+        is_short_label = (
+            len(t_c) > 0
+            and len(t_c.split()) <= 3
+            and not any(ch in t_c for ch in ".!?:")
+        )
+
+        prefix_match = False
+        if first_body_word:
+            if t_c.startswith(first_body_word):
+                prefix_match = True
+            else:
+                fw = t_c.split()[0]
+                if fw == first_body_word:
+                    prefix_match = True
+
+        # 4) Похож ли текст бокса на начало основного текста?
+        body_prefix = body_c[: len(t_c) + 16]
+        ratio = SequenceMatcher(None, t_c, body_prefix).ratio()
+
+        if prefix_match or ratio >= 0.6:
+            # это кусок основного диалога
+            good.append((x, y, w, h))
+        else:
+            # если это короткий лейбл и он не совпал с началом BODY — скорее всего имя/мусор
+            if not is_short_label:
+                # длинную строку всё-таки лучше не терять вообще
+                good.append((x, y, w, h))
+
+    if not good:
+        # на всякий случай, если всё отфильтровали — не ломаем поведение
+        return [(x, y, w, h) for (x, y, w, h, _t) in boxes_with_text]
+
+    good.sort(key=lambda b: b[1])  # стабильный порядок по вертикали
+    return good
 
 def _bgr_to_png_b64(img, max_side: int = 1400) -> str:
     h, w = img.shape[:2]
@@ -203,15 +402,13 @@ class ModelHubDialog(QDialog):
              "url":"https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3-VL-2B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-VL-2B-Instruct (OCR).gguf"},
             {"name": "Qwen3-VL-2B-mmproj", "kind": "mmproj", "fmt": "F16/BF16", "note":"Проектор к Qwen-VL-2B (название будет просто mmproj-F16!!!) (необходим для Qwen-B2)", "size": "~800 MB",
              "url":"https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-VL-2B-mmproj.gguf"},
-            {"name": "Nanonets-OCR2-3B", "kind": "OCR (VL)", "fmt": "GGUF Q4_K_M", "note":"Альтернативная OCR (Качество примерно такое же)", "size": "~2 GB",
-             "url":"https://huggingface.co/mradermacher/Nanonets-OCR2-3B-GGUF/resolve/main/Nanonets-OCR2-3B.Q4_K_M.gguf?download=true", "filename":"Nanonets-OCR2-3B.gguf"},
-            {"name": "Nanonets-OCR2-3B-mmproj", "kind": "mmproj", "fmt": "Q8_0", "note":"Проектор к Nanonets", "size": "~850 MB",
-             "url":"https://huggingface.co/mradermacher/Nanonets-OCR2-3B-GGUF/resolve/main/Nanonets-OCR2-3B.mmproj-Q8_0.gguf?download=true", "filename":"Nanonets-OCR2-3B-mmproj.gguf"},
             # Translator / TEXT
             {"name": "Qwen3-4B-Instruct", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_K_M", "note":"Только текст для дуал режима", "size": "~2.5 GB",
              "url":"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true", "filename":"Qwen3-4B-Instruct.gguf"},
             {"name": "Qwen3-4B-Instruct", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_NL", "note":"Только текст для дуал режима (ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~2.4 GB",
              "url":"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-IQ4_NL.gguf?download=true", "filename":"Qwen3-4B-Instruct.gguf"},
+            {"name": "Hunyuan-MT-7B-GGUF", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_K_M", "note":"Хорошее алтернатива между качеством и качеством). Переводит очень хорошо, читать приятно, но абсолютно клал болт на лор и фразбук", "size": "~4.6 GB",
+             "url":"https://huggingface.co/mradermacher/Hunyuan-MT-7B-GGUF/resolve/main/Hunyuan-MT-7B.Q4_K_M.gguf?download=true", "filename":"Hunyuan-MT-7B-GGUF.gguf"},
             # Всё в одном
             {"name": "Qwen3-8B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_K_M", "note":"Модель для соло режима (И читает и переводит)", "size": "~5 GB",
              "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct.gguf"},
@@ -250,10 +447,8 @@ class ModelHubDialog(QDialog):
 
         # Кнопки действий
         row2 = QHBoxLayout()
-        self.btnFill = QPushButton("Из пресета")
         self.btnDl   = QPushButton("Скачать")
         self.btnClose= QPushButton("Закрыть")
-        row2.addWidget(self.btnFill)
         row2.addStretch(1)
         row2.addWidget(self.btnDl)
         row2.addWidget(self.btnClose)
@@ -269,9 +464,10 @@ class ModelHubDialog(QDialog):
 
         # Сигналы
         self.btnBrowse.clicked.connect(self._choose_dir)
-        self.btnFill.clicked.connect(self._fill_from_selected)
         self.btnDl.clicked.connect(self._start_download)
         self.btnClose.clicked.connect(self.reject)
+        # Автоподстановка URL при выборе пресета
+        self.tree.itemSelectionChanged.connect(self._fill_from_selected)
 
         self._worker: DownloadWorker|None = None
         
@@ -340,6 +536,17 @@ class ModelHubDialog(QDialog):
         self.lab.setText(msg)
         if ok:
             QMessageBox.information(self, "Модели", "Загрузка завершена.")
+
+            # после успешной загрузки попробуем обновить список моделей в родительском окне
+            parent = self.parent()
+            if parent is not None:
+                for name in ("_rescan_models", "_scan_models", "_scan_models_ui", "_rebuild_models_list"):
+                    if hasattr(parent, name):
+                        try:
+                            getattr(parent, name)()
+                            break
+                        except Exception as e:
+                            print("[ModelHub] rescan error:", e)
         else:
             QMessageBox.critical(self, "Модели", msg)
 
@@ -351,18 +558,33 @@ class ACCENT_POLICY(ctypes.Structure):
               ("GradientColor",ctypes.c_uint),("AnimationId",ctypes.c_int)]
 class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
     _fields_=[("Attribute",ctypes.c_int),("Data",ctypes.c_void_p),("SizeOfData",ctypes.c_size_t)]
-WCA_ACCENT_POLICY=19
-ACCENT_ENABLE_ACRYLICBLURBEHIND=4
+WCA_ACCENT_POLICY = 19
+ACCENT_DISABLED   = 0
+ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+
 user32 = ctypes.windll.user32
 SetWindowCompositionAttribute = user32.SetWindowCompositionAttribute
 SetWindowCompositionAttribute.argtypes=[wt.HWND, ctypes.POINTER(WINDOWCOMPOSITIONATTRIBDATA)]
 SetWindowCompositionAttribute.restype=_HRESULT
+
+def _set_accent(hwnd:int, state:int, tint_abgr:int=0):
+    policy = ACCENT_POLICY()
+    policy.AccentState = state
+    policy.GradientColor = tint_abgr
+    data = WINDOWCOMPOSITIONATTRIBDATA()
+    data.Attribute = WCA_ACCENT_POLICY
+    data.SizeOfData = ctypes.sizeof(policy)
+    data.Data = ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p)
+    try:
+        SetWindowCompositionAttribute(wt.HWND(hwnd), ctypes.byref(data))
+    except Exception as e:
+        print("[ACRYLIC] error:", e)
+
 def enable_acrylic(hwnd:int, tint_abgr:int=0x40101010):
-    policy=ACCENT_POLICY(); policy.AccentState=ACCENT_ENABLE_ACRYLICBLURBEHIND
-    data=WINDOWCOMPOSITIONATTRIBDATA(); data.Attribute=WCA_ACCENT_POLICY
-    data.SizeOfData=ctypes.sizeof(policy)
-    data.Data=ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p)
-    SetWindowCompositionAttribute(wt.HWND(hwnd), ctypes.byref(data))
+    _set_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, tint_abgr)
+
+def disable_acrylic(hwnd:int):
+    _set_accent(hwnd, ACCENT_DISABLED, 0)
 
 def _get_window_rect(hwnd):
     try:
@@ -473,17 +695,168 @@ class RegionPanel(QWidget):
         self.setGeometry(rect)
 
     def apply_acrylic(self):
-        enable_acrylic(int(self.winId()))
+        # применяем выбранный режим фона
+        hwnd = int(self.winId())
+        mode  = globals().get("PANEL_BG_MODE", "blur")
+        alpha = int(globals().get("PANEL_BG_ALPHA", 64))
+        alpha = max(0, min(255, alpha))
+
+        if mode == "blur":
+            # tint цвет — тёмно-серый, альфа задаётся из настроек
+            tint = (alpha << 24) | 0x101010
+            enable_acrylic(hwnd, tint_abgr=tint)
+        else:
+            # для solid/none акрил отключаем
+            disable_acrylic(hwnd)
 
     def paintEvent(self, _e):
-        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.rect().adjusted(self.margin, self.margin, -self.margin, -self.margin)
-        ov=self.parent_overlay
-        f=QFont(getattr(ov,'font_family','Segoe UI'), int(getattr(ov,'font_size', 22)))
-        f.setBold(bool(getattr(ov,'font_bold', False)))
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        ov = self.parent_overlay
+
+        rect_full = self.rect()
+        f = QFont(getattr(ov, 'font_family', 'Segoe UI'),
+                  int(getattr(ov, 'font_size', 22)))
+        f.setBold(bool(getattr(ov, 'font_bold', False)))
         p.setFont(f)
-        p.setPen(QColor(0,0,0,220));   p.drawText(rect.translated(1,1), Qt.TextWordWrap|Qt.AlignLeft|Qt.AlignVCenter, self.text)
-        p.setPen(QColor(255,255,255)); p.drawText(rect, Qt.TextWordWrap|Qt.AlignLeft|Qt.AlignVCenter, self.text)
+
+        text = self.text or ""
+
+        # --- режим «подставлять перевод на место оригинального текста» ---
+        if getattr(ov, "draw_over_original", False):
+            # найдём регион, которому принадлежит эта панель
+            region = None
+            for r in getattr(ov, "regions", []):
+                if getattr(r, "panel", None) is self:
+                    region = r
+                    break
+
+            boxes = getattr(region, "text_boxes", None) if region is not None else None
+
+            if boxes:
+                # 1) Убираем строку с именем из текста (но не из OCR/перевода)
+                raw_lines = text.split("\n")
+                visible_text = text
+
+                if len(raw_lines) >= 2:
+                    raw_first = raw_lines[0].strip()
+
+                    # сносим ведущие многоточия / точки / пробелы
+                    cand = re.sub(r"^[.…\s]+", "", raw_first)
+
+                    # убираем висящий двоеточие в конце
+                    if cand.endswith(":"):
+                        cand_core = cand[:-1].strip()
+                    else:
+                        cand_core = cand
+
+                    if cand_core:
+                        tokens = cand_core.split()
+
+                        # считаем nameplate'ом:
+                        #  - 1–3 коротких слова
+                        #  - без пунктуации внутри
+                        #  - каждое слово начинается с заглавной буквы
+                        looks_like_label = (
+                            1 <= len(tokens) <= 3
+                            and not re.search(r"[.,!?;:]", cand_core)
+                            and all(t and t[0].isupper() for t in tokens)
+                        )
+
+                        if looks_like_label:
+                            visible_text = "\n".join(raw_lines[1:]).lstrip("\n")
+
+                if not visible_text.strip():
+                    return  # показывать нечего
+
+                # 2) Объединяем ВСЕ боксы в одну область —
+                # так перевод остаётся на том же месте, что и исходный английский блок
+                boxes_sorted = sorted(boxes, key=lambda b: b[1])
+                min_x = min(b[0] for b in boxes_sorted)
+                min_y = min(b[1] for b in boxes_sorted)
+                max_x = max(b[0] + b[2] for b in boxes_sorted)
+                max_y = max(b[1] + b[3] for b in boxes_sorted)
+                union_box = (min_x, min_y, max_x - min_x, max_y - min_y)
+
+                def draw_block(norm_box, txt):
+                    if not txt.strip():
+                        return
+
+                    nx, ny, nw, nh = norm_box
+
+                    # переводим нормализованные координаты (0..1) в пиксели панели
+                    x = rect_full.x() + int(nx * rect_full.width())
+                    y = rect_full.y() + int(ny * rect_full.height())
+
+                    fm = p.fontMetrics()
+                    flags = Qt.TextWordWrap | Qt.AlignLeft
+
+                    max_w = rect_full.width() - (x - rect_full.x()) - 10
+                    if max_w <= 0:
+                        return
+
+                    # считаем размер текста в локальной системе координат
+                    tmp_rect = fm.boundingRect(0, 0, max_w, 10_000, flags, txt)
+
+                    text_rect = QRect(
+                        x,
+                        y,
+                        tmp_rect.width(),
+                        tmp_rect.height(),
+                    )
+
+                    # паддинги вокруг текста
+                    pad_x, pad_y = 8, 4
+                    bg_rect = text_rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+
+                    # фон под строкой / блоком
+                    mode_box = globals().get("BOX_BG_MODE", "solid")
+                    alpha_box = int(globals().get("BOX_BG_ALPHA", 180))
+                    alpha_box = max(0, min(255, alpha_box))
+
+                    if mode_box == "solid" and alpha_box > 0:
+                        p.setPen(Qt.NoPen)
+                        p.setBrush(QColor(0, 0, 0, alpha_box))
+                        p.drawRoundedRect(bg_rect, 4, 4)
+
+                    # тень
+                    p.setPen(QColor(0, 0, 0, 220))
+                    p.drawText(text_rect.translated(1, 1), flags, txt)
+
+                    # основной текст
+                    p.setPen(QColor(255, 255, 255))
+                    p.drawText(text_rect, flags, txt)
+
+                draw_block(union_box, visible_text)
+                return  # всё нарисовали, базовый режим не нужен
+
+        # --- обычный режим панели (как раньше) ---
+        rect = rect_full.adjusted(self.margin, self.margin,
+                                  -self.margin, -self.margin)
+
+        mode = globals().get("PANEL_BG_MODE", "blur")
+        alpha = int(globals().get("PANEL_BG_ALPHA", 64))
+        alpha = max(0, min(255, alpha))
+
+        if mode == "solid" and alpha > 0:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, alpha))
+            p.drawRoundedRect(rect_full, 4, 4)
+
+        # тень
+        p.setPen(QColor(0, 0, 0, 220))
+        p.drawText(
+            rect.translated(1, 1),
+            Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
+            text,
+        )
+        # текст
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(
+            rect,
+            Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
+            text,
+        )
 
 
 # ===================== Data Model ========================
@@ -506,7 +879,6 @@ class RegionModel:
     last_rendered_instant: str = ""  # чтобы не перерисовывать одинаковое
     seq: int = 0                     # «эпоха» входного текста
     commit_seq: int = 0              # с какой эпохой был последний коммит
-    last_thumb: Optional[np.ndarray] = field(default=None, repr=False)
     last_ocr_ts: float = 0.0
 
     # канон/анти-дубли
@@ -517,6 +889,10 @@ class RegionModel:
     pending_ru_canon: str = ""
     pending_hits: int = 0
     is_frozen: bool = False
+    
+    last_en_canon: str = ""
+    
+    text_boxes: List[Tuple[float, float, float, float]] = field(default_factory=list, repr=False)
 
     panel: Optional[RegionPanel]=field(default=None, repr=False)
 
@@ -582,35 +958,131 @@ class CaptureWorker(QThread):
                     full  = None
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                th = _thumb(gray)
-                changed = True
                 now = time.perf_counter()
 
-                r.last_thumb = th
                 r.last_ocr_ts = now
+
+                # если включён режим «подставлять перевод на место оригинального текста» —
+                # найдём bbox'ы текста и запомним их в нормализованном виде
 
                 # LLM: одна картинка (регион) → перевод
                 reg_b64  = _bgr_to_png_b64(frame, max_side=1024)
                 full_b64 = None
                 r.last_ocr_ts = time.perf_counter()
-                if getattr(self.overlay, "dual_mode", False) and LLMConfigDual is not None:
-                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
-                    ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual) if en else ""
-                else:
-                    ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
-                print(f"[LLM-OCR] got {len(ru) if ru else 0} chars")
 
-                if ru:
-                    # сырой режим: сразу в оверлей, без проверок/стабилизаций
-                    self.textReady.emit(idx, ru)
-                    # (только обновим последние значения, чтобы UI знал, что мы уже что-то показали)
+                en = ""
+                ru = ""
+
+                if getattr(self.overlay, "dual_mode", False) and LLMConfigDual is not None:
+                    # ---------- DUAL: отдельно логируем OCR и перевод ----------
+                    t0 = time.perf_counter()
+                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
+                    t1 = time.perf_counter()
+                    print(f"[DUAL][OCR] region {idx}: {len(en) if en else 0} chars, {t1 - t0:.3f}s, text = {repr((en or '')[:200])}")
+
+                    t2 = time.perf_counter()
+                    ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual) if en else ""
+                    t3 = time.perf_counter()
+                    print(f"[DUAL][TR ] region {idx}: {len(ru) if ru else 0} chars, {t3 - t2:.3f}s, text = {repr((ru or '')[:200])}")
+                else:
+                    # SOLO как раньше
+                    t0 = time.perf_counter()
+                    ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
+                    t1 = time.perf_counter()
+                    print(f"[SOLO][VL ] region {idx}: {len(ru) if ru else 0} chars, {t1 - t0:.3f}s, text = {repr((ru or '')[:200])}")
+                    
+                if getattr(self.overlay, "draw_over_original", False):
                     try:
-                        r.last_sent_ru_raw   = ru
-                        r.last_sent_ru_canon = canon_ru(ru)
+                        boxes_with_text = detect_text_boxes(frame)  # список (x,y,w,h,text)
+                        print(f"[BOXES] region {idx}: {len(boxes_with_text)} boxes -> {boxes_with_text}")
+
+                        boxes_px = _filter_boxes_by_llm_text(boxes_with_text, en)
+                        if len(boxes_px) != len(boxes_with_text):
+                            print(f"[BOXES-FIX] region {idx}: filtered overlay boxes; {len(boxes_with_text)} -> {len(boxes_px)}")
+
+                        h, w = gray.shape[:2]
+                        r.text_boxes = [
+                            (x / float(w), y / float(h), bw / float(w), bh / float(h))
+                            for (x, y, bw, bh) in boxes_px
+                        ]
+                    except Exception as e:
+                        print("[OCR-BOXES] error:", e)
+                        r.text_boxes = []
+
+                # --- DUAL: вырезаем строку с именем из RU, если в EN оно есть ---
+                name_line = None
+                if getattr(self.overlay, "dual_mode", False) and en and ru:
+                    try:
+                        name_line, _body = _split_name_and_body(en)
                     except Exception:
-                        r.last_sent_ru_canon = (ru or "").strip().lower()
-                    r.pending_ru_raw = r.pending_ru_canon = ""
-                    r.pending_hits = 0
+                        name_line = None
+
+                    if name_line:
+                        ru_lines = ru.splitlines()
+                        if len(ru_lines) >= 2:
+                            ru_first = ru_lines[0].strip()
+
+                            # Нормализация метки: убираем всё кроме букв/цифр
+                            def _canon_label(s: str) -> str:
+                                s = s or ""
+                                return re.sub(r"[^0-9a-zA-Zа-яА-Я]+", "", s).lower()
+
+                            # первая строка RU выглядит как короткий неймплейт
+                            looks_like_ru_label = (
+                                ru_first
+                                and len(ru_first) <= 32
+                                and len(ru_first.split()) <= 3
+                                and not any(ch in ru_first for ch in ".!?:")
+                            )
+
+                            if looks_like_ru_label:
+                                en_label = _canon_label(name_line)
+                                ru_label = _canon_label(ru_first)
+
+                                # строки более-менее совпадают
+                                if en_label and ru_label and (
+                                    ru_label == en_label
+                                    or en_label in ru_label
+                                    or ru_label in en_label
+                                ):
+                                    # Считаем, что первая строка — реально имя → убираем её
+                                    ru = "\n".join(ru_lines[1:]).lstrip("\n")
+                
+                if ru:
+                    # канонизируем перевод
+                    try:
+                        ru_canon = canon_ru(ru)
+                    except Exception:
+                        ru_canon = (ru or "").strip().lower()
+
+                    # канон исходного EN (есть только в DUAL, в SOLO en будет пустым)
+                    try:
+                        en_canon = canon_en(en) if en else ""
+                    except Exception:
+                        en_canon = ""
+
+                    mode = "DUAL" if getattr(self.overlay, "dual_mode", False) else "SOLO"
+
+                    # --- Анти-фликер по EN ---
+                    # Если канон EN не изменился, считаем, что фраза та же,
+                    # и игнорируем любые «перепридуманные» варианты перевода.
+                    if en_canon and en_canon == (getattr(r, "last_en_canon", "") or ""):
+                        print(f"[{mode}][SKIP] region {idx}: same EN canon → keep previous RU")
+                        # НИЧЕГО не отправляем в панель и не обновляем last_sent_ru_*
+                        # (на экране останется прошлый стабильный перевод)
+                    else:
+                        # EN изменился (или мы в SOLO и en пустой) — смотрим на RU-канон
+                        if ru_canon == (r.last_sent_ru_canon or ""):
+                            print(f"[{mode}][SKIP] region {idx}: same RU canon")
+                        else:
+                            # новый перевод — отправляем в панель и обновляем состояние
+                            self.textReady.emit(idx, ru)
+                            r.last_sent_ru_raw   = ru
+                            r.last_sent_ru_canon = ru_canon
+                            r.last_en_canon      = en_canon  # <--- важное обновление
+
+                            r.pending_ru_raw = r.pending_ru_canon = ""
+                            r.pending_hits = 0
 
                 self.msleep(self.interval_ms)
             except Exception as e:
@@ -676,7 +1148,10 @@ class Overlay(QWidget):
         self.edit_target='display'
         self.border_w = BORDER_WIDTH
         self.split_border_w = SPLIT_BORDER_WIDTH
+        self.draw_over_original: bool = False
         self.dual_mode = False
+        self.bg_mode  = PANEL_BG_MODE
+        self.bg_alpha = PANEL_BG_ALPHA
         self.ocr_cfg_dual = None
         self.tr_cfg_dual  = None
 
@@ -694,6 +1169,7 @@ class Overlay(QWidget):
         first=RegionModel(QRect(cx,cy,w,h), QRect(cx,cy,w,h), selected=True)
         first.panel=RegionPanel(self); first.panel.set_geometry(first.display_rect); first.panel.show(); first.panel.apply_acrylic()
         self.regions:[RegionModel]=[first]
+        self.draw_over_original = DRAW_OVER_ORIGINAL
 
         self.worker=None
         if start_worker_immediately:
@@ -1212,6 +1688,8 @@ class ConfigWindow(QWidget):
         # --- controls ---
         self.btnStart = QPushButton("Начать перевод")
         self.cbDual = QCheckBox("Двойной режим (OCR + Переводчик)")
+        
+        self.btnStart.clicked.connect(self._start)
 
         # окна/процессы
         self.cbWindow = QComboBox(); self.btnRefreshWin=QPushButton("Обновить список")
@@ -1225,6 +1703,10 @@ class ConfigWindow(QWidget):
         self.cbModel  = QComboBox()
         self.cbMmproj = QComboBox()
         self.btnRescan = QPushButton("Сканировать models/lmm и models/llm")
+        
+        self.cbModelOCR  = QComboBox()   # DUAL: OCR-модель .gguf
+        self.cbMmprojOCR = QComboBox()   # DUAL: mmproj для OCR
+        self.cbModelTR   = QComboBox()   # DUAL: текстовая модель перевода
 
         # настройки модели
         self.spMaxTok = QSpinBox(); self.spMaxTok.setRange(16, 16000); self.spMaxTok.setValue(int(getattr(llm_cfg,'max_tokens',15000)))
@@ -1251,16 +1733,13 @@ class ConfigWindow(QWidget):
         # константы/поведение
         self.spFps    = QDoubleSpinBox(); self.spFps.setRange(0.1, 5.0); self.spFps.setSingleStep(0.1); self.spFps.setValue(float(MAX_OCR_FPS))
         self.spRetr = QDoubleSpinBox(); self.spRetr.setRange(0.0, 600.0); self.spRetr.setSingleStep(0.5); self.spRetr.setDecimals(1); self.spRetr.setValue(0.0)
-        self.spThumbW = QSpinBox(); self.spThumbW.setRange(8, 256); self.spThumbW.setValue(THUMB_SIZE[0])
-        self.spThumbH = QSpinBox(); self.spThumbH.setRange(8, 256); self.spThumbH.setValue(THUMB_SIZE[1])
-        thumbRow = QWidget(); hl = QHBoxLayout(thumbRow); hl.setContentsMargins(0,0,0,0)
-        hl.addWidget(QLabel("W")); hl.addWidget(self.spThumbW); hl.addSpacing(8)
-        hl.addWidget(QLabel("H")); hl.addWidget(self.spThumbH)
         self.spBorder = QSpinBox(); self.spBorder.setRange(1, 16); self.spBorder.setValue(BORDER_WIDTH)
         self.spBorder.valueChanged.connect(lambda v: (setattr(self.overlay, "border_w", int(v)), self.overlay.update()))
         self.spSplit  = QSpinBox(); self.spSplit.setRange(1, 16); self.spSplit.setValue(SPLIT_BORDER_WIDTH)
         self.spSplit.valueChanged.connect(lambda v: (setattr(self.overlay, "split_border_w", int(v)), self.overlay.update()))
         self.cbSmooth = QCheckBox("Плавный вывод (smooth)"); self.cbSmooth.setChecked(RENDER_MODE=="smooth")
+        self.cbOverlayBoxes = QCheckBox("Подставлять перевод на место оригинального текста")
+        self.cbOverlayBoxes.setChecked(False)
         self.spHandle = QSpinBox(); self.spHandle.setRange(6, 30); self.spHandle.setValue(int(HANDLE))
         self.spHandle.valueChanged.connect(lambda v: (globals().__setitem__("HANDLE", int(v)), self.overlay.update()))
 
@@ -1279,31 +1758,253 @@ class ConfigWindow(QWidget):
         self.btnEditOCR.clicked.connect(self._edit_ocr_prompt)
         self.btnPrevOCR.clicked.connect(self._preview_ocr)
 
-        # --- layout ---
+        # --- layout: шапка + левое меню + стэк страниц ---
+
         top = QVBoxLayout(self)
-        
-        top.addWidget(self.btnStart)
-        top.addWidget(self.cbDual)
-        
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        inner = QWidget(scroll)
-        form = QVBoxLayout(inner)
 
-        gbWin = QGroupBox("Окно для захвата"); lw = QHBoxLayout(gbWin)
-        lw.addWidget(QLabel("Окно:")); lw.addWidget(self.cbWindow, 1); lw.addWidget(self.btnRefreshWin)
-        form.addWidget(gbWin)
+        # основная область: слева навигация, справа стэк страниц
+        main = QHBoxLayout()
+        top.addLayout(main, 1)
 
-        self.gbModel = QGroupBox("Модель и mmproj")
-        fm = QFormLayout(self.gbModel)
-        fm.addRow("Модель .gguf:", self.cbModel)
-        fm.addRow("mmproj .gguf:", self.cbMmproj)
-        form.addWidget(self.gbModel)
+        # =========== ЛЕВАЯ КОЛОНКА НАВИГАЦИИ ============
+
+        def _make_nav_button(icon_path: str, tooltip: str) -> QToolButton:
+            btn = QToolButton(self)
+            # иконка
+            btn.setIcon(QIcon(icon_path))
+            btn.setIconSize(QSize(32, 32))  # размер самой картинки
+            # текст нам не нужен, оставим только подсказку
+            btn.setText("")                  # на всякий случай
+            btn.setToolTip(tooltip)
+            # поведение
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            # размеры кнопки (можешь подправить под свои иконки)
+            btn.setFixedSize(64, 64)
+            return btn
+
+        # здесь подставишь свои реальные пути к картинкам
+        self.btnNavHome      = _make_nav_button("_internal/icons/Home.png",      "Дом")
+        self.btnNavCustomize = _make_nav_button("_internal/icons/UI.png",     "Кастомизация")
+        self.btnNavDownload  = _make_nav_button("_internal/icons/Download.png",  "Скачать модели")
+        self.btnNavModel     = _make_nav_button("_internal/icons/Settings.png",       "Настройки моделей")
+        self.btnNavInfo      = _make_nav_button("_internal/icons/FAQ.png",      "Информация")
+
+        navLayout = QVBoxLayout()
+        navLayout.setContentsMargins(0, 0, 0, 0)
+        navLayout.setSpacing(8)
+
+        # верхняя группа кнопок
+        navLayout.addWidget(self.btnNavHome)
+        navLayout.addWidget(self.btnNavCustomize)
+        navLayout.addWidget(self.btnNavDownload)
+        navLayout.addWidget(self.btnNavModel)
+
+        # растяжка, чтобы Info ушла в самый низ
+        navLayout.addStretch()
+
+        # кнопка Info прижата к низу
+        navLayout.addWidget(self.btnNavInfo)
+
+        # оборачиваем в отдельный виджет с фиксированной шириной
+        navWidget = QWidget(self)
+        navWidget.setLayout(navLayout)
+        navWidget.setFixedWidth(64)  # подгони под размер своих иконок
+
+        main.addWidget(navWidget)
+
+        # вертикальная разделительная линия
+        sep = QFrame(self)
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        main.addWidget(sep)
+
+        # =========== ПРАВАЯ ОБЛАСТЬ: QStackedWidget ============
+        self.stack = QStackedWidget(self)
+        main.addWidget(self.stack, 1)
+
+        # --------------------------------------------------------
+        # СТРАНИЦА 0 — ДОМ: старт, окно захвата, лор и фразбук
+        # --------------------------------------------------------
+
+        pageHome = QWidget()
+        homeLayout = QVBoxLayout(pageHome)
+        homeLayout.setContentsMargins(0, 0, 0, 0)
+
+        scrollHome = QScrollArea(pageHome)
+        scrollHome.setWidgetResizable(True)
+        innerHome = QWidget(scrollHome)
+        formHome = QVBoxLayout(innerHome)
         
+        # Начать перевод
+        topRow = QHBoxLayout()
+        topRow.addWidget(self.btnStart)
+        topRow.addSpacing(12)
+        topRow.addWidget(self.cbDual)
+        topRow.addStretch()
+        formHome.addLayout(topRow)
+
+        # Окно для захвата
+        gbWin = QGroupBox("Окно для захвата")
+        lw = QHBoxLayout(gbWin)
+        lw.addWidget(QLabel("Окно:"))
+        lw.addWidget(self.cbWindow, 1)
+        lw.addWidget(self.btnRefreshWin)
+        formHome.addWidget(gbWin)
+
+        # Выбор модели
+        gbModels = QGroupBox("Модели")
+        fmModels = QFormLayout(gbModels)
+
+        # подписи запоминаем как атрибуты, чтобы можно было скрывать
+        self.lblSoloModel   = QLabel("SOLO .gguf:")
+        self.lblSoloMmproj  = QLabel("SOLO mmproj:")
+        self.lblOcrModel    = QLabel("DUAL OCR .gguf:")
+        self.lblOcrMmproj   = QLabel("DUAL OCR mmproj:")
+        self.lblTrModel     = QLabel("DUAL TR .gguf:")
+
+        # SOLO
+        fmModels.addRow(self.lblSoloModel,  self.cbModel)
+        fmModels.addRow(self.lblSoloMmproj, self.cbMmproj)
+
+        # DUAL OCR
+        fmModels.addRow(self.lblOcrModel,   self.cbModelOCR)
+        fmModels.addRow(self.lblOcrMmproj,  self.cbMmprojOCR)
+
+        # DUAL переводчик
+        fmModels.addRow(self.lblTrModel,    self.cbModelTR)
+
+        formHome.addWidget(gbModels)
+        
+        # Лор
+        gbLore = QGroupBox("Лор (game_bible)")
+        fl = QHBoxLayout(gbLore)
+        fl.addWidget(QLabel("Файл лора:"))
+        fl.addWidget(self.edLore, 1)
+        fl.addWidget(self.btnLore)
+        formHome.addWidget(gbLore)
+
+        # Phrasebook
+        gbPB = QGroupBox("Фразеологический словарик (phrasebook)")
+        fpb = QHBoxLayout(gbPB)
+        fpb.addWidget(QLabel("Файл phrasebook:"))
+        fpb.addWidget(self.edPB, 1)
+        fpb.addWidget(self.btnPB)
+        formHome.addWidget(gbPB)
+
+        formHome.addStretch()
+
+        scrollHome.setWidget(innerHome)
+        homeLayout.addWidget(scrollHome)
+        self.stack.addWidget(pageHome)
+
+        # --------------------------------------------------------
+        # СТРАНИЦА 1 — КАСТОМИЗАЦИЯ UI: шрифт, фон, FPS, рамки
+        # --------------------------------------------------------
+
+        pageCustomize = QWidget()
+        layCust = QVBoxLayout(pageCustomize)
+        layCust.setContentsMargins(0, 0, 0, 0)
+
+        scrollCust = QScrollArea(pageCustomize)
+        scrollCust.setWidgetResizable(True)
+        innerCust = QWidget(scrollCust)
+        formCust = QVBoxLayout(innerCust)
+
+        # Шрифт панели
+        gbFont = QGroupBox("Шрифт панели")
+        ff = QFormLayout(gbFont)
+        ff.addRow("Гарнитура:", self.fontFamily)
+        ff.addRow("Размер:", self.fontSize)
+        ff.addRow("", self.fontBold)
+        formCust.addWidget(gbFont)
+
+        # Режим фона панели
+        self.cbBgMode = QComboBox()
+        self.cbBgMode.addItem("Размытие Windows (акрил)", "blur")
+        self.cbBgMode.addItem("Чёрный фон", "solid")
+        self.cbBgMode.addItem("Без фона (только текст)", "none")
+
+        self.spBgAlpha = QSlider(Qt.Horizontal)
+        self.spBgAlpha.setRange(1, 10)
+        self.spBgAlpha.setSingleStep(1)
+        self.spBgAlpha.setValue(5)
+        self.spBgAlpha.setToolTip("1 — минимальное размытие/затемнение, 10 — максимальное")
+
+        # Фон под строками
+        self.cbBoxBgMode = QComboBox()
+        self.cbBoxBgMode.addItem("Как у панели", "panel")
+        self.cbBoxBgMode.addItem("Чёрный фон под строками", "solid")
+        self.cbBoxBgMode.addItem("Без фона под строками", "none")
+
+        self.spBoxBgAlpha = QSlider(Qt.Horizontal)
+        self.spBoxBgAlpha.setRange(1, 10)
+        self.spBoxBgAlpha.setSingleStep(1)
+        self.spBoxBgAlpha.setValue(7)
+        self.spBoxBgAlpha.setToolTip("1 — почти прозрачный, 10 — максимально тёмные плашки под строками")
+
+        # Константы/поведение панели
+        gbK = QGroupBox("Вид и поведение панели")
+        fk = QFormLayout(gbK)
+        fk.addRow("FPS захвата:", self.spFps)
+        fk.addRow("Ширина рамки:", self.spBorder)
+        fk.addRow("Ширина разделителя:", self.spSplit)
+        fk.addRow("Плавный вывод:", self.cbSmooth)
+        fk.addRow("Overlay по боксам:", self.cbOverlayBoxes)
+        fk.addRow("Ручка рамки:", self.spHandle)
+        fk.addRow("Фон панели:", self.cbBgMode)
+        fk.addRow("Интенсивность фона:", self.spBgAlpha)
+        fk.addRow("Фон под строками:", self.cbBoxBgMode)
+        fk.addRow("Интенсивность под строками:", self.spBoxBgAlpha)
+        formCust.addWidget(gbK)
+
+        formCust.addStretch()
+        scrollCust.setWidget(innerCust)
+        layCust.addWidget(scrollCust)
+        self.stack.addWidget(pageCustomize)
+
+        # --------------------------------------------------------
+        # СТРАНИЦА 2 — СКАЧАТЬ МОДЕЛИ
+        # --------------------------------------------------------
+
+        pageDownload = QWidget()
+        layDown = QVBoxLayout(pageDownload)
+
+        # Встраиваем менеджер моделей прямо во вкладку
+        try:
+            base = os.path.dirname(self.cbModel.currentText().strip() or "")
+            if not base:
+                base = str((BASE_DIR / "models" / "llm").resolve())
+        except Exception:
+            base = os.path.join(os.getcwd(), "models", "llm")
+
+        # один экземпляр менеджера, просто как обычный виджет
+        self.modelHub = ModelHubDialog(self, default_models_dir=base)
+        # кнопка "Закрыть" во вкладке не нужна
+        if hasattr(self.modelHub, "btnClose"):
+            self.modelHub.btnClose.hide()
+
+        layDown.addWidget(self.modelHub)
+        self.stack.addWidget(pageDownload)
+
+        # --------------------------------------------------------
+        # СТРАНИЦА 3 — НАСТРОЙКА МОДЕЛЕЙ (SOLO / DUAL)
+        # --------------------------------------------------------
+
+        pageModel = QWidget()
+        layModel = QVBoxLayout(pageModel)
+        layModel.setContentsMargins(0, 0, 0, 0)
+
+        scrollModel = QScrollArea(pageModel)
+        scrollModel.setWidgetResizable(True)
+        innerModel = QWidget(scrollModel)
+        formModel = QVBoxLayout(innerModel)
+
+        # OCR-сервер (DUAL)
         self.gbOCR = QGroupBox("OCR-сервер (vision)")
-        self.cbModelOCR  = QComboBox()
-        self.cbMmprojOCR = QComboBox()
-        self.edHost1 = QLineEdit("127.0.0.1"); self.spPort1 = QSpinBox(); self.spPort1.setRange(1,65535); self.spPort1.setValue(8080)
+        self.edHost1 = QLineEdit("127.0.0.1")
+        self.spPort1 = QSpinBox(); self.spPort1.setRange(1,65535); self.spPort1.setValue(8080)
         self.spCtx1  = QSpinBox(); self.spCtx1.setRange(1024,65536); self.spCtx1.setValue(8192)
         self.spBatch1= QSpinBox(); self.spBatch1.setRange(1,4096); self.spBatch1.setValue(256)
         self.spUB1   = QSpinBox(); self.spUB1.setRange(1,4096); self.spUB1.setValue(64)
@@ -1314,11 +2015,9 @@ class ConfigWindow(QWidget):
         self.spMaxTok1 = QSpinBox()
         self.spMaxTok1.setRange(64, 16384)
         self.spMaxTok1.setSingleStep(64)
-        self.spMaxTok1.setValue(512)   # разумный потолок для OCR-выдачи
-        
+        self.spMaxTok1.setValue(512)
+
         f1 = QFormLayout(self.gbOCR)
-        f1.addRow("Модель .gguf:", self.cbModelOCR)
-        f1.addRow("mmproj .gguf:", self.cbMmprojOCR)
         f1.addRow("host:", self.edHost1)
         f1.addRow("port:", self.spPort1)
         f1.addRow("max_tokens:", self.spMaxTok1)
@@ -1329,12 +2028,15 @@ class ConfigWindow(QWidget):
         f1.addRow("ngl:", self.spNGL1)
         f1.addRow("seed:", self.spSeed1)
         f1.addRow("slot_id:", self.spSlot1)
-        f1.addRow(self.btnEditOCR); f1.addRow(self.btnPrevOCR)
-        form.addWidget(self.gbOCR)
-        
+        f1.addRow(self.btnEditOCR)
+        f1.addRow(self.btnPrevOCR)
+        f1.addRow(self.btnPrevOCR)
+        formModel.addWidget(self.gbOCR)
+
+        # Переводчик (DUAL)
         self.gbTR = QGroupBox("Перевод-сервер (text)")
-        self.cbModelTR = QComboBox()
-        self.edHost2 = QLineEdit("127.0.0.1"); self.spPort2 = QSpinBox(); self.spPort2.setRange(1,65535); self.spPort2.setValue(8081)
+        self.edHost2 = QLineEdit("127.0.0.1")
+        self.spPort2 = QSpinBox(); self.spPort2.setRange(1,65535); self.spPort2.setValue(8081)
         self.spCtx2  = QSpinBox(); self.spCtx2.setRange(1024,65536); self.spCtx2.setValue(6000)
         self.spBatch2= QSpinBox(); self.spBatch2.setRange(1,4096); self.spBatch2.setValue(256)
         self.spUB2   = QSpinBox(); self.spUB2.setRange(1,4096); self.spUB2.setValue(64)
@@ -1342,24 +2044,33 @@ class ConfigWindow(QWidget):
         self.spNGL2  = QSpinBox(); self.spNGL2.setRange(0,999); self.spNGL2.setValue(999)
         self.spSeed2 = QSpinBox(); self.spSeed2.setRange(0, 2_000_000_000); self.spSeed2.setValue(0)
         self.spSlot2 = QSpinBox(); self.spSlot2.setRange(0,7); self.spSlot2.setValue(1)
-        # TR max_tokens
         self.spMaxTok2 = QSpinBox()
         self.spMaxTok2.setRange(64, 16384)
         self.spMaxTok2.setSingleStep(64)
-        self.spMaxTok2.setValue(1024)  # базовый лимит для перевода
+        self.spMaxTok2.setValue(1024)
         
+        self.spTO2 = QDoubleSpinBox();   self.spTO2.setRange(1.0, 600.0);  self.spTO2.setSingleStep(1.0);  self.spTO2.setDecimals(1);  self.spTO2.setValue(float(getattr(llm_cfg, 'timeout_s', 60.0)))
+        self.spTemp2 = QDoubleSpinBox(); self.spTemp2.setRange(0.0, 2.0);  self.spTemp2.setSingleStep(0.05); self.spTemp2.setDecimals(2); self.spTemp2.setValue(float(getattr(llm_cfg, 'temp', 0.2)))
+        self.spTopP2 = QDoubleSpinBox(); self.spTopP2.setRange(0.0, 1.0);  self.spTopP2.setSingleStep(0.05); self.spTopP2.setDecimals(2); self.spTopP2.setValue(float(getattr(llm_cfg, 'top_p', 0.9)))
+        self.spTopK2 = QSpinBox();       self.spTopK2.setRange(0, 10000);  self.spTopK2.setValue(int(getattr(llm_cfg, 'top_k', 0)))
+        self.spRP2   = QDoubleSpinBox(); self.spRP2.setRange(0.1, 2.0);    self.spRP2.setSingleStep(0.05);  self.spRP2.setDecimals(2);  self.spRP2.setValue(float(getattr(llm_cfg, 'repeat_penalty', 1.0)))
+
         self.cbDual.toggled.connect(self._reflow_mode_ui)
-        
+
         self.btnEditTR  = QPushButton("Настроить промпт (Переводчик)")
         self.btnPrevTR  = QPushButton("Предпросмотр (Переводчик)")
         self.btnEditTR.clicked.connect(self._edit_tr_prompt)
         self.btnPrevTR.clicked.connect(self._preview_tr)
 
         f2 = QFormLayout(self.gbTR)
-        f2.addRow("Модель .gguf:", self.cbModelTR)
         f2.addRow("host:", self.edHost2)
         f2.addRow("port:", self.spPort2)
         f2.addRow("max_tokens:", self.spMaxTok2)
+        f2.addRow("timeout, сек:", self.spTO2)
+        f2.addRow("temperature:", self.spTemp2)
+        f2.addRow("top_p:", self.spTopP2)
+        f2.addRow("top_k:", self.spTopK2)
+        f2.addRow("repeat_penalty:", self.spRP2)
         f2.addRow("ctx-size:", self.spCtx2)
         f2.addRow("batch-size:", self.spBatch2)
         f2.addRow("ubatch-size:", self.spUB2)
@@ -1367,39 +2078,28 @@ class ConfigWindow(QWidget):
         f2.addRow("ngl:", self.spNGL2)
         f2.addRow("seed:", self.spSeed2)
         f2.addRow("slot_id:", self.spSlot2)
-        f2.addRow(self.btnEditTR); f2.addRow(self.btnPrevTR)
-        form.addWidget(self.gbTR)
+        f2.addRow(self.btnEditTR)
+        f2.addRow(self.btnPrevTR)
+        formModel.addWidget(self.gbTR)
 
-        gbLore = QGroupBox("Лор (game_bible)"); fl = QHBoxLayout(gbLore)
-        fl.addWidget(QLabel("Файл лора:")); fl.addWidget(self.edLore, 1); fl.addWidget(self.btnLore)
-        form.addWidget(gbLore)
-        gbPB = QGroupBox("Фразеологический словарик (phrasebook)")
-        fpb = QHBoxLayout(gbPB)
-        fpb.addWidget(QLabel("Файл phrasebook:"))
-        fpb.addWidget(self.edPB, 1)
-        fpb.addWidget(self.btnPB)
-        form.addWidget(gbPB)
-
-        gbFont = QGroupBox("Шрифт панели"); ff = QFormLayout(gbFont)
-        ff.addRow("Гарнитура:", self.fontFamily)
-        ff.addRow("Размер:", self.fontSize)
-        ff.addRow("", self.fontBold)
-        form.addWidget(gbFont)
-
-        gbLLM = QGroupBox("Настройки модели"); flm = QFormLayout(gbLLM)
+        # Настройки модели (SOLO)
+        self.gbLLM = QGroupBox("Настройки модели (SOLO)")
+        flm = QFormLayout(self.gbLLM)
         flm.addRow("max_tokens:", self.spMaxTok)
         flm.addRow("timeout, сек:", self.spTO)
         flm.addRow("temperature:", self.spTemp)
         flm.addRow("top_p:", self.spTopP)
-        form.addWidget(gbLLM)
-        
-        gbGen = QGroupBox("Доп. параметры генерации"); fgen = QFormLayout(gbGen)
+        formModel.addWidget(self.gbLLM)
+
+        # Доп. параметры генерации (SOLO)
+        self.gbGen = QGroupBox("Доп. параметры генерации (SOLO)")
+        fgen = QFormLayout(self.gbGen)
         fgen.addRow("top_k:", self.spTopK)
         fgen.addRow("repeat_penalty:", self.spRP)
         fgen.addRow("seed:", self.spSeed)
         fgen.addRow("slot_id:", self.spSlot)
         fgen.addRow("", self.cbCache)
-        form.addWidget(gbGen)
+        formModel.addWidget(self.gbGen)
 
         self.gbSrv = QGroupBox("Сервер (llama.cpp)")
         fsrv = QFormLayout(self.gbSrv)
@@ -1410,43 +2110,60 @@ class ConfigWindow(QWidget):
         fsrv.addRow("ngl:", self.spNGL)
 
         rowSrv = QWidget()
-        h = QHBoxLayout(rowSrv); h.setContentsMargins(0,0,0,0)
-        h.addWidget(QLabel("host:")); h.addWidget(self.edHost); h.addSpacing(8)
-        h.addWidget(QLabel("port:")); h.addWidget(self.spPort)
+        h = QHBoxLayout(rowSrv)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(QLabel("host:"))
+        h.addWidget(self.edHost)
+        h.addSpacing(8)
+        h.addWidget(QLabel("port:"))
+        h.addWidget(self.spPort)
         fsrv.addRow(rowSrv)
 
-        form.addWidget(self.gbSrv)
+        formModel.addWidget(self.gbSrv)
 
-        gbK = QGroupBox("Константы"); fk = QFormLayout(gbK)
-        fk.addRow("FPS захвата:", self.spFps)
-        fk.addRow("THUMB_SIZE:", thumbRow)
-        fk.addRow("", self.cbSmooth)
-        fk.addRow("Размер ручек рамки:", self.spHandle)
-        fk.addRow("Толщина рамки (display):", self.spBorder)
-        fk.addRow("Толщина рамки (capture):", self.spSplit)
+        # Кнопки промпта (SOLO)
+        rowPrompt = QHBoxLayout()
+        rowPrompt.addWidget(self.btnPrompt)
+        rowPrompt.addWidget(self.btnPreview)
+        formModel.addLayout(rowPrompt)
+
+        formModel.addStretch()
+        scrollModel.setWidget(innerModel)
+        layModel.addWidget(scrollModel)
+        self.stack.addWidget(pageModel)
+
+        # --------------------------------------------------------
+        # СТРАНИЦА 4 — ИНФО
+        # --------------------------------------------------------
+
+        pageInfo = QWidget()
+        layInfo = QVBoxLayout(pageInfo)
+        infoLabel = QLabel()
+        infoLabel.setTextFormat(Qt.RichText)
+        infoLabel.setOpenExternalLinks(True)
+        infoLabel.setWordWrap(True)
+        infoLabel.setText("АИ переводчик by IgoRexa. <br>"
+                            "Версия 0.0.4 <br>"
+                            "GitHub: "
+                            "<a href='https://github.com/igorexa225/AIGameTranslater'>"
+                            "https://github.com/igorexa225/AIGameTranslater"
+                            "</a>")
+        layInfo.addWidget(infoLabel)
+        infoLabel.setStyleSheet("font-size: 14pt;")
+        layInfo.addStretch()
+        self.stack.addWidget(pageInfo)
+
+        # по умолчанию показываем Дом
+        self.btnNavHome.setChecked(True)
+        self.stack.setCurrentIndex(0)
+
+        # навигация
+        self.btnNavHome.clicked.connect(lambda: self._switch_page(0))
+        self.btnNavCustomize.clicked.connect(lambda: self._switch_page(1))
+        self.btnNavDownload.clicked.connect(lambda: self._switch_page(2))
+        self.btnNavModel.clicked.connect(lambda: self._switch_page(3))
+        self.btnNavInfo.clicked.connect(lambda: self._switch_page(4))
         
-        self.btnModelHub = QPushButton("Скачать модели…")
-        fk.addRow(self.btnModelHub)
-        self.btnModelHub.clicked.connect(self._open_model_hub)
-        
-        form.addWidget(gbK)
-
-        scroll.setWidget(inner)
-        top.addWidget(scroll, 1)
-
-        form.addWidget(self.btnPrompt)
-        form.addWidget(self.btnPreview)
-
-        # events
-        self.btnRefreshWin.clicked.connect(self._fill_windows)
-        self.btnRescan.clicked.connect(self._rescan_models)
-        self.btnLore.clicked.connect(self._browse_lore)
-        self.btnPB.clicked.connect(self._browse_phrasebook)
-        self.btnPrompt.clicked.connect(self._edit_prompt)
-        self.btnPreview.clicked.connect(self._preview_system)
-        self.btnStart.clicked.connect(self._start)
-
-        # --- создаём ОВЕРЛЕЙ СРАЗУ (без стартa воркера) для настройки области ---
         self.overlay = Overlay(on_quit=self._back_from_overlay, start_worker_immediately=False)
         self.overlay.show()
         self.raise_()  # держим окно настроек сверху
@@ -1478,35 +2195,59 @@ class ConfigWindow(QWidget):
                 except Exception as e:
                     print("[ModelHub] rescan error:", e)
     
-    def _reflow_mode_ui(self, *args):
-        # защита от случайной реэнтерабельности
-        if getattr(self, "_reflow_in_progress", False):
-            return
-        self._reflow_in_progress = True
-        try:
-            dual = self.cbDual.isChecked() if hasattr(self, "cbDual") else False
+    def _switch_page(self, index: int):
+        """Переключение вкладок слева."""
+        if hasattr(self, "stack"):
+            self.stack.setCurrentIndex(index)
+        # подсветка выбранной кнопки
+        btns = [
+            getattr(self, "btnNavHome", None),
+            getattr(self, "btnNavCustomize", None),
+            getattr(self, "btnNavDownload", None),
+            getattr(self, "btnNavModel", None),
+            getattr(self, "btnNavInfo", None),
+        ]
+        for i, b in enumerate(btns):
+            if b is not None:
+                b.setChecked(i == index)
+    
+    def _reflow_mode_ui(self, *_):
+        """Переключение SOLO <-> DUAL: что показывать в UI."""
+        dual = self.cbDual.isChecked()
 
-            # что показываем в одиночном режиме
-            single_widgets = [
-                getattr(self, "gbModel", None),
-                getattr(self, "gbSrv", None),
-                getattr(self, "btnPrompt", None),
-                getattr(self, "btnPreview", None),
-            ]
-            # что показываем в dual-режиме
-            dual_widgets = [
-                getattr(self, "gbOCR", None),
-                getattr(self, "gbTR", None),
-            ]
+        # --- Вкладка "Дом": какие модели видны ---
 
-            for w in single_widgets:
-                if w:
-                    w.setVisible(not dual)
-            for w in dual_widgets:
-                if w:
-                    w.setVisible(dual)
-        finally:
-            self._reflow_in_progress = False
+        # SOLO видно только в одиночном режиме
+        for w in (self.lblSoloModel, self.cbModel,
+                  self.lblSoloMmproj, self.cbMmproj):
+            w.setVisible(not dual)
+
+        # DUAL видно только в двойном режиме
+        for w in (self.lblOcrModel, self.cbModelOCR,
+                  self.lblOcrMmproj, self.cbMmprojOCR,
+                  self.lblTrModel, self.cbModelTR):
+            w.setVisible(dual)
+
+        # --- Вкладка "LLM": какие группы настроек активны ---
+
+        # SOLO-группы видны только в одиночном режиме
+        for w in (getattr(self, "gbLLM", None),
+                  getattr(self, "gbGen", None),
+                  getattr(self, "gbSrv", None),
+                  getattr(self, "btnPrompt", None),
+                  getattr(self, "btnPreview", None)):
+            if w is not None:
+                w.setVisible(not dual)
+
+        # DUAL-группы (OCR / TR) видны только в двойном режиме
+        for w in (getattr(self, "gbOCR", None),
+                  getattr(self, "gbTR", None),
+                  getattr(self, "btnEditOCR", None),
+                  getattr(self, "btnPrevOCR", None),
+                  getattr(self, "btnEditTR", None),
+                  getattr(self, "btnPrevTR", None)):
+            if w is not None:
+                w.setVisible(dual)
     
     def _load_prefs_into_ui(self):
         p = _load_prefs()
@@ -1585,15 +2326,65 @@ class ConfigWindow(QWidget):
         self.spNGL2.setValue(int(p.get("dual_tr_ngl",999)))
         self.spSeed2.setValue(int(p.get("dual_tr_seed",0)))
         self.spSlot2.setValue(int(p.get("dual_tr_slot",1)))
+        self.spTO2.setValue(float(p.get("dual_tr_timeout_s", p.get("timeout_s", 30.0))))
+        self.spTemp2.setValue(float(p.get("dual_tr_temp",      p.get("temp", 0.2))))
+        self.spTopP2.setValue(float(p.get("dual_tr_top_p",     p.get("top_p", 0.9))))
+        self.spTopK2.setValue(int(p.get("dual_tr_top_k",       p.get("top_k", 0))))
+        self.spRP2.setValue(float(p.get("dual_tr_repeat_penalty", p.get("repeat_penalty", 1.0))))
         self._tr_prompt_override = p.get("dual_tr_system_override","")
         # константы
         self.spFps.setValue(float(p.get("fps", 1.0)))
         self.cbSmooth.setChecked(p.get("render_mode", "smooth") == "smooth")
+        self.cbOverlayBoxes.setChecked(bool(p.get("draw_over_original", False)))
         self.spHandle.setValue(int(p.get("handle", 15)))
-        self.spThumbW.setValue(int(p.get("thumb_w", THUMB_SIZE[0])))
-        self.spThumbH.setValue(int(p.get("thumb_h", THUMB_SIZE[1])))
         self.spBorder.setValue(int(p.get("border_w", BORDER_WIDTH)))
         self.spSplit.setValue(int(p.get("split_border_w", SPLIT_BORDER_WIDTH)))
+        
+        bg_mode = p.get("bg_mode", PANEL_BG_MODE)
+        idx = self.cbBgMode.findData(bg_mode)
+        if idx < 0:
+            idx = 0
+        self.cbBgMode.setCurrentIndex(idx)
+
+        # из сохранённого alpha (0..255) получаем уровень 1..10
+        alpha = int(p.get("bg_alpha", PANEL_BG_ALPHA))
+        alpha = max(0, min(255, alpha))
+        level = 1 if alpha == 0 else max(1, min(10, round(alpha / 255.0 * 10)))
+        self.spBgAlpha.setValue(level)
+
+        # сразу применяем фон
+        self._apply_bg_settings()
+        self.cbBgMode.currentIndexChanged.connect(lambda _ : self._apply_bg_settings())
+        self.spBgAlpha.valueChanged.connect(lambda _ : self._apply_bg_settings())
+        
+        globals()["PANEL_BG_MODE"]  = self.cbBgMode.currentData()
+        globals()["PANEL_BG_ALPHA"] = int(self.spBgAlpha.value())
+        
+        box_mode = p.get("box_bg_mode", BOX_BG_MODE)
+        idx2 = self.cbBoxBgMode.findData(box_mode)
+        if idx2 < 0:
+            idx2 = 0
+        self.cbBoxBgMode.setCurrentIndex(idx2)
+
+        alpha_box = int(p.get("box_bg_alpha", BOX_BG_ALPHA))
+        alpha_box = max(0, min(255, alpha_box))
+        level_box = 1 if alpha_box == 0 else max(1, min(10, round(alpha_box / 255.0 * 10)))
+        self.spBoxBgAlpha.setValue(level_box)
+
+        # сразу применяем фон под строками
+        self._apply_box_bg_settings()
+        self.cbBoxBgMode.currentIndexChanged.connect(lambda _ : self._apply_box_bg_settings())
+        self.spBoxBgAlpha.valueChanged.connect(lambda _ : self._apply_box_bg_settings())
+
+        self.overlay.bg_mode  = PANEL_BG_MODE
+        self.overlay.bg_alpha = PANEL_BG_ALPHA
+
+        try:
+            for r in getattr(self.overlay, "regions", []):
+                if getattr(r, "panel", None):
+                    r.panel.apply_acrylic()
+        except Exception as e:
+            print("[UI] apply bg prefs error:", e)
         # окно
         want = p.get("window_title", "")
         if want:
@@ -1610,6 +2401,55 @@ class ConfigWindow(QWidget):
                 self.overlay.load_regions_from_prefs(regions)
             except Exception as e:
                 print("[UI] load regions prefs error:", e)
+                
+    def _apply_bg_settings(self):
+        """Применить текущие настройки фона ко всем панелям сразу."""
+        global PANEL_BG_MODE, PANEL_BG_ALPHA
+
+        mode = self.cbBgMode.currentData()
+        level = int(self.spBgAlpha.value())  # 1..10
+
+        # Маппинг 1–10 → 0..255 (линейно)
+        level = max(1, min(10, level))
+        alpha = int(round(level / 10.0 * 255))
+
+        PANEL_BG_MODE = mode
+        PANEL_BG_ALPHA = alpha
+
+        self.overlay.bg_mode = PANEL_BG_MODE
+        self.overlay.bg_alpha = PANEL_BG_ALPHA
+
+        # Перекинуть настройки на все RegionPanel
+        try:
+            for r in getattr(self.overlay, "regions", []):
+                panel = getattr(r, "panel", None)
+                if panel is not None:
+                    panel.apply_acrylic()
+                    panel.update()
+        except Exception as e:
+            print("[UI] apply bg settings error:", e)
+            
+    def _apply_box_bg_settings(self):
+        """Применить настройки фона под строками ко всем панелям."""
+        global BOX_BG_MODE, BOX_BG_ALPHA
+
+        mode = self.cbBoxBgMode.currentData()
+        level = int(self.spBoxBgAlpha.value())  # 1..10
+
+        level = max(1, min(10, level))
+        alpha = int(round(level / 10.0 * 255))
+
+        BOX_BG_MODE = mode
+        BOX_BG_ALPHA = alpha
+
+        # Перерисовать все RegionPanel, чтобы фон под строками обновился
+        try:
+            for r in getattr(self.overlay, "regions", []):
+                panel = getattr(r, "panel", None)
+                if panel is not None:
+                    panel.update()
+        except Exception as e:
+            print("[UI] apply box-bg settings error:", e)
             
     def _collect_prefs(self) -> dict:
         prefs = {
@@ -1625,12 +2465,15 @@ class ConfigWindow(QWidget):
             "temp": float(self.spTemp.value()),
             "top_p": float(self.spTopP.value()),
             "fps": float(self.spFps.value()),
-            "thumb_w": int(self.spThumbW.value()),
-            "thumb_h": int(self.spThumbH.value()),
             "border_w": int(self.spBorder.value()),
             "split_border_w": int(self.spSplit.value()),
             "render_mode": "smooth" if self.cbSmooth.isChecked() else "instant",
+            "draw_over_original": bool(self.cbOverlayBoxes.isChecked()),
             "handle": int(self.spHandle.value()),
+            "bg_mode": self.cbBgMode.currentData(),
+            "bg_alpha": int(round(max(1, min(10, self.spBgAlpha.value())) / 10.0 * 255)),
+            "box_bg_mode": self.cbBoxBgMode.currentData(),
+            "box_bg_alpha": int(round(max(1, min(10, self.spBoxBgAlpha.value())) / 10.0 * 255)),
             "window_title": self.cbWindow.currentText().strip(),
             "system_override": llm_cfg.system_override or "",
             "top_k": int(self.spTopK.value()),
@@ -1674,6 +2517,11 @@ class ConfigWindow(QWidget):
         prefs["dual_tr_ngl"]    = int(self.spNGL2.value())
         prefs["dual_tr_seed"]   = int(self.spSeed2.value())
         prefs["dual_tr_slot"]   = int(self.spSlot2.value())
+        prefs["dual_tr_timeout_s"]       = float(self.spTO2.value())
+        prefs["dual_tr_temp"]            = float(self.spTemp2.value())
+        prefs["dual_tr_top_p"]           = float(self.spTopP2.value())
+        prefs["dual_tr_top_k"]           = int(self.spTopK2.value())
+        prefs["dual_tr_repeat_penalty"]  = float(self.spRP2.value())
         prefs["dual_tr_system_override"] = getattr(self, "_tr_prompt_override", "")
 
         # регионы
@@ -1837,7 +2685,7 @@ class ConfigWindow(QWidget):
     
     def _start(self):
         # применяем настройки
-        global MAX_OCR_FPS, RENDER_MODE, HANDLE, SERVER_EXE, THUMB_SIZE
+        global MAX_OCR_FPS, RENDER_MODE, HANDLE, SERVER_EXE, DRAW_OVER_ORIGINAL, PANEL_BG_MODE, PANEL_BG_ALPHA
         
         sel = self.cbWindow.currentText(); hwnd = getattr(self, "_hwnd_map", {}).get(sel)
 
@@ -1855,10 +2703,19 @@ class ConfigWindow(QWidget):
         MAX_OCR_FPS    = float(self.spFps.value())
         RENDER_MODE    = "smooth" if self.cbSmooth.isChecked() else "instant"
         HANDLE         = int(self.spHandle.value())
-        THUMB_SIZE        = (int(self.spThumbW.value()), int(self.spThumbH.value()))
+        DRAW_OVER_ORIGINAL = bool(self.cbOverlayBoxes.isChecked())
+        self._apply_bg_settings()
+        try:
+            for r in getattr(self.overlay, "regions", []):
+                if getattr(r, "panel", None):
+                    r.panel.apply_acrylic()
+        except Exception as e:
+            print("[UI] reapply acrylic on start error:", e)
+        self._apply_box_bg_settings()
         
         self.overlay.border_w = int(self.spBorder.value())
         self.overlay.split_border_w = int(self.spSplit.value())
+        self.overlay.draw_over_original = bool(self.cbOverlayBoxes.isChecked())
 
         # применим лор
         lore_path = (self.edLore.text() or "").strip()
@@ -1951,10 +2808,15 @@ class ConfigWindow(QWidget):
             self.overlay.tr_cfg_dual = LLMConfigDual(
                 server=f"http://{host2}:{port2}",
                 model=tr_model,
-                timeout_s=float(self.spTO.value()),
+                timeout_s=float(self.spTO2.value()),
                 max_tokens=int(self.spMaxTok2.value()),
-                slot_id=int(self.spSlot2.value()), seed=int(self.spSeed2.value()),
-                system_override=(getattr(self,"_tr_prompt_override","") or None),
+                temp=float(self.spTemp2.value()),
+                top_p=float(self.spTopP2.value()),
+                top_k=int(self.spTopK2.value()),
+                repeat_penalty=float(self.spRP2.value()),
+                slot_id=int(self.spSlot2.value()),
+                seed=int(self.spSeed2.value()),
+                system_override=(getattr(self, "_tr_prompt_override", "") or None),
                 lore_path=(llm_cfg.lore_path or None),
                 phrasebook_path=(llm_cfg.phrasebook_path or None),
             )
