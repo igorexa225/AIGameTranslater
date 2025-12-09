@@ -217,19 +217,30 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
         print("[DUAL][OCR] http", r.status_code, "in", f"{dt:.0f} ms", (r.text or "")[:180])
         return ""
     js = r.json()
-    out = (js.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    out = (js.get("choices", [{}])[0]
+              .get("message", {})
+              .get("content") or "").strip()
 
-    # --- Фильтр фантомных ответов (модель повторяет наш промпт) ---
-    bad_snippets = (
-        "Вы получили имя говорящего",            # кусок нашего system-prompt'а
-        "Переводите текст исключительно на русский язык",
-        "Translate the following text into natural Russian",  # на случай англ. эха
+    lower = out.lower()
+
+    # --- Фильтр галлюцинаций OCR (описание вместо текста) ---
+    hallucination_markers = (
+        "the following text is visible in the image",
+        "the text is not visible in the image",
+        "no text is visible in the image",
+        "there is no readable text in the image",
+        "no legible text is visible in the image",
+        "The game is a classic, and it's a great way",
+        "The final answer is:\nThe final answe",
     )
-    if any(snippet in out for snippet in bad_snippets):
-        print("[DUAL][TR] prompt echo detected, ignoring bad response")
+
+    if any(m in lower for m in hallucination_markers):
+        # Модель описывает картинку, а не считывает текст — игнорируем
+        print(f"[DUAL][OCR] hallucinated description, ignoring; raw = {repr(out[:200])}")
         return ""
 
-    print(f"[DUAL][TR] {len(out)} chars in {dt:.0f} ms")
+    # Нормальный случай: отдаём распознанный EN
+    print(f"[DUAL][OCR] {len(out)} chars in {dt:.0f} ms, text = {repr(out[:200])}")
     return out
 
 def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
@@ -282,6 +293,26 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         print("[DUAL][TR] http", r.status_code, "in", f"{dt:.0f} ms", (r.text or "")[:180])
         return ""
     js = r.json()
-    out = (js.get("choices",[{}])[0].get("message",{}).get("content") or "").strip()
-    print(f"[DUAL][TR] {len(out)} chars in {dt:.0f} ms")
+    out = (js.get("choices", [{}])[0]
+              .get("message", {})
+              .get("content") or "").strip()
+
+    lower = out.lower()
+
+    # --- Фильтр эха промпта / мета-ответов ---
+    prompt_echo_snippets = (
+        "вы получили имя говорящего",                   # русский кусок system-promt'а
+        "переводите текст исключительно на русский язык",
+        "you are given a speaker name",                 # английская версия
+        "translate the following english text into russian",
+        "```plaintext",                                 # часто в фантомных ответах
+        "as an ai language model",                      # на случай типичных фраз
+        "Эта игра – настоящий классик, и она отлично",
+    )
+
+    if any(s in lower for s in prompt_echo_snippets):
+        print(f"[DUAL][TR] prompt/meta echo detected, ignoring; raw = {repr(out[:200])}")
+        return ""
+
+    print(f"[DUAL][TR] {len(out)} chars in {dt:.0f} ms, text = {repr(out[:200])}")
     return out

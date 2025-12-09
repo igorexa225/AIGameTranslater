@@ -246,79 +246,198 @@ def _filter_boxes_by_llm_text(
     boxes_with_text: [(x, y, w, h, text), ...]
     возвращаем:      [(x, y, w, h), ...]
     """
+    # ЖЁСТКАЯ ЗАЩИТА: вообще ничего нет → ничего не делаем
+    if not boxes_with_text:
+        return []
 
+    # Нормализуем входные боксы — отбрасываем кривые кортежи
+    safe_boxes: List[Tuple[int, int, int, int, str]] = []
+    try:
+        for b in boxes_with_text:
+            if not b:
+                continue
+            # Иногда EasyOCR/что-то ещё может вернуть список не той длины
+            if len(b) < 5:
+                try:
+                    print("[OCR-BOXES] bad box tuple (len<5):", b)
+                except Exception:
+                    pass
+                continue
+            x, y, w, h, txt = b[0], b[1], b[2], b[3], b[4]
+            safe_boxes.append((int(x), int(y), int(w), int(h), txt))
+    except Exception as e:
+        print("[OCR-BOXES] _filter_boxes_by_llm_text pre-normalize error:", e)
+        # если даже тут что-то пошло не так — лучше вообще не использовать боксы
+        return []
+
+    boxes_with_text = safe_boxes
     if not boxes_with_text:
         return []
 
     en_full = en_full or ""
 
-    # 1) Разделяем полный текст на NAME + BODY той же логикой, что и в переводчике
     try:
-        name_line, body = _split_name_and_body(en_full)
-    except Exception:
-        name_line, body = None, en_full
+        # 1) Разделяем полный текст на NAME + BODY той же логикой, что и в переводчике
+        try:
+            name_line, body = _split_name_and_body(en_full)
+        except Exception:
+            name_line, body = None, en_full
 
-    name_c = canon_en(name_line) if name_line else ""
-    body_c = canon_en(body) if body else canon_en(en_full)
+        name_c = canon_en(name_line) if name_line else ""
+        body_c = canon_en(body) if body else canon_en(en_full)
 
-    if not body_c:
-        # если тело пустое — лучше вернуть все боксы как есть
-        return [(x, y, w, h) for (x, y, w, h, _t) in boxes_with_text]
+        if not body_c:
+            # если тело пустое — лучше вернуть все боксы как есть
+            return [
+                (int(x), int(y), int(w), int(h))
+                for (x, y, w, h, _t) in boxes_with_text
+            ]
 
-    first_body_word = body_c.split()[0] if body_c.split() else ""
+        first_body_word = body_c.split()[0] if body_c.split() else ""
 
-    good: List[Tuple[int, int, int, int]] = []
+        good: List[Tuple[int, int, int, int]] = []
 
-    for (x, y, w, h, txt) in boxes_with_text:
-        t = (txt or "").strip()
-        if not t:
-            continue
-
-        t_c = canon_en(t)
-
-        # 2) Если этот бокс очень похож на строку NAME — выкидываем его
-        if name_c:
-            r_name = SequenceMatcher(None, t_c, name_c).ratio()
-            if r_name >= 0.8:
-                # почти точно nameplate
+        # --- базовая фильтрация по тексту (как было раньше) ---
+        for (x, y, w, h, txt) in boxes_with_text:
+            t = (txt or "").strip()
+            if not t:
                 continue
 
-        # 3) Короткие подписи (1–3 слова, без точки и т.п.) — потенциальный мусор,
-        #    но если они явно совпадают с началом BODY, считаем диалогом
-        is_short_label = (
-            len(t_c) > 0
-            and len(t_c.split()) <= 3
-            and not any(ch in t_c for ch in ".!?:")
-        )
+            t_c = canon_en(t)
 
-        prefix_match = False
-        if first_body_word:
-            if t_c.startswith(first_body_word):
-                prefix_match = True
-            else:
-                fw = t_c.split()[0]
-                if fw == first_body_word:
+            # 2) Если этот бокс очень похож на строку NAME — выкидываем его
+            if name_c:
+                r_name = SequenceMatcher(None, t_c, name_c).ratio()
+                if r_name >= 0.8:
+                    # почти точно nameplate
+                    continue
+
+            # 3) Короткие подписи (1–3 слова, без точки и т.п.) — потенциальный мусор,
+            #    но если они явно совпадают с началом BODY, считаем диалогом
+            is_short_label = (
+                len(t_c) > 0
+                and len(t_c.split()) <= 3
+                and not any(ch in t_c for ch in ".!?:")
+            )
+
+            prefix_match = False
+            if first_body_word:
+                if t_c.startswith(first_body_word):
                     prefix_match = True
+                else:
+                    parts = t_c.split()
+                    if parts and parts[0] == first_body_word:
+                        prefix_match = True
 
-        # 4) Похож ли текст бокса на начало основного текста?
-        body_prefix = body_c[: len(t_c) + 16]
-        ratio = SequenceMatcher(None, t_c, body_prefix).ratio()
+            # 4) Похож ли текст бокса на начало основного текста?
+            body_prefix = body_c[: len(t_c) + 16]
+            ratio = SequenceMatcher(None, t_c, body_prefix).ratio()
 
-        if prefix_match or ratio >= 0.6:
-            # это кусок основного диалога
-            good.append((x, y, w, h))
-        else:
-            # если это короткий лейбл и он не совпал с началом BODY — скорее всего имя/мусор
-            if not is_short_label:
-                # длинную строку всё-таки лучше не терять вообще
-                good.append((x, y, w, h))
+            if prefix_match or ratio >= 0.6:
+                # это кусок основного диалога
+                good.append((int(x), int(y), int(w), int(h)))
+            else:
+                # если это короткий лейбл и он не совпал с началом BODY — скорее всего имя/мусор
+                if not is_short_label:
+                    # длинную строку всё-таки лучше не терять вообще
+                    good.append((int(x), int(y), int(w), int(h)))
 
-    if not good:
-        # на всякий случай, если всё отфильтровали — не ломаем поведение
-        return [(x, y, w, h) for (x, y, w, h, _t) in boxes_with_text]
+        # если вообще ничего не прошло — не ломаем поведение
+        if not good:
+            return [
+                (int(x), int(y), int(w), int(h))
+                for (x, y, w, h, _t) in boxes_with_text
+            ]
 
-    good.sort(key=lambda b: b[1])  # стабильный порядок по вертикали
-    return good
+        # --- НОВОЕ: кластеризация по строкам и выкидывание верхнего "имени" ---
+        # Собираем карту box -> текст для дальнейшей эвристики
+        text_by_box = {
+            (int(x), int(y), int(w), int(h)): (txt or "").strip()
+            for (x, y, w, h, txt) in boxes_with_text
+        }
+
+        # канонизированный EN-лейбл
+        def _canon_label(s: str) -> str:
+            s = s or ""
+            return re.sub(r"[^0-9a-zA-Zа-яА-Я]+", "", s).lower()
+
+        name_label = _canon_label(name_line) if name_line else ""
+
+        # сортируем боксы по Y
+        boxes_for_rows = sorted(good, key=lambda b: b[1])
+        heights = [h for (_x, _y, _w, h) in boxes_for_rows]
+        avg_h = sum(heights) / max(len(heights), 1)
+        row_thresh = max(4, avg_h * 0.7)
+
+        # разбиваем на строки (ряды) по вертикали
+        rows: list[list[Tuple[int, int, int, int]]] = []
+        cur: list[Tuple[int, int, int, int]] = []
+        if boxes_for_rows:
+            base_y = boxes_for_rows[0][1]
+            cur.append(boxes_for_rows[0])
+            for box in boxes_for_rows[1:]:
+                y = box[1]
+                if abs(y - base_y) <= row_thresh:
+                    cur.append(box)
+                else:
+                    rows.append(cur)
+                    cur = [box]
+                    base_y = y
+            rows.append(cur)
+
+        # если строк нет, просто вернём good
+        if not rows:
+            good.sort(key=lambda b: b[1])
+            return good
+
+        top_row = rows[0]
+
+        # Текст верхней строки
+        row_text = " ".join(
+            text_by_box.get((int(x), int(y), int(w), int(h)), "")
+            for (x, y, w, h) in top_row
+        ).strip()
+        tokens = row_text.split()
+
+        looks_like_label = False
+        if row_text:
+            # короткая строка, мало слов, нет знаков конца предложения
+            if (
+                len(row_text) <= 32
+                and 1 <= len(tokens) <= 3
+                and not any(ch in row_text for ch in ".!?:")
+            ):
+                looks_like_label = True
+
+        # доп. проверка по совпадению с EN-именем
+        if looks_like_label and name_label:
+            top_label = _canon_label(row_text)
+            if top_label and (
+                top_label == name_label
+                or top_label in name_label
+                or name_label in top_label
+            ):
+                # считаем верхнюю строку неймплейтом → выкидываем её целиком
+                new_good: List[Tuple[int, int, int, int]] = []
+                for row in rows[1:]:
+                    new_good.extend(row)
+                if new_good:
+                    good = new_good  # если после этого что-то осталось — используем это
+
+        # финальная сортировка по вертикали
+        good.sort(key=lambda b: b[1])
+        return good
+
+    except Exception as e:
+        # Любая внутренняя ошибка: лог + фолбэк
+        print("[OCR-BOXES] _filter_boxes_by_llm_text error:", e)
+        try:
+            return [
+                (int(x), int(y), int(w), int(h))
+                for (x, y, w, h, _t) in boxes_with_text
+            ]
+        except Exception:
+            return []
 
 def _bgr_to_png_b64(img, max_side: int = 1400) -> str:
     h, w = img.shape[:2]
@@ -962,6 +1081,24 @@ class CaptureWorker(QThread):
 
                 r.last_ocr_ts = now
 
+                boxes_with_text = []
+                if getattr(self.overlay, "draw_over_original", False):
+                    try:
+                        boxes_with_text = detect_text_boxes(frame)  # список (x,y,w,h,text)
+                        print(f"[BOXES] region {idx}: {len(boxes_with_text)} boxes -> {boxes_with_text}")
+
+                        if not boxes_with_text:
+                            # В режиме overlay по боксам: текста нет → ничего не OCR'им и не переводим.
+                            # Остаётся предыдущий стабильный перевод.
+                            r.text_boxes = []
+                            self.msleep(self.interval_ms)
+                            continue
+                    except Exception as e:
+                        print("[OCR-BOXES] detect_text_boxes error:", e)
+                        # Не ломаем обычный вывод: в случае ошибки детектора продолжаем без боксов
+                        boxes_with_text = []
+                        r.text_boxes = []
+                        
                 # если включён режим «подставлять перевод на место оригинального текста» —
                 # найдём bbox'ы текста и запомним их в нормализованном виде
 
@@ -985,20 +1122,24 @@ class CaptureWorker(QThread):
                     t3 = time.perf_counter()
                     print(f"[DUAL][TR ] region {idx}: {len(ru) if ru else 0} chars, {t3 - t2:.3f}s, text = {repr((ru or '')[:200])}")
                 else:
-                    # SOLO как раньше
+                    # SOLO: получаем и EN, и RU из vision-модели
                     t0 = time.perf_counter()
-                    ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
+                    en, ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
                     t1 = time.perf_counter()
-                    print(f"[SOLO][VL ] region {idx}: {len(ru) if ru else 0} chars, {t1 - t0:.3f}s, text = {repr((ru or '')[:200])}")
+                    print(
+                        f"[SOLO][VL ] region {idx}: "
+                        f"EN={len(en) if en else 0} chars, RU={len(ru) if ru else 0} chars, "
+                        f"{t1 - t0:.3f}s, text = {repr((ru or '')[:200])}"
+                    )
                     
-                if getattr(self.overlay, "draw_over_original", False):
+                if getattr(self.overlay, "draw_over_original", False) and boxes_with_text:
                     try:
-                        boxes_with_text = detect_text_boxes(frame)  # список (x,y,w,h,text)
-                        print(f"[BOXES] region {idx}: {len(boxes_with_text)} boxes -> {boxes_with_text}")
-
                         boxes_px = _filter_boxes_by_llm_text(boxes_with_text, en)
                         if len(boxes_px) != len(boxes_with_text):
-                            print(f"[BOXES-FIX] region {idx}: filtered overlay boxes; {len(boxes_with_text)} -> {len(boxes_px)}")
+                            print(
+                                f"[BOXES-FIX] region {idx}: filtered overlay boxes; "
+                                f"{len(boxes_with_text)} -> {len(boxes_px)}"
+                            )
 
                         h, w = gray.shape[:2]
                         r.text_boxes = [
@@ -1007,7 +1148,10 @@ class CaptureWorker(QThread):
                         ]
                     except Exception as e:
                         print("[OCR-BOXES] error:", e)
-                        r.text_boxes = []
+                        # НЕ обнуляем r.text_boxes, чтобы оверлей не пропадал из-за временной ошибки
+                        # просто оставляем предыдущие боксы
+                        # r.text_boxes = []
+                        pass
 
                 # --- DUAL: вырезаем строку с именем из RU, если в EN оно есть ---
                 name_line = None
@@ -1254,11 +1398,28 @@ class Overlay(QWidget):
             self.worker.start()
 
     def stop_worker(self):
-        if self.worker is not None:
+        """Корректно останавливаем поток захвата, чтобы не ловить QThread crash."""
+        w = self.worker
+        if w is None:
+            return
+
+        try:
+            # даём потоку шанс завершиться сам
+            w.stop()
+        except Exception as e:
+            print("[Worker] stop() error:", e)
+
+        # ждём разумное время
+        if not w.wait(2000):
+            print("[Worker] still running after 2s, forcing terminate()")
             try:
-                self.worker.stop(); self.worker.wait(800)
-            except Exception: pass
-            self.worker=None
+                # жёстко прибиваем поток, чтобы он не пережил объект QThread
+                w.terminate()
+            except Exception as e:
+                print("[Worker] terminate() error:", e)
+            w.wait(2000)
+
+        self.worker = None
 
     # ---- рисуем рамки в режиме правки ----
     def paintEvent(self,_e):
@@ -1469,10 +1630,31 @@ class Overlay(QWidget):
         self.update()
 
     def toggle_edit_mode(self):
-        self.edit_mode=not self.edit_mode
+        """
+        Переключить режим правки рамок.
+
+        Пока включён edit_mode — ставим паузу захвата, чтобы тяжёлые модели
+        не забивали процесс и рамка гарантированно отрисовывалась.
+        """
+        new_state = not self.edit_mode
+        self.edit_mode = new_state
+
+        # пока редактируем область — ставим паузу захвата
+        # CaptureWorker.run смотрит на overlay.paused
+        self.paused = new_state
+
+        # панели всегда прозрачны для мыши, двигаем именно рамку overlay
         for r in self.regions:
-            if r.panel: r.panel.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.update()
+            if r.panel:
+                r.panel.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        # при входе в режим правки – гарантированно показываем и поднимаем overlay
+        if self.edit_mode:
+            self.show()
+            self.raise_()
+
+        # при высокой нагрузке update() может отложиться — форсим немедленную отрисовку
+        self.repaint()
 
     def switch_edit_target(self):
         self.edit_target = 'capture' if (self.edit_target=='display') else 'display'
@@ -1677,6 +1859,16 @@ def _stop_llama_server2():
         except Exception: pass
     _LLAMA_PROC2 = None
 
+def stop_all_llama_servers():
+    """Останавливает оба сервера (solo/dual), если они запущены."""
+    try:
+        _stop_llama_server()
+    except Exception as e:
+        print("[LLM] error stopping main server:", e)
+    try:
+        _stop_llama_server2()
+    except Exception as e:
+        print("[LLM] error stopping second server:", e)
 # ====================== Настроечный GUI ===================
 
 class ConfigWindow(QWidget):
@@ -1748,11 +1940,15 @@ class ConfigWindow(QWidget):
         self.btnLore = QPushButton("Выбрать…")
         self.edPB  = QLineEdit("")          # путь к phrasebook.txt
         self.btnPB = QPushButton("Выбрать…")
+        self.btnLore.clicked.connect(self._browse_lore)
+        self.btnPB.clicked.connect(self._browse_phrasebook)
         
 
         # промпт
         self.btnPrompt  = QPushButton("Настроить промпт…")
         self.btnPreview = QPushButton("Предпросмотр system…")
+        self.btnPrompt.clicked.connect(self._edit_prompt)
+        self.btnPreview.clicked.connect(self._preview_system)
         self.btnEditOCR = QPushButton("Настроить промпт (OCR)")
         self.btnPrevOCR = QPushButton("Предпросмотр (OCR)")
         self.btnEditOCR.clicked.connect(self._edit_ocr_prompt)
@@ -2539,10 +2735,16 @@ class ConfigWindow(QWidget):
             _save_prefs(p)
         except Exception as e:
             print("[UI] save on back error:", e)
+
         # Вызывается по Ctrl+Alt+Q из оверлея
-        _stop_llama_server()
-        _stop_llama_server2()
-        self.showNormal(); self.activateWindow(); self._fill_windows()
+        try:
+            stop_all_llama_servers()
+        except Exception as e:
+            print("[UI] stop_all_llama_servers on back error:", e)
+
+        self.showNormal()
+        self.activateWindow()
+        self._fill_windows()
 
     def _fill_windows(self):
         self.cbWindow.clear(); self._hwnd_map = {}
@@ -2868,6 +3070,7 @@ class ConfigWindow(QWidget):
         # запускаем воркер и скрываем режим правки
         self.overlay.start_worker()
         self.overlay.edit_mode = False
+        self.overlay.paused = False   # <-- обязательно сбрасываем паузу
         self.overlay.update()
         try:
             _save_prefs(self._collect_prefs())
@@ -2880,6 +3083,19 @@ class ConfigWindow(QWidget):
             _save_prefs(self._collect_prefs())
         except Exception as ex:
             print("[UI] save on close error:", ex)
+
+        # аккуратно останавливаем захват и сервера при выходе из программы
+        try:
+            if getattr(self, "overlay", None) is not None:
+                self.overlay.stop_worker()
+        except Exception as ex:
+            print("[UI] overlay.stop_worker on close error:", ex)
+
+        try:
+            stop_all_llama_servers()
+        except Exception as ex:
+            print("[UI] stop_all_llama_servers on close error:", ex)
+
         super().closeEvent(e)
 
 
@@ -2889,7 +3105,14 @@ def main():
     app = QApplication(sys.argv)
     w = ConfigWindow()
     w.show()
-    sys.exit(app.exec())
+    try:
+        sys.exit(app.exec())
+    finally:
+        # если по какой-то причине дошли сюда без closeEvent — всё равно гасим сервера
+        try:
+            stop_all_llama_servers()
+        except Exception as e:
+            print("[MAIN] stop_all_llama_servers error:", e)
 
 if __name__=="__main__":
     main()

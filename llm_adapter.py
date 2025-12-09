@@ -315,9 +315,10 @@ def vision_translate_from_images(region_png_b64: str,
                 f"(total {(time.perf_counter()-t0_all)*1000:.0f} ms)"
             )
 
-            return ru_final
+            # ВАЖНО: теперь возвращаем и EN, и RU
+            return en_text, ru_final
             print(f"[LLM] vision empty kind={kind} in {dt:.0f} ms")
         except Exception as e:
             print(f"[LLM] vision error kind={kind}:", e)
 
-    return ""
+    return "", ""
