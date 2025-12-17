@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QDialog,
 
 import win32con, win32gui, win32ui, win32api, win32process
 import ctypes.wintypes as wt
+import online_adapter
 
 #========================== Вызов EasyOCR ==============================
 
@@ -111,9 +112,11 @@ try:
         preload_prompt_cache_tr,
         reset_tr_system_cache,
         _split_name_and_body,
+        set_memory_enabled,
     )
 except Exception:
     LLMConfigDual = None
+    set_memory_enabled = None
 
 llm_cfg = LLMConfig(
     enabled=True,
@@ -185,9 +188,24 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
         # EasyOCR ожидает RGB
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
+        # --- НОВОЕ: уменьшаем картинку перед EasyOCR ---
+        # Масштаб 0.7–0.8 обычно сильно снижает нагрузку без потери качества для субтитров.
+        SCALE = 0.7
+
+        if SCALE < 1.0:
+            small_w = max(1, int(w * SCALE))
+            small_h = max(1, int(h * SCALE))
+            # INTER_AREA – оптимален для уменьшения
+            rgb_small = cv2.resize(rgb, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            used_rgb = rgb_small
+            inv_scale = 1.0 / SCALE
+        else:
+            used_rgb = rgb
+            inv_scale = 1.0
+
         # detail=1 -> bbox + text + conf, paragraph=False -> отдельные строки
         results = reader.readtext(
-            rgb,
+            used_rgb,
             detail=1,
             paragraph=False,
         )
@@ -204,11 +222,11 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
             bbox = res[0]
             text = str(res[1] or "").strip()
             if not text:
-                # пустой текст нам не нужен
                 continue
 
-            xs = [p[0] for p in bbox]
-            ys = [p[1] for p in bbox]
+            # bbox пришёл в координатах уменьшенного изображения → растягиваем обратно
+            xs = [p[0] * inv_scale for p in bbox]
+            ys = [p[1] * inv_scale for p in bbox]
             x0, y0 = min(xs), min(ys)
             x1, y1 = max(xs), max(ys)
             bw, bh = x1 - x0, y1 - y0
@@ -220,9 +238,6 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
             if area < min_area:
                 continue
 
-            # фильтр по форме:
-            # сильно "высокие и узкие" боксы (почти вертикальные) выкидываем,
-            # чтобы меньше цеплять перила/части одежды
             aspect = bw / float(bh) if bh > 0 else 999.0
             if aspect < 1.2 and bw < w * 0.4:
                 continue
@@ -1077,6 +1092,54 @@ class CaptureWorker(QThread):
                     full  = None
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                # --- НАЧАЛО ВСТАВКИ: Умная проверка изменений (Visual Diff) ---
+                if getattr(r, "last_gray_img", None) is not None:
+                    # 1. Вычисляем абсолютную разницу
+                    diff = cv2.absdiff(gray, r.last_gray_img)
+                    
+                    # 2. Убираем шум (игнорируем изменения яркости < 25 из 255)
+                    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+                    
+                    # 3. Считаем общее кол-во изменившихся пикселей
+                    changed_pixels = cv2.countNonZero(thresh)
+                    
+                    # Получаем порог стабильности (обычно 2) и текущие хиты
+                    threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
+                    current_hits = r.pending_hits or 0
+
+                    # ЛОГИКА ПРОПУСКА:
+                    # Пропускаем OCR только если:
+                    # 1. Картинка не изменилась (мало пикселей)
+                    # 2. И ПРИ ЭТОМ мы уже стабилизировали текст (current_hits >= threshold)
+                    # Если hits < threshold, мы ОБЯЗАНЫ сделать OCR еще раз, чтобы подтвердить текст.
+                    
+                    if changed_pixels < 50:
+                        if current_hits >= threshold:
+                            self.msleep(self.interval_ms)
+                            continue
+                        # Иначе: идем дальше делать OCR, даже если картинка старая!
+
+                    # 4. Геометрический фильтр (защита от мигающего курсора)
+                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    is_real_text = False
+                    for cnt in contours:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        if w > 30 or h > 30:
+                            is_real_text = True
+                            break
+                    
+                    if not is_real_text:
+                        # Изменения мелкие (курсор).
+                        # То же правило: если текст уже стабилен — спим. Если нет — проверяем.
+                        if current_hits >= threshold:
+                            self.msleep(self.interval_ms)
+                            continue
+
+                # Сохраняем текущий кадр для сравнения в следующем цикле
+                r.last_gray_img = gray.copy()
+                # --- КОНЕЦ ВСТАВКИ ---
+
                 now = time.perf_counter()
 
                 r.last_ocr_ts = now
@@ -1110,27 +1173,34 @@ class CaptureWorker(QThread):
                 en = ""
                 ru = ""
 
-                if getattr(self.overlay, "dual_mode", False) and LLMConfigDual is not None:
-                    # ---------- DUAL: отдельно логируем OCR и перевод ----------
-                    t0 = time.perf_counter()
-                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
-                    t1 = time.perf_counter()
-                    print(f"[DUAL][OCR] region {idx}: {len(en) if en else 0} chars, {t1 - t0:.3f}s, text = {repr((en or '')[:200])}")
+                mode_idx = getattr(self.overlay, "work_mode_idx", 0)
 
-                    t2 = time.perf_counter()
+                if mode_idx == 1: 
+                    # --- DUAL LOCAL ---
+                    # OCR через LLM Dual
+                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
+                    # Перевод через LLM Dual
                     ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual) if en else ""
-                    t3 = time.perf_counter()
-                    print(f"[DUAL][TR ] region {idx}: {len(ru) if ru else 0} chars, {t3 - t2:.3f}s, text = {repr((ru or '')[:200])}")
+                
+                elif mode_idx == 2:
+                    # --- ONLINE ---
+                    # OCR через LLM Dual (используем тот же метод, так как модель та же)
+                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
+                    
+                    # ПЕРЕВОД ЧЕРЕЗ НОВЫЙ ФАЙЛ
+                    if en:
+                        ru = online_adapter.translate_text(en)
+                    else:
+                        ru = ""
+                    
+                    # Логирование для отладки
+                    if ru:
+                         print(f"[ONLINE] Translated: {ru[:50]}...")
+
                 else:
-                    # SOLO: получаем и EN, и RU из vision-модели
-                    t0 = time.perf_counter()
+                    # --- SOLO ---
                     en, ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
-                    t1 = time.perf_counter()
-                    print(
-                        f"[SOLO][VL ] region {idx}: "
-                        f"EN={len(en) if en else 0} chars, RU={len(ru) if ru else 0} chars, "
-                        f"{t1 - t0:.3f}s, text = {repr((ru or '')[:200])}"
-                    )
+                
                     
                 if getattr(self.overlay, "draw_over_original", False) and boxes_with_text:
                     try:
@@ -1161,35 +1231,35 @@ class CaptureWorker(QThread):
                     except Exception:
                         name_line = None
 
+                    # Если в EN вообще есть отдельная строка с именем —
+                    # считаем, что первая строка RU тоже может быть неймплейтом.
                     if name_line:
                         ru_lines = ru.splitlines()
                         if len(ru_lines) >= 2:
-                            ru_first = ru_lines[0].strip()
+                            raw_first = ru_lines[0].strip()
 
-                            # Нормализация метки: убираем всё кроме букв/цифр
-                            def _canon_label(s: str) -> str:
-                                s = s or ""
-                                return re.sub(r"[^0-9a-zA-Zа-яА-Я]+", "", s).lower()
+                            # убираем ведущие точки/многоточие/пробелы
+                            cand = re.sub(r"^[.…\s]+", "", raw_first)
 
-                            # первая строка RU выглядит как короткий неймплейт
-                            looks_like_ru_label = (
-                                ru_first
-                                and len(ru_first) <= 32
-                                and len(ru_first.split()) <= 3
-                                and not any(ch in ru_first for ch in ".!?:")
-                            )
+                            # сносим висящий двоеточие в конце
+                            if cand.endswith(":"):
+                                cand_core = cand[:-1].strip()
+                            else:
+                                cand_core = cand
 
-                            if looks_like_ru_label:
-                                en_label = _canon_label(name_line)
-                                ru_label = _canon_label(ru_first)
+                            if cand_core:
+                                tokens = cand_core.split()
 
-                                # строки более-менее совпадают
-                                if en_label and ru_label and (
-                                    ru_label == en_label
-                                    or en_label in ru_label
-                                    or ru_label in en_label
-                                ):
-                                    # Считаем, что первая строка — реально имя → убираем её
+                                # 1–3 слова, без знаков конца предложения,
+                                # каждое слово начинается с заглавной буквы
+                                looks_like_ru_label = (
+                                    1 <= len(tokens) <= 3
+                                    and not re.search(r"[.,!?;:]", cand_core)
+                                    and all(t and t[0].isupper() for t in tokens)
+                                )
+
+                                if looks_like_ru_label:
+                                    # считаем, что это именно строка с именем → выбрасываем её
                                     ru = "\n".join(ru_lines[1:]).lstrip("\n")
                 
                 if ru:
@@ -1206,27 +1276,63 @@ class CaptureWorker(QThread):
                         en_canon = ""
 
                     mode = "DUAL" if getattr(self.overlay, "dual_mode", False) else "SOLO"
+                    threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
 
-                    # --- Анти-фликер по EN ---
-                    # Если канон EN не изменился, считаем, что фраза та же,
-                    # и игнорируем любые «перепридуманные» варианты перевода.
-                    if en_canon and en_canon == (getattr(r, "last_en_canon", "") or ""):
-                        print(f"[{mode}][SKIP] region {idx}: same EN canon → keep previous RU")
-                        # НИЧЕГО не отправляем в панель и не обновляем last_sent_ru_*
-                        # (на экране останется прошлый стабильный перевод)
-                    else:
-                        # EN изменился (или мы в SOLO и en пустой) — смотрим на RU-канон
+                    # Если EN-канона нет или порог = 0 — работаем по-старому:
+                    # сразу показываем новый RU (если он не дубликат).
+                    if not en_canon or threshold <= 0:
+                        # (старая логика без задержки - оставляем как есть)
                         if ru_canon == (r.last_sent_ru_canon or ""):
                             print(f"[{mode}][SKIP] region {idx}: same RU canon")
                         else:
-                            # новый перевод — отправляем в панель и обновляем состояние
                             self.textReady.emit(idx, ru)
                             r.last_sent_ru_raw   = ru
                             r.last_sent_ru_canon = ru_canon
-                            r.last_en_canon      = en_canon  # <--- важное обновление
-
-                            r.pending_ru_raw = r.pending_ru_canon = ""
+                            r.last_en_canon      = en_canon
+                            r.pending_ru_raw = ""
+                            r.pending_ru_canon = ""
                             r.pending_hits = 0
+
+                    else:
+                        # --- НАЧАЛО ИЗМЕНЕНИЯ (Fuzzy Logic) ---
+                        
+                        # Импорт нужен в начале файла, но можно и тут локально для проверки
+                        from difflib import SequenceMatcher 
+                        
+                        # Сравниваем текущий OCR с прошлым "стабильным"
+                        similarity = SequenceMatcher(None, en_canon, (r.last_en_canon or "")).ratio()
+                        is_stable = similarity > 0.85  # Порог 85% (прощает 1-2 ошибки на 10 букв)
+
+                        if is_stable:
+                            r.pending_hits = (r.pending_hits or 0) + 1
+                        else:
+                            # Текст реально сменился
+                            r.pending_hits = 1
+                            r.last_en_canon = en_canon
+                        
+                        # Всегда сохраняем САМЫЙ СВЕЖИЙ вариант перевода
+                        r.pending_ru_raw = ru
+                        r.pending_ru_canon = ru_canon
+
+                        if r.pending_hits < threshold:
+                            print(
+                                f"[{mode}][PENDING] region {idx}: EN fuzzy match {similarity:.2f}, "
+                                f"hits={r.pending_hits}/{threshold}"
+                            )
+                        else:
+                            # Порог пройден, текст стабилен
+                            if r.pending_ru_canon == (r.last_sent_ru_canon or ""):
+                                # Если перевод такой же, как уже на экране - не спамим
+                                pass 
+                            else:
+                                # Выводим СВЕЖИЙ (последний) перевод
+                                self.textReady.emit(idx, r.pending_ru_raw)
+                                r.last_sent_ru_raw   = r.pending_ru_raw
+                                r.last_sent_ru_canon = r.pending_ru_canon
+                                print(
+                                    f"[{mode}][COMMIT] region {idx}: Stable ({similarity:.2f}) "
+                                    f"-> Show RU"
+                                )
 
                 self.msleep(self.interval_ms)
             except Exception as e:
@@ -1293,6 +1399,7 @@ class Overlay(QWidget):
         self.border_w = BORDER_WIDTH
         self.split_border_w = SPLIT_BORDER_WIDTH
         self.draw_over_original: bool = False
+        self.en_canon_hits: int = 0
         self.dual_mode = False
         self.bg_mode  = PANEL_BG_MODE
         self.bg_alpha = PANEL_BG_ALPHA
@@ -1879,12 +1986,23 @@ class ConfigWindow(QWidget):
 
         # --- controls ---
         self.btnStart = QPushButton("Начать перевод")
-        self.cbDual = QCheckBox("Двойной режим (OCR + Переводчик)")
-        
+        self.cbMode = QComboBox()
+        self.cbMode.addItems([
+            "SOLO (Все в одной модели)",   # index 0
+            "DUAL (Две нейросети)",        # index 1
+            "ONLINE (OCR + Google)"        # index 2
+        ])
+        self.cbMode.setToolTip(
+            "SOLO: Qwen-VL делает всё (тяжело для VRAM).\n"
+            "DUAL: Qwen-VL только читает, Qwen-Text переводит.\n"
+            "ONLINE: Qwen-VL читает, Google переводит (для слабых ПК)."
+        )
+
         self.btnStart.clicked.connect(self._start)
 
         # окна/процессы
         self.cbWindow = QComboBox(); self.btnRefreshWin=QPushButton("Обновить список")
+        self.btnRefreshWin.clicked.connect(self._fill_windows)
 
         # шрифт панели
         self.fontFamily = QFontComboBox()
@@ -1924,6 +2042,7 @@ class ConfigWindow(QWidget):
 
         # константы/поведение
         self.spFps    = QDoubleSpinBox(); self.spFps.setRange(0.1, 5.0); self.spFps.setSingleStep(0.1); self.spFps.setValue(float(MAX_OCR_FPS))
+        self.spCanonHits = QSpinBox(); self.spCanonHits.setRange(0, 10); self.spCanonHits.setValue(2)  # разумное значение по умолчанию
         self.spRetr = QDoubleSpinBox(); self.spRetr.setRange(0.0, 600.0); self.spRetr.setSingleStep(0.5); self.spRetr.setDecimals(1); self.spRetr.setValue(0.0)
         self.spBorder = QSpinBox(); self.spBorder.setRange(1, 16); self.spBorder.setValue(BORDER_WIDTH)
         self.spBorder.valueChanged.connect(lambda v: (setattr(self.overlay, "border_w", int(v)), self.overlay.update()))
@@ -1932,6 +2051,9 @@ class ConfigWindow(QWidget):
         self.cbSmooth = QCheckBox("Плавный вывод (smooth)"); self.cbSmooth.setChecked(RENDER_MODE=="smooth")
         self.cbOverlayBoxes = QCheckBox("Подставлять перевод на место оригинального текста")
         self.cbOverlayBoxes.setChecked(False)
+        self.cbMemory = QCheckBox("Память нейросети")
+        if set_memory_enabled is not None:
+            self.cbMemory.toggled.connect(lambda v: set_memory_enabled(v))
         self.spHandle = QSpinBox(); self.spHandle.setRange(6, 30); self.spHandle.setValue(int(HANDLE))
         self.spHandle.valueChanged.connect(lambda v: (globals().__setitem__("HANDLE", int(v)), self.overlay.update()))
 
@@ -2037,7 +2159,7 @@ class ConfigWindow(QWidget):
         topRow = QHBoxLayout()
         topRow.addWidget(self.btnStart)
         topRow.addSpacing(12)
-        topRow.addWidget(self.cbDual)
+        topRow.addWidget(self.cbMode)
         topRow.addStretch()
         formHome.addLayout(topRow)
 
@@ -2144,10 +2266,12 @@ class ConfigWindow(QWidget):
         gbK = QGroupBox("Вид и поведение панели")
         fk = QFormLayout(gbK)
         fk.addRow("FPS захвата:", self.spFps)
+        fk.addRow("Проверок EN до фиксации:", self.spCanonHits)
         fk.addRow("Ширина рамки:", self.spBorder)
         fk.addRow("Ширина разделителя:", self.spSplit)
         fk.addRow("Плавный вывод:", self.cbSmooth)
         fk.addRow("Overlay по боксам:", self.cbOverlayBoxes)
+        fk.addRow("Память нейросети:", self.cbMemory)
         fk.addRow("Ручка рамки:", self.spHandle)
         fk.addRow("Фон панели:", self.cbBgMode)
         fk.addRow("Интенсивность фона:", self.spBgAlpha)
@@ -2251,7 +2375,7 @@ class ConfigWindow(QWidget):
         self.spTopK2 = QSpinBox();       self.spTopK2.setRange(0, 10000);  self.spTopK2.setValue(int(getattr(llm_cfg, 'top_k', 0)))
         self.spRP2   = QDoubleSpinBox(); self.spRP2.setRange(0.1, 2.0);    self.spRP2.setSingleStep(0.05);  self.spRP2.setDecimals(2);  self.spRP2.setValue(float(getattr(llm_cfg, 'repeat_penalty', 1.0)))
 
-        self.cbDual.toggled.connect(self._reflow_mode_ui)
+        self.cbMode.currentIndexChanged.connect(self._reflow_mode_ui)
 
         self.btnEditTR  = QPushButton("Настроить промпт (Переводчик)")
         self.btnPrevTR  = QPushButton("Предпросмотр (Переводчик)")
@@ -2339,7 +2463,7 @@ class ConfigWindow(QWidget):
         infoLabel.setOpenExternalLinks(True)
         infoLabel.setWordWrap(True)
         infoLabel.setText("АИ переводчик by IgoRexa. <br>"
-                            "Версия 0.0.4 <br>"
+                            "Версия 0.0.6 <br>"
                             "GitHub: "
                             "<a href='https://github.com/igorexa225/AIGameTranslater'>"
                             "https://github.com/igorexa225/AIGameTranslater"
@@ -2408,47 +2532,100 @@ class ConfigWindow(QWidget):
                 b.setChecked(i == index)
     
     def _reflow_mode_ui(self, *_):
-        """Переключение SOLO <-> DUAL: что показывать в UI."""
-        dual = self.cbDual.isChecked()
+        """Управление видимостью настроек в зависимости от режима."""
+        mode = self.cbMode.currentIndex() # 0=SOLO, 1=DUAL, 2=ONLINE
+        
+        # === ЛОГИЧЕСКИЕ ФЛАГИ ===
+        is_solo   = (mode == 0)
+        is_dual   = (mode == 1)
+        is_online = (mode == 2)
 
-        # --- Вкладка "Дом": какие модели видны ---
+        # OCR нужен везде, КРОМЕ Solo (в Solo он встроен в основную модель)
+        # Но в UI мы разделили: SOLO настройки отдельно, OCR (Dual/Online) отдельно.
+        needs_separate_ocr = (is_dual or is_online)
 
-        # SOLO видно только в одиночном режиме
-        for w in (self.lblSoloModel, self.cbModel,
-                  self.lblSoloMmproj, self.cbMmproj):
-            w.setVisible(not dual)
+        # Текстовая модель (TR) нужна ТОЛЬКО в Dual
+        needs_local_tr = is_dual
 
-        # DUAL видно только в двойном режиме
-        for w in (self.lblOcrModel, self.cbModelOCR,
-                  self.lblOcrMmproj, self.cbMmprojOCR,
-                  self.lblTrModel, self.cbModelTR):
-            w.setVisible(dual)
+        # Лор и Промпты нужны только для нейросетей (Solo и Dual)
+        needs_ai_context = (is_solo or is_dual)
 
-        # --- Вкладка "LLM": какие группы настроек активны ---
+        # === Вкладка "Дом" (Home) ===
+        
+        # 1. Блок выбора моделей SOLO
+        self.lblSoloModel.setVisible(is_solo)
+        self.cbModel.setVisible(is_solo)
+        self.lblSoloMmproj.setVisible(is_solo)
+        self.cbMmproj.setVisible(is_solo)
 
-        # SOLO-группы видны только в одиночном режиме
+        # 2. Блок выбора моделей OCR (для Dual/Online)
+        self.lblOcrModel.setVisible(needs_separate_ocr)
+        self.cbModelOCR.setVisible(needs_separate_ocr)
+        self.lblOcrMmproj.setVisible(needs_separate_ocr)
+        self.cbMmprojOCR.setVisible(needs_separate_ocr)
+
+        # 3. Блок выбора модели TR (только Dual)
+        self.lblTrModel.setVisible(needs_local_tr)
+        self.cbModelTR.setVisible(needs_local_tr)
+
+        # 4. Лор и Фразбук (Скрываем в Online, так как Google их не понимает)
+        # Нам нужно найти виджеты gbLore и gbPB. 
+        # В __init__ мы их добавляли, но не сохранили в self. 
+        # Но у нас есть self.edLore, self.btnLore, self.edPB, self.btnPB
+        # Лучше всего скрыть родительские GroupBox, если мы их найдем, 
+        # или просто скрыть сами поля.
+        
+        # Попробуем найти GroupBox через родителя кнопки
+        if hasattr(self, "btnLore"):
+            gb_lore = self.btnLore.parentWidget()
+            if gb_lore and isinstance(gb_lore, QGroupBox):
+                gb_lore.setVisible(needs_ai_context)
+        
+        if hasattr(self, "btnPB"):
+            gb_pb = self.btnPB.parentWidget()
+            if gb_pb and isinstance(gb_pb, QGroupBox):
+                gb_pb.setVisible(needs_ai_context)
+
+        # === Вкладка "Настройки моделей" (Model Settings) ===
+        
+        # 1. Группы настроек SOLO (gbLLM, gbGen, gbSrv)
         for w in (getattr(self, "gbLLM", None),
                   getattr(self, "gbGen", None),
                   getattr(self, "gbSrv", None),
-                  getattr(self, "btnPrompt", None),
-                  getattr(self, "btnPreview", None)):
+                  getattr(self, "btnPrompt", None),     # Кнопка настройки промпта SOLO
+                  getattr(self, "btnPreview", None)):   # Кнопка превью SOLO
             if w is not None:
-                w.setVisible(not dual)
+                w.setVisible(is_solo)
 
-        # DUAL-группы (OCR / TR) видны только в двойном режиме
-        for w in (getattr(self, "gbOCR", None),
-                  getattr(self, "gbTR", None),
-                  getattr(self, "btnEditOCR", None),
-                  getattr(self, "btnPrevOCR", None),
-                  getattr(self, "btnEditTR", None),
-                  getattr(self, "btnPrevTR", None)):
-            if w is not None:
-                w.setVisible(dual)
+        # 2. Группа OCR (gbOCR) - нужна для Dual и Online
+        # Но внутри неё кнопки "Edit Prompt" (OCR) нужны только для Dual? 
+        # Нет, OCR промпт "Return JSON..." нужен всегда, его можно оставить.
+        if getattr(self, "gbOCR", None):
+            self.gbOCR.setVisible(needs_separate_ocr)
+
+        # 3. Группа TR (gbTR) - нужна ТОЛЬКО для Dual
+        if getattr(self, "gbTR", None):
+            self.gbTR.setVisible(needs_local_tr)
+        
+        self.cbMemory.setEnabled(not is_online)
+            
+        if is_online:
+            self.cbMemory.setToolTip("В режиме ONLINE контекст и память недоступны (Google переводит фразы изолированно).")
+        else:
+            self.cbMemory.setToolTip("Сохранять историю диалога для улучшения перевода (кто говорит, пол персонажа).")
     
     def _load_prefs_into_ui(self):
         p = _load_prefs()
-        dual = bool(p.get("dual_enabled", False))
-        self.cbDual.setChecked(dual)
+        
+        # Логика миграции со старого конфига
+        old_dual = bool(p.get("dual_enabled", False))
+        saved_mode = p.get("work_mode", None)
+
+        if saved_mode is not None:
+            self.cbMode.setCurrentIndex(int(saved_mode))
+        else:
+            # Если параметра нет, конвертируем старый флаг dual
+            self.cbMode.setCurrentIndex(1 if old_dual else 0)
         # шрифт
         fam = p.get("font_family")
         if fam:
@@ -2530,8 +2707,15 @@ class ConfigWindow(QWidget):
         self._tr_prompt_override = p.get("dual_tr_system_override","")
         # константы
         self.spFps.setValue(float(p.get("fps", 1.0)))
+        self.spCanonHits.setValue(int(p.get("en_canon_hits", 2)))
         self.cbSmooth.setChecked(p.get("render_mode", "smooth") == "smooth")
         self.cbOverlayBoxes.setChecked(bool(p.get("draw_over_original", False)))
+        self.cbMemory.setChecked(bool(p.get("memory_enabled", True)))
+        if set_memory_enabled is not None:
+            try:
+                set_memory_enabled(self.cbMemory.isChecked())
+            except Exception as e:
+                print("[UI] set_memory_enabled load error:", e)
         self.spHandle.setValue(int(p.get("handle", 15)))
         self.spBorder.setValue(int(p.get("border_w", BORDER_WIDTH)))
         self.spSplit.setValue(int(p.get("split_border_w", SPLIT_BORDER_WIDTH)))
@@ -2661,10 +2845,12 @@ class ConfigWindow(QWidget):
             "temp": float(self.spTemp.value()),
             "top_p": float(self.spTopP.value()),
             "fps": float(self.spFps.value()),
+            "en_canon_hits": int(self.spCanonHits.value()),
             "border_w": int(self.spBorder.value()),
             "split_border_w": int(self.spSplit.value()),
             "render_mode": "smooth" if self.cbSmooth.isChecked() else "instant",
             "draw_over_original": bool(self.cbOverlayBoxes.isChecked()),
+            "memory_enabled": bool(self.cbMemory.isChecked()),
             "handle": int(self.spHandle.value()),
             "bg_mode": self.cbBgMode.currentData(),
             "bg_alpha": int(round(max(1, min(10, self.spBgAlpha.value())) / 10.0 * 255)),
@@ -2687,7 +2873,8 @@ class ConfigWindow(QWidget):
         }
 
         # dual-mode
-        prefs["dual_enabled"] = bool(self.cbDual.isChecked())
+        prefs["work_mode"] = self.cbMode.currentIndex()
+        prefs["dual_enabled"] = (self.cbMode.currentIndex() == 1) # для совместимости
         prefs["dual_ocr_model"]  = self.cbModelOCR.currentText().strip()
         prefs["dual_ocr_mmproj"] = self.cbMmprojOCR.currentText().strip()
         prefs["dual_ocr_host"]   = self.edHost1.text().strip()
@@ -2900,7 +3087,7 @@ class ConfigWindow(QWidget):
         llm_cfg.seed           = int(self.spSeed.value())
         llm_cfg.slot_id        = int(self.spSlot.value())
         llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
-        dual = self.cbDual.isChecked()
+        mode_idx = self.cbMode.currentIndex()
 
         MAX_OCR_FPS    = float(self.spFps.value())
         RENDER_MODE    = "smooth" if self.cbSmooth.isChecked() else "instant"
@@ -2917,6 +3104,7 @@ class ConfigWindow(QWidget):
         
         self.overlay.border_w = int(self.spBorder.value())
         self.overlay.split_border_w = int(self.spSplit.value())
+        self.overlay.en_canon_hits = int(self.spCanonHits.value())
         self.overlay.draw_over_original = bool(self.cbOverlayBoxes.isChecked())
 
         # применим лор
@@ -2957,12 +3145,45 @@ class ConfigWindow(QWidget):
         )
         print("[LLM] server exe:", SERVER_EXE)
 
-        dual = self.cbDual.isChecked()
         _stop_llama_server()
         _stop_llama_server2()
 
-        if dual and LLMConfigDual is not None:
-            # -------- DUAL MODE: OCR + TR --------
+        self.overlay.work_mode_idx = mode_idx
+        
+        if mode_idx == 0:
+        
+            host = (self.edHost.text() or "127.0.0.1").strip()
+            port = int(self.spPort.value())
+            model_path  = self.cbModel.currentText().strip()
+            mmproj_path = self.cbMmproj.currentText().strip()
+
+            cmd = rebuild_server_cmd(
+                SERVER_EXE, model_path, mmproj_path,
+                host=host, port=port,
+                ctx=int(self.spCtx.value()),
+                batch=int(self.spBatch.value()),
+                ubatch=int(self.spUBatch.value()),
+                parallel=int(self.spPar.value()),
+                ngl=int(self.spNGL.value()),
+            )
+
+            print("[LLM] model:", model_path)
+            print("[LLM] mmproj:", mmproj_path)
+
+            llm_cfg.server = f"http://{host}:{port}"
+            _ensure_llama_server(cmd, llm_cfg.server)
+
+            # прогрев single
+            try:
+                if llm_cfg.enabled and llm_cfg.use_prompt_cache:
+                    preload_prompt_cache(llm_cfg)
+            except Exception as e:
+                print("[LLM] warmup error:", e)
+            
+            self.overlay.dual_mode = False
+                
+        elif mode_idx == 1:
+            
             host1 = (self.edHost1.text() or "127.0.0.1").strip()
             port1 = int(self.spPort1.value())
             host2 = (self.edHost2.text() or "127.0.0.1").strip()
@@ -2996,9 +3217,7 @@ class ConfigWindow(QWidget):
 
             _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
             _ensure_llama_server2(cmd2, f"http://{host2}:{port2}")
-
-            # конфиги для воркера
-            self.overlay.dual_mode = True
+            
             self.overlay.ocr_cfg_dual = LLMConfigDual(
                 server=f"http://{host1}:{port1}",
                 model=ocr_model,
@@ -3012,54 +3231,55 @@ class ConfigWindow(QWidget):
                 model=tr_model,
                 timeout_s=float(self.spTO2.value()),
                 max_tokens=int(self.spMaxTok2.value()),
-                temp=float(self.spTemp2.value()),
-                top_p=float(self.spTopP2.value()),
-                top_k=int(self.spTopK2.value()),
-                repeat_penalty=float(self.spRP2.value()),
-                slot_id=int(self.spSlot2.value()),
-                seed=int(self.spSeed2.value()),
-                system_override=(getattr(self, "_tr_prompt_override", "") or None),
-                lore_path=(llm_cfg.lore_path or None),
-                phrasebook_path=(llm_cfg.phrasebook_path or None),
+                slot_id=int(self.spSlot2.value()), seed=int(self.spSeed2.value()),
+                temp=float(self.spTemp2.value()), top_p=float(self.spTopP2.value()),
+                top_k=int(self.spTopK2.value()), repeat_penalty=float(self.spRP2.value()),
+                system_override=(getattr(self,"_tr_prompt_override","") or None),
+                lore_path=llm_cfg.lore_path,
+                phrasebook_path=llm_cfg.phrasebook_path,
             )
+            # ============================
+            
+            self.overlay.dual_mode = True
+            
+            
+        elif mode_idx == 2:
+            # -------- ONLINE MODE (Local OCR + Google) --------
+            # Запускаем ТОЛЬКО сервер №1 (OCR), второй сервер не нужен
+            host1 = (self.edHost1.text() or "127.0.0.1").strip()
+            port1 = int(self.spPort1.value())
+            ocr_model   = self.cbModelOCR.currentText().strip()
+            ocr_mmproj  = self.cbMmprojOCR.currentText().strip()
+            
+            cmd1 = rebuild_server_cmd(
+                SERVER_EXE, ocr_model, ocr_mmproj,
+                host=host1, port=port1,
+                ctx=int(self.spCtx1.value()),
+                batch=int(self.spBatch1.value()),
+                ubatch=int(self.spUB1.value()),
+                parallel=int(self.spPar1.value()),
+                ngl=int(self.spNGL1.value()),
+            )
+            print("[LLM] spawn OCR (Online mode):", cmd1)
+            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
+            
+            # Настраиваем OCR конфиг (используем тот же класс из dual)
+            self.overlay.ocr_cfg_dual = LLMConfigDual(
+                server=f"http://{host1}:{port1}",
+                model=ocr_model,
+                timeout_s=float(self.spTO.value()),
+                max_tokens=int(self.spMaxTok1.value()),
+                slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
+                system_override=(getattr(self,"_ocr_prompt_override","") or None),
+            )
+            # Конфиг TR ставим None, чтобы воркер понимал, что локального перевода нет
+            self.overlay.tr_cfg_dual = None 
+            self.overlay.dual_mode = True # Технически это dual (разные этапы), но флаг work_mode_idx главнее
 
-            # прогрев (опционально)
+            # Прогрев только OCR
             try: preload_prompt_cache_ocr(self.overlay.ocr_cfg_dual)
-            except Exception as e: print("[DUAL] OCR warmup error:", e)
-            try: preload_prompt_cache_tr(self.overlay.tr_cfg_dual)
-            except Exception as e: print("[DUAL] TR warmup error:", e)
-
-        else:
-            # -------- SINGLE MODE ("всё в одном") --------
-            host = (self.edHost.text() or "127.0.0.1").strip()
-            port = int(self.spPort.value())
-            model_path  = self.cbModel.currentText().strip()
-            mmproj_path = self.cbMmproj.currentText().strip()
-
-            cmd = rebuild_server_cmd(
-                SERVER_EXE, model_path, mmproj_path,
-                host=host, port=port,
-                ctx=int(self.spCtx.value()),
-                batch=int(self.spBatch.value()),
-                ubatch=int(self.spUBatch.value()),
-                parallel=int(self.spPar.value()),
-                ngl=int(self.spNGL.value()),
-            )
-
-            print("[LLM] model:", model_path)
-            print("[LLM] mmproj:", mmproj_path)
-
-            llm_cfg.server = f"http://{host}:{port}"
-            _ensure_llama_server(cmd, llm_cfg.server)
-
-            # прогрев single
-            try:
-                if llm_cfg.enabled and llm_cfg.use_prompt_cache:
-                    preload_prompt_cache(llm_cfg)
-            except Exception as e:
-                print("[LLM] warmup error:", e)
-
-            self.overlay.dual_mode = False
+            except Exception as e: print("[ONLINE] OCR warmup error:", e)
+            
         
         # шрифт панели
         self.overlay.font_family = self.fontFamily.currentFont().family()

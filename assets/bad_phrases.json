@@ -1,0 +1,28 @@
+{
+  "ocr": [
+    "the following text is visible",
+    "text is not visible",
+    "no text is visible",
+    "no readable text",
+    "no legible text",
+    "game is a classic",
+    "final answer is",
+    "i cannot read",
+    "image contains"
+  ],
+  "translation": [
+    "вы получили имя",
+    "переводите текст исключительно",
+    "given a speaker name",
+    "translate the following",
+    "```plaintext",
+    "as an ai language model",
+    "эта игра – настоящий классик",
+    "cant translate",
+    "cannot translate",
+	"recent context",
+    "lore snippet",
+    "end of context",
+    "current line"
+  ]
+}

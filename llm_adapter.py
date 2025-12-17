@@ -4,9 +4,10 @@
 import os, time, json, base64, threading, re
 from dataclasses import dataclass
 from typing import Optional
+import requests
 
 DEFAULT_MODEL = "Qwen3-VL-8B-Instruct"
-
+_SESSION = requests.Session()
 # ===================== Конфиг LLM =========================
 
 @dataclass
@@ -48,6 +49,29 @@ _TM_LOCK = threading.Lock()
 _TM_EN2RU: dict[str, str] = {}
 _TM_ORDER: list[str] = []
 _TM_MAX = 512  # максимум записей в кэше
+
+# ====== Мини-память для SOLO (одна последняя EN-реплика) ======
+_SOLO_CTX_LOCK = threading.Lock()
+_SOLO_LAST_EN: str = ""
+
+
+def _solo_get_last_en() -> str:
+    with _SOLO_CTX_LOCK:
+        return _SOLO_LAST_EN
+
+
+def _solo_set_last_en(en: str) -> None:
+    """Сохраняем последнюю EN-реплику для контекста SOLO."""
+    global _SOLO_LAST_EN
+    en = (en or "").strip()
+    if not en:
+        return
+    # немного нормализуем: схлопываем пробелы и режем по длине
+    en = _EN_WS_RX.sub(" ", en)
+    if len(en) > 500:
+        en = en[:500]
+    with _SOLO_CTX_LOCK:
+        _SOLO_LAST_EN = en
 
 _EN_WS_RX = re.compile(r"\s+")
 def _canon_en(s: str) -> str:
@@ -176,7 +200,7 @@ def preload_prompt_cache(cfg: LLMConfig) -> bool:
     try:
         import requests, time as _t
         for _ in range(60):
-            r = requests.post(url, json=payload, timeout=max(1.0, float(cfg.timeout_s)))
+            r = _SESSION.post(url, json=payload, timeout=max(1.0, float(cfg.timeout_s)))
             if r.status_code == 200:
                 print(f"[LLM] prompt cache warmed (slot_id={cfg.slot_id})")
                 return True
@@ -205,23 +229,35 @@ def vision_translate_from_images(region_png_b64: str,
     if not (cfg.enabled and cfg.server and region_png_b64):
         return ""
 
+    prev_en = _solo_get_last_en()
+    
     init_lore_once(cfg)
     system = _SYSTEM_PROMPT
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
 
     def _content_variant(kind: str):
+        base_text = (
+            "This image is a cropped in-game dialogue or UI box.\n"
+            "1) Read ALL clearly visible ENGLISH text EXACTLY as it appears "
+            "(preserve line breaks).\n"
+            "2) Translate it into natural Russian, using the system instructions and LORE.\n"
+            "3) Respond with a SINGLE JSON object ONLY, in one line:\n"
+            '   {\"en\": \"<original English text>\", \"ru\": \"<Russian translation>\"}\n'
+            "- Use \\n inside strings for line breaks.\n"
+            "- Do NOT add comments, extra fields, or any text before/after the JSON."
+        )
+
+        # НОВОЕ: одна последняя EN-реплика как контекст
+        if prev_en:
+            base_text += (
+                "\n\nRECENT CONTEXT (do NOT translate, context only):\n"
+                f"{prev_en}\n"
+                "END OF CONTEXT.\n"
+            )
+
         txt = {
             "type": "text",
-            "text": (
-                "This image is a cropped in-game dialogue or UI box.\n"
-                "1) Read ALL clearly visible ENGLISH text EXACTLY as it appears "
-                "(preserve line breaks).\n"
-                "2) Translate it into natural Russian, using the system instructions and LORE.\n"
-                "3) Respond with a SINGLE JSON object ONLY, in one line:\n"
-                '   {\"en\": \"<original English text>\", \"ru\": \"<Russian translation>\"}\n'
-                "- Use \\n inside strings for line breaks.\n"
-                "- Do NOT add comments, extra fields, or any text before/after the JSON."
-            ),
+            "text": base_text,
         }
         if kind == "A":
             return [txt, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{region_png_b64}", "detail": "high"}}]
@@ -251,7 +287,7 @@ def vision_translate_from_images(region_png_b64: str,
         }
         t0 = time.perf_counter()
         try:
-            r = requests.post(url, json=payload, timeout=float(cfg.timeout_s))
+            r = _SESSION.post(url, json=payload, timeout=float(cfg.timeout_s))
             dt = (time.perf_counter() - t0) * 1000.0
             if r.status_code != 200:
                 print(f"[LLM] vision kind={kind} http={r.status_code} in {dt:.0f} ms")
@@ -308,6 +344,9 @@ def vision_translate_from_images(region_png_b64: str,
                                 _TM_EN2RU.pop(old_key, None)
             else:
                 ru_final = ru_text
+                
+            if en_text:
+                _solo_set_last_en(en_text)
 
             print(
                 f"[LLM] vision ok kind={kind} "
