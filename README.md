@@ -64,7 +64,7 @@
 <img width="878" height="135" alt="image" src="https://github.com/user-attachments/assets/06e3ae01-940e-48ac-8430-91aaecd813a5" />
 
 - ONLINE: Нейросеть читает текст, перевод через Google. Мгновенно, работает на любом ПК, но не понимает Лор и контекст.
-<img width="868" height="283" alt="image" src="https://github.com/user-attachments/assets/f4d5803b-798f-49ff-9f5b-a33c4cf85e8e" />
+<img width="872" height="108" alt="image" src="https://github.com/user-attachments/assets/8623c9f7-eb0e-4bac-aa43-2362a74ac509" />
 
 
 #### 5) Лор файл и "Фразбук"
