@@ -81,10 +81,12 @@
 
 #### 1) Смена шрифта, его размера и толщина
 - тут всё просто (не спрашивайте почему там "гарнитура" я сам не знаю, пока лень исправлять), там все шрифты в вашей системе, выбирайте любой и подгоняйте размер как вам нужно.
-<img width="868" height="384" alt="image" src="https://github.com/user-attachments/assets/38eea322-7c01-47c9-96b9-01cf704285a4" />
+<img width="875" height="130" alt="image" src="https://github.com/user-attachments/assets/0fe3c694-1e4d-4646-b080-3d73fc2a6d7a" />
 
 
-<img width="873" height="331" alt="image" src="https://github.com/user-attachments/assets/4e683d00-4f33-4c8c-a0c8-49f786629be8" />
+
+<img width="869" height="389" alt="image" src="https://github.com/user-attachments/assets/5b79cf9d-3c71-4308-b375-24026ac09669" />
+
 
 #### 2) Фпс захвата
 - Как часто будет делать скриншот области для отправки нейросети. Если значение низкое, а система не успевает, то будет работать просто на пределе возможного, но ничего не сломается.
