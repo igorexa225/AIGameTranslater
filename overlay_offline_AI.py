@@ -1092,82 +1092,74 @@ class CaptureWorker(QThread):
                     full  = None
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # --- НОВАЯ ВСТАВКА: Сравнение по ГРАНИЦАМ (игнорирует фон) ---
+                # Используем детектор краев Canny. Он видит буквы, но игнорирует мягкие тени и облака.
+                edges = cv2.Canny(gray, 50, 150)
 
-                # --- НАЧАЛО ВСТАВКИ: Умная проверка изменений (Visual Diff) ---
-                if getattr(r, "last_gray_img", None) is not None:
-                    # 1. Вычисляем абсолютную разницу
-                    diff = cv2.absdiff(gray, r.last_gray_img)
+                if getattr(r, "last_edges_img", None) is not None:
+                    # Сравниваем не картинки, а их "скелеты" (границы)
+                    diff = cv2.absdiff(edges, r.last_edges_img)
                     
-                    # 2. Убираем шум (игнорируем изменения яркости < 25 из 255)
-                    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+                    # Считаем, сколько пикселей-границ изменилось
+                    changed_pixels = cv2.countNonZero(diff)
                     
-                    # 3. Считаем общее кол-во изменившихся пикселей
-                    changed_pixels = cv2.countNonZero(thresh)
-                    
-                    # Получаем порог стабильности (обычно 2) и текущие хиты
+                    # Получаем порог стабильности
                     threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
                     current_hits = r.pending_hits or 0
 
-                    # ЛОГИКА ПРОПУСКА:
-                    # Пропускаем OCR только если:
-                    # 1. Картинка не изменилась (мало пикселей)
-                    # 2. И ПРИ ЭТОМ мы уже стабилизировали текст (current_hits >= threshold)
-                    # Если hits < threshold, мы ОБЯЗАНЫ сделать OCR еще раз, чтобы подтвердить текст.
-                    
-                    if changed_pixels < 50:
+                    # Если изменений границ мало (меньше 150 пикселей) — считаем, что текст стоит на месте
+                    # (Даже если фон при этом пляшет)
+                    if changed_pixels < 150:
+                        # Если мы УЖЕ перевели этот текст (hits >= threshold) — спим и не грузим проц
                         if current_hits >= threshold:
                             self.msleep(self.interval_ms)
                             continue
-                        # Иначе: идем дальше делать OCR, даже если картинка старая!
+                        # А если текст новый, но еще "накапливает уверенность" (Pending) — идем дальше, 
+                        # чтобы подтвердить его (увеличить hits).
 
-                    # 4. Геометрический фильтр (защита от мигающего курсора)
-                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    is_real_text = False
-                    for cnt in contours:
-                        x, y, w, h = cv2.boundingRect(cnt)
-                        if w > 30 or h > 30:
-                            is_real_text = True
-                            break
-                    
-                    if not is_real_text:
-                        # Изменения мелкие (курсор).
-                        # То же правило: если текст уже стабилен — спим. Если нет — проверяем.
-                        if current_hits >= threshold:
-                            self.msleep(self.interval_ms)
-                            continue
-
-                # Сохраняем текущий кадр для сравнения в следующем цикле
-                r.last_gray_img = gray.copy()
+                # Сохраняем текущие ГРАНИЦЫ для следующего кадра
+                r.last_edges_img = edges.copy()
                 # --- КОНЕЦ ВСТАВКИ ---
 
                 now = time.perf_counter()
 
-                r.last_ocr_ts = now
+                r.last_ocr_ts = time.perf_counter()
 
+                # --- ЭТАП 1: ГЛАВНЫЙ РУБИЛЬНИК (БОКСЫ) ---
+                # Сначала ищем текст через быстрый EasyOCR.
+                # Если боксов нет — значит, текста нет. Останавливаем ВСЁ.
                 boxes_with_text = []
-                if getattr(self.overlay, "draw_over_original", False):
-                    try:
-                        boxes_with_text = detect_text_boxes(frame)  # список (x,y,w,h,text)
-                        print(f"[BOXES] region {idx}: {len(boxes_with_text)} boxes -> {boxes_with_text}")
+                try:
+                    boxes_with_text = detect_text_boxes(frame)
+                except Exception as e:
+                    print("[OCR-BOXES] Error:", e)
 
-                        if not boxes_with_text:
-                            # В режиме overlay по боксам: текста нет → ничего не OCR'им и не переводим.
-                            # Остаётся предыдущий стабильный перевод.
-                            r.text_boxes = []
-                            self.msleep(self.interval_ms)
-                            continue
-                    except Exception as e:
-                        print("[OCR-BOXES] detect_text_boxes error:", e)
-                        # Не ломаем обычный вывод: в случае ошибки детектора продолжаем без боксов
-                        boxes_with_text = []
-                        r.text_boxes = []
-                        
-                # если включён режим «подставлять перевод на место оригинального текста» —
-                # найдём bbox'ы текста и запомним их в нормализованном виде
+                # ПРОВЕРКА: Если боксов нет -> Чистим экран и спим
+                if not boxes_with_text:
+                    # Если на экране еще висит старый текст — убираем его
+                    if r.last_sent_ru_raw:
+                         print(f"[CLEAR] region {idx}: No text boxes -> Clear screen")
+                         self.textReady.emit(idx, "")
+                         
+                         # Сбрасываем все счетчики и память
+                         r.last_sent_ru_raw = ""
+                         r.last_sent_ru_canon = ""
+                         r.last_en_canon = "" 
+                         r.pending_ru_raw = ""
+                         r.pending_hits = 0
+                         r.text_boxes = []
+
+                    # Полная остановка: не идем к нейросетям, ждем след. кадра
+                    self.msleep(self.interval_ms)
+                    continue
+                
+                # Если дошли сюда — значит, EasyOCR нашел текст. Работаем дальше.
+                # -----------------------------------------------------------
 
                 # LLM: одна картинка (регион) → перевод
                 reg_b64  = _bgr_to_png_b64(frame, max_side=1024)
-                full_b64 = None
+                
                 r.last_ocr_ts = time.perf_counter()
 
                 en = ""
@@ -1175,31 +1167,55 @@ class CaptureWorker(QThread):
 
                 mode_idx = getattr(self.overlay, "work_mode_idx", 0)
 
-                if mode_idx == 1: 
-                    # --- DUAL LOCAL ---
-                    # OCR через LLM Dual
-                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
-                    # Перевод через LLM Dual
-                    ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual) if en else ""
-                
-                elif mode_idx == 2:
-                    # --- ONLINE ---
-                    # OCR через LLM Dual (используем тот же метод, так как модель та же)
-                    en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
-                    
-                    # ПЕРЕВОД ЧЕРЕЗ НОВЫЙ ФАЙЛ
-                    if en:
-                        ru = online_adapter.translate_text(en)
-                    else:
-                        ru = ""
-                    
-                    # Логирование для отладки
-                    if ru:
-                         print(f"[ONLINE] Translated: {ru[:50]}...")
-
+                # 1. Сначала делаем ТОЛЬКО OCR (чтение текста) для Dual/Online
+                if mode_idx == 1 or mode_idx == 2:
+                    if getattr(self.overlay, "dual_mode", False) and LLMConfigDual:
+                        en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
                 else:
-                    # --- SOLO ---
-                    en, ru = vision_translate_from_images(reg_b64, full_b64, self.overlay.llm_cfg)
+                    # В режиме SOLO нейросеть делает всё сразу
+                    en, ru = vision_translate_from_images(reg_b64, None, self.overlay.llm_cfg)
+
+                # 2. УМНАЯ ПРОВЕРКА (Страж №2): Нужно ли переводить?
+                need_translate = True
+                
+                if (mode_idx == 1 or mode_idx == 2) and en:
+                    # Параметры стабилизации
+                    threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
+                    current_hits = r.pending_hits or 0
+                    
+                    # Сравниваем текущий текст с прошлым (как в конце цикла)
+                    current_en_canon = canon_en(en)
+                    last_confirmed_canon = r.last_en_canon or ""
+                    
+                    similarity = SequenceMatcher(None, current_en_canon, last_confirmed_canon).ratio()
+                    is_stable = similarity > 0.85  # Текст похож на предыдущий?
+
+                    if is_stable:
+                        # Текст СТАБИЛЕН (тот же самый)
+                        if current_hits >= threshold:
+                            # УСЛОВИЕ ВЫПОЛНЕНО: Мы уже набрали нужное кол-во проверок.
+                            # Значит, перевод уже готов и зафиксирован. 
+                            # Останавливаем переводчик, чтобы не тратить ресурсы.
+                            need_translate = False
+                            
+                            # Берем самый свежий готовый перевод (из pending или уже выведенный)
+                            ru = r.pending_ru_raw if r.pending_ru_raw else r.last_sent_ru_raw
+                            
+                            # print(f"[SKIP-TR] Text stable & committed (hits {current_hits}). Freeze.")
+                        else:
+                            # Текст тот же, НО мы еще не набрали хиты (идет стабилизация).
+                            # ТВОЯ ИДЕЯ: Продолжаем переводить, чтобы нейросеть могла уточнить результат.
+                            need_translate = True
+                    else:
+                        # Текст ИЗМЕНИЛСЯ (новый диалог) -> Конечно переводим.
+                        need_translate = True
+
+                # 3. ВЫЗОВ ПЕРЕВОДЧИКА (Только если need_translate = True)
+                if need_translate and (mode_idx == 1 or mode_idx == 2) and en:
+                    if mode_idx == 1: # DUAL (Local LLM)
+                        ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual)
+                    elif mode_idx == 2: # ONLINE (Google)
+                        ru = online_adapter.translate_text(en)
                 
                     
                 if getattr(self.overlay, "draw_over_original", False) and boxes_with_text:
@@ -1295,9 +1311,6 @@ class CaptureWorker(QThread):
 
                     else:
                         # --- НАЧАЛО ИЗМЕНЕНИЯ (Fuzzy Logic) ---
-                        
-                        # Импорт нужен в начале файла, но можно и тут локально для проверки
-                        from difflib import SequenceMatcher 
                         
                         # Сравниваем текущий OCR с прошлым "стабильным"
                         similarity = SequenceMatcher(None, en_canon, (r.last_en_canon or "")).ratio()
