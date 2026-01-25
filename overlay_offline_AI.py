@@ -5,7 +5,7 @@
 import sys, os, time, re, subprocess, base64, difflib, ctypes, json, requests
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from datetime import datetime
 import numpy as np
 import cv2
 from difflib import SequenceMatcher
@@ -32,20 +32,45 @@ except Exception:
     _EASYOCR_AVAILABLE = False
 
 _easyocr_reader = None
+_current_ocr_lang = None  # <--- Запоминаем текущий язык
 
-def get_easyocr_reader():
-    """Ленивое создание EasyOCR-ридера (только на CPU, gpu=False)."""
-    global _easyocr_reader
+def get_easyocr_reader(lang_code="en"):
+    """Ленивое создание EasyOCR-ридера с поддержкой переключения языков."""
+    global _easyocr_reader, _current_ocr_lang
     if not _EASYOCR_AVAILABLE:
         print("[OCR-BOXES] EasyOCR not available (import failed)")
         return None
-    if _easyocr_reader is None:
-        try:
-            _easyocr_reader = easyocr.Reader(['en'], gpu=False)
-            print("[OCR-BOXES] EasyOCR reader initialised (gpu=False)")
-        except Exception as e:
-            print("[OCR-BOXES] EasyOCR init error:", e)
+    
+    # Если ридер уже есть и язык тот же — возвращаем готовый
+    if _easyocr_reader is not None and _current_ocr_lang == lang_code:
+        return _easyocr_reader
+
+    print(f"[OCR-BOXES] Reloading EasyOCR for language: {lang_code}...")
+    
+    # Собираем список языков. 
+    # EasyOCR лучше работает, когда английский добавлен вторым (для смешанного текста)
+    langs = [lang_code]
+    if lang_code != "en":
+        langs.append("en") 
+
+    try:
+        # gpu=False (на CPU), чтобы не отжирать память у нейросетей
+        _easyocr_reader = easyocr.Reader(langs, gpu=False)
+        _current_ocr_lang = lang_code
+        print(f"[OCR-BOXES] EasyOCR initialized for {langs}")
+    except Exception as e:
+        print(f"[OCR-BOXES] Init error for {lang_code}:", e)
+        # Если упало (например, нет модели для корейского), пробуем откатиться на EN
+        if lang_code != "en":
+            print("[OCR-BOXES] Fallback to English...")
+            try:
+                _easyocr_reader = easyocr.Reader(['en'], gpu=False)
+                _current_ocr_lang = "en"
+            except:
+                _easyocr_reader = None
+        else:
             _easyocr_reader = None
+            
     return _easyocr_reader
 
 # ======================== CONFIG (по умолчанию) =========================
@@ -64,9 +89,48 @@ PANEL_BG_MODE  = "blur"   # "blur" | "solid" | "none"
 PANEL_BG_ALPHA = 64       # 0–255, для blur = альфа tint'а, для solid = прозрачность чёрного фона
 BOX_BG_MODE  = "solid"    # "panel" | "solid" | "none"
 BOX_BG_ALPHA = 180        # 0–255, для solid = прозрачность чёрной подложки под строкой
+HIDE_CONSOLE = False
 
 # Пути
 BASE_DIR = Path(__file__).resolve().parent
+
+# ================== LOGGING ==================
+class _DualLogger:
+    def __init__(self, filepath, original_stream):
+        self.terminal = original_stream
+        self.log = open(filepath, "a", encoding="utf-8", buffering=1)
+
+    def write(self, message):
+        if self.terminal:
+            try: self.terminal.write(message)
+            except Exception: pass
+        try: self.log.write(message)
+        except Exception: pass
+
+    def flush(self):
+        if self.terminal:
+            try: self.terminal.flush()
+            except Exception: pass
+        try: self.log.flush()
+        except Exception: pass
+
+def _setup_logging():
+    try:
+        log_dir = BASE_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Очистка старых логов (оставляем 10 последних)
+        logs = sorted(log_dir.glob("log_*.txt"), key=os.path.getmtime)
+        while len(logs) > 9:
+            try: os.remove(logs.pop(0))
+            except Exception: pass
+        fname = f"log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+        fpath = log_dir / fname
+        sys.stdout = _DualLogger(fpath, sys.stdout)
+        sys.stderr = _DualLogger(fpath, sys.stderr)
+        print(f"=== SESSION STARTED: {datetime.now()} ===")
+        print(f"[LOG] Log file: {fpath}")
+    except Exception as e:
+        print(f"[LOG] Failed to setup logging: {e}")
 
 PREFS_FILE = BASE_DIR / "config" / "ui_prefs.json"
 
@@ -92,7 +156,7 @@ SERVER_CANDIDATES = [
     BASE_DIR / "models" / "llama.cpp" / ("llama-server.exe" if os.name == "nt" else "llama-server"),
 ]
 
-def _pick_server_exe() -> Optional[Path]:
+def _pick_server_exe() -> Path | None:
     for p in SERVER_CANDIDATES:
         if p.exists():
             return p
@@ -113,10 +177,12 @@ try:
         reset_tr_system_cache,
         _split_name_and_body,
         set_memory_enabled,
+        commit_history_manually,
     )
 except Exception:
     LLMConfigDual = None
     set_memory_enabled = None
+    commit_history_manually = None
 
 llm_cfg = LLMConfig(
     enabled=True,
@@ -156,19 +222,35 @@ def canon_ru(s: str) -> str:
 
 
 def canon_en(s: str) -> str:
+    """
+    Канонизация исходного текста для проверки стабильности.
+    Теперь поддерживает CJK (китайский, японский, корейский).
+    """
     s = (s or "").replace("\ufeff", "")
-    # нормализуем пробелы и регистр
-    s = _EN_WS_RX.sub(" ", s)
-    s = s.strip().lower()
-    if not s:
-        return ""
-    # выкидываем пунктуацию
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    # убираем простые артикли, которые часто "прыгают" в OCR/LLM
-    tokens = [t for t in s.split() if t not in ("a", "an", "the")]
-    return " ".join(tokens)
+    
+    # 1. Переводим в нижний регистр
+    s = str(s).lower()
+    
+    # Разрешаем строку, состоящую только из знаков вопроса
+    if re.fullmatch(r"[?？]+", s.strip()):
+        return s.strip()
+    
+    # 2. Удаляем всё, что НЕ буквы (включая иероглифы) и НЕ цифры и НЕ пробелы
+    # \w в Python 3 включает в себя иероглифы, умляуты и кириллицу.
+    s = re.sub(r"[^\w\s]", " ", s) 
+    
+    # 3. Схлопываем лишние пробелы
+    s = re.sub(r"\s+", " ", s).strip()
+    
+    # 4. (Опционально) Убираем английские артикли, если они попались отдельными словами
+    # Для CJK это не повредит, так как там нет пробелов и "a" не вырежется из середины слова.
+    if s:
+        tokens = [t for t in s.split() if t not in ("a", "an", "the")]
+        s = " ".join(tokens)
+        
+    return s
 
-def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, str]]:
+def detect_text_boxes(frame_bgr: np.ndarray, lang_code: str = "en") -> list[tuple[int, int, int, int, str]]:
     """
     Детектор прямоугольников с текстом на EasyOCR.
     Возвращает список (x, y, w, h, text) в пикселях.
@@ -180,7 +262,10 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
     if h < 10 or w < 10:
         return []
 
-    reader = get_easyocr_reader()
+    # --- ПЕРЕДАЕМ ЯЗЫК СЮДА ---
+    reader = get_easyocr_reader(lang_code)
+    # --------------------------
+    
     if reader is None:
         return []
 
@@ -195,8 +280,8 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
         if SCALE < 1.0:
             small_w = max(1, int(w * SCALE))
             small_h = max(1, int(h * SCALE))
-            # INTER_AREA – оптимален для уменьшения
-            rgb_small = cv2.resize(rgb, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            # INTER_LINEAR быстрее и достаточен для детекции боксов
+            rgb_small = cv2.resize(rgb, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
             used_rgb = rgb_small
             inv_scale = 1.0 / SCALE
         else:
@@ -210,7 +295,7 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
             paragraph=False,
         )
 
-        boxes: List[Tuple[int, int, int, int, str]] = []
+        boxes: list[tuple[int, int, int, int, str]] = []
         # отсечём совсем мелкий шум: ~0.3% площади региона
         min_area = (w * h) * 0.003
 
@@ -251,9 +336,9 @@ def detect_text_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int, s
         return []
 
 def _filter_boxes_by_llm_text(
-    boxes_with_text: List[Tuple[int, int, int, int, str]],
+    boxes_with_text: list[tuple[int, int, int, int, str]],
     en_full: str,
-) -> List[Tuple[int, int, int, int]]:
+) -> list[tuple[int, int, int, int]]:
     """
     Пытаемся выбрать только те боксы, которые соответствуют основному диалогу
     из LLM-OCR (en_full), и выкинуть имя / мусор.
@@ -266,7 +351,7 @@ def _filter_boxes_by_llm_text(
         return []
 
     # Нормализуем входные боксы — отбрасываем кривые кортежи
-    safe_boxes: List[Tuple[int, int, int, int, str]] = []
+    safe_boxes: list[tuple[int, int, int, int, str]] = []
     try:
         for b in boxes_with_text:
             if not b:
@@ -310,7 +395,7 @@ def _filter_boxes_by_llm_text(
 
         first_body_word = body_c.split()[0] if body_c.split() else ""
 
-        good: List[Tuple[int, int, int, int]] = []
+        good: list[tuple[int, int, int, int]] = []
 
         # --- базовая фильтрация по тексту (как было раньше) ---
         for (x, y, w, h, txt) in boxes_with_text:
@@ -374,6 +459,9 @@ def _filter_boxes_by_llm_text(
         # канонизированный EN-лейбл
         def _canon_label(s: str) -> str:
             s = s or ""
+            # Разрешаем ??? как лейбл
+            if re.fullmatch(r"[?？]+", s.strip()):
+                return s.strip()
             return re.sub(r"[^0-9a-zA-Zа-яА-Я]+", "", s).lower()
 
         name_label = _canon_label(name_line) if name_line else ""
@@ -385,8 +473,8 @@ def _filter_boxes_by_llm_text(
         row_thresh = max(4, avg_h * 0.7)
 
         # разбиваем на строки (ряды) по вертикали
-        rows: list[list[Tuple[int, int, int, int]]] = []
-        cur: list[Tuple[int, int, int, int]] = []
+        rows: list[list[tuple[int, int, int, int]]] = []
+        cur: list[tuple[int, int, int, int]] = []
         if boxes_for_rows:
             base_y = boxes_for_rows[0][1]
             cur.append(boxes_for_rows[0])
@@ -433,7 +521,7 @@ def _filter_boxes_by_llm_text(
                 or name_label in top_label
             ):
                 # считаем верхнюю строку неймплейтом → выкидываем её целиком
-                new_good: List[Tuple[int, int, int, int]] = []
+                new_good: list[tuple[int, int, int, int]] = []
                 for row in rows[1:]:
                     new_good.extend(row)
                 if new_good:
@@ -459,7 +547,7 @@ def _bgr_to_png_b64(img, max_side: int = 1400) -> str:
     if max(h, w) > max_side:
         scale = max_side/float(max(h, w))
         img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-    ok, enc = cv2.imencode(".png", img)
+    ok, enc = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     if not ok: return ""
     return base64.b64encode(enc).decode("ascii")
 
@@ -727,7 +815,7 @@ def _get_window_rect(hwnd):
         left,top,right,bottom = win32gui.GetWindowRect(hwnd)
     return left,top,right,bottom
 
-def _printwindow_to_bgr(hwnd):
+def _capture_window_rgba(hwnd):
     left,top,right,bottom = _get_window_rect(hwnd)
     w,h=max(1,right-left), max(1,bottom-top)
     hwndDC=win32gui.GetWindowDC(hwnd)
@@ -740,31 +828,35 @@ def _printwindow_to_bgr(hwnd):
         saveDC.BitBlt((0,0),(w,h),mfcDC,(0,0),win32con.SRCCOPY)
     info=bmp.GetInfo(); data=bmp.GetBitmapBits(True)
     img=np.frombuffer(data,dtype=np.uint8); img.shape=(info['bmHeight'],info['bmWidth'],4)
-    bgr=img[...,:3].copy()
     win32gui.DeleteObject(bmp.GetHandle()); saveDC.DeleteDC(); mfcDC.DeleteDC(); win32gui.ReleaseDC(hwnd,hwndDC)
-    return bgr,(left,top,w,h)
+    return img, (left, top, w, h)
 
 def _grab_from_bound(hwnd, region_px):
-    full, (wx, wy, ww, hh) = _printwindow_to_bgr(hwnd)
+    # Optimization: Get RGBA view (no copy) and crop before converting to BGR
+    full_rgba, (wx, wy, ww, hh) = _capture_window_rgba(hwnd)
     rx, ry, rw, rh = region_px
 
     # пересечение
     ix1 = max(rx, wx); iy1 = max(ry, wy)
     ix2 = min(rx + rw, wx + ww); iy2 = min(ry + rh, wy + hh)
     if ix2 <= ix1 or iy2 <= iy1:
-        return None, full
+        return None, None
 
     sx1, sy1 = ix1 - wx, iy1 - wy
     sx2, sy2 = ix2 - wx, iy2 - wy
-    sub = full[sy1:sy2, sx1:sx2]
+    
+    # Crop from RGBA
+    sub_rgba = full_rgba[sy1:sy2, sx1:sx2]
+    # Convert to BGR (copy happens here, but only for the small region)
+    sub = sub_rgba[..., :3].copy()
 
     out = np.zeros((rh, rw, 3), dtype=np.uint8)
     dx, dy = ix1 - rx, iy1 - ry
     h = min(sub.shape[0], rh - dy); w = min(sub.shape[1], rw - dx)
     if h <= 0 or w <= 0:
-        return None, full
+        return None, None
     out[dy:dy + h, dx:dx + w] = sub[:h, :w]
-    return out, full
+    return out, None
 
 
 # ===== DPI-aware координаты из Qt в физические пиксели ===
@@ -1007,7 +1099,7 @@ class RegionModel:
     display_text: str=""
     target_ru: str=""
     display_idx: int=0
-    typing_timer: Optional[QTimer]=field(default=None, repr=False)
+    typing_timer: QTimer | None = field(default=None, repr=False)
 
     i_text: str = ""                 # мгновенный полный RU
     last_rendered_instant: str = ""  # чтобы не перерисовывать одинаковое
@@ -1026,9 +1118,9 @@ class RegionModel:
     
     last_en_canon: str = ""
     
-    text_boxes: List[Tuple[float, float, float, float]] = field(default_factory=list, repr=False)
+    text_boxes: list[tuple[float, float, float, float]] = field(default_factory=list, repr=False)
 
-    panel: Optional[RegionPanel]=field(default=None, repr=False)
+    panel: RegionPanel | None = field(default=None, repr=False)
 
 
 # ==================== Capture Worker =====================
@@ -1091,34 +1183,52 @@ class CaptureWorker(QThread):
                     frame = arr[:,:,:3].copy()
                     full  = None
 
+                mode_idx = getattr(self.overlay, "work_mode_idx", 0)
+                
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 
+                # Оптимизация: уменьшаем картинку для Canny, если она большая
+                # Это ускоряет проверку стабильности на 4K экранах
+                h_g, w_g = gray.shape
+                if w_g > 800:
+                    sc = 800.0 / w_g
+                    gray_small = cv2.resize(gray, (800, int(h_g * sc)), interpolation=cv2.INTER_LINEAR)
+                    edges = cv2.Canny(gray_small, 50, 150)
+                else:
+                    edges = cv2.Canny(gray, 50, 150)
+                # ----------------------------------------------
+
                 # --- НОВАЯ ВСТАВКА: Сравнение по ГРАНИЦАМ (игнорирует фон) ---
                 # Используем детектор краев Canny. Он видит буквы, но игнорирует мягкие тени и облака.
-                edges = cv2.Canny(gray, 50, 150)
-
-                if getattr(r, "last_edges_img", None) is not None:
-                    # Сравниваем не картинки, а их "скелеты" (границы)
-                    diff = cv2.absdiff(edges, r.last_edges_img)
-                    
-                    # Считаем, сколько пикселей-границ изменилось
+                last_img = getattr(r, "last_edges_img", None)
+                
+                # Теперь edges существует, и ошибка исчезнет
+                if last_img is not None and last_img.shape == edges.shape:
+                    diff = cv2.absdiff(edges, last_img)
                     changed_pixels = cv2.countNonZero(diff)
                     
-                    # Получаем порог стабильности
-                    threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
-                    current_hits = r.pending_hits or 0
+                    # Динамический порог: 0.2% от площади картинки, но не меньше 30 пикселей
+                    # (2500 было слишком много для коротких фраз)
+                    total_px = edges.shape[0] * edges.shape[1]
+                    STABILITY_THRESHOLD = max(30, int(total_px * 0.002))
+                    
+                    if changed_pixels < STABILITY_THRESHOLD:
+                        # ... (дальше ваши условия сна для DUAL/SOLO) ...
+                        if (mode_idx == 1 or mode_idx == 2):
+                             threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
+                             if r.pending_hits >= threshold:
+                                 self.msleep(self.interval_ms)
+                                 continue
+                        
+                        if mode_idx == 0 and r.last_sent_ru_raw:
+                             threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
+                             if r.pending_hits == 0 or r.pending_hits >= threshold:
+                                 self.msleep(self.interval_ms)
+                                 continue
+                else:
+                    # Если размеры разные (например, вы поменяли размер окна) — считаем, что картинка новая.
+                    pass
 
-                    # Если изменений границ мало (меньше 150 пикселей) — считаем, что текст стоит на месте
-                    # (Даже если фон при этом пляшет)
-                    if changed_pixels < 150:
-                        # Если мы УЖЕ перевели этот текст (hits >= threshold) — спим и не грузим проц
-                        if current_hits >= threshold:
-                            self.msleep(self.interval_ms)
-                            continue
-                        # А если текст новый, но еще "накапливает уверенность" (Pending) — идем дальше, 
-                        # чтобы подтвердить его (увеличить hits).
-
-                # Сохраняем текущие ГРАНИЦЫ для следующего кадра
                 r.last_edges_img = edges.copy()
                 # --- КОНЕЦ ВСТАВКИ ---
 
@@ -1131,7 +1241,11 @@ class CaptureWorker(QThread):
                 # Если боксов нет — значит, текста нет. Останавливаем ВСЁ.
                 boxes_with_text = []
                 try:
-                    boxes_with_text = detect_text_boxes(frame)
+                    # 1. Берем язык, который выбрал пользователь в UI
+                    cur_lang = getattr(self.overlay, "source_lang", "en")
+                    
+                    # 2. Передаем его в детектор
+                    boxes_with_text = detect_text_boxes(frame, cur_lang)
                 except Exception as e:
                     print("[OCR-BOXES] Error:", e)
 
@@ -1165,8 +1279,6 @@ class CaptureWorker(QThread):
                 en = ""
                 ru = ""
 
-                mode_idx = getattr(self.overlay, "work_mode_idx", 0)
-
                 # 1. Сначала делаем ТОЛЬКО OCR (чтение текста) для Dual/Online
                 if mode_idx == 1 or mode_idx == 2:
                     if getattr(self.overlay, "dual_mode", False) and LLMConfigDual:
@@ -1188,7 +1300,8 @@ class CaptureWorker(QThread):
                     last_confirmed_canon = r.last_en_canon or ""
                     
                     similarity = SequenceMatcher(None, current_en_canon, last_confirmed_canon).ratio()
-                    is_stable = similarity > 0.85  # Текст похож на предыдущий?
+                    # Повышаем порог до 95%, чтобы не пропускать похожие фразы (например "I can" vs "I ran")
+                    is_stable = similarity > 0.95  
 
                     if is_stable:
                         # Текст СТАБИЛЕН (тот же самый)
@@ -1212,10 +1325,20 @@ class CaptureWorker(QThread):
 
                 # 3. ВЫЗОВ ПЕРЕВОДЧИКА (Только если need_translate = True)
                 if need_translate and (mode_idx == 1 or mode_idx == 2) and en:
-                    if mode_idx == 1: # DUAL (Local LLM)
+                    if mode_idx == 1: # DUAL
                         ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual)
-                    elif mode_idx == 2: # ONLINE (Google)
-                        ru = online_adapter.translate_text(en)
+                    
+                    elif mode_idx == 2: # ONLINE
+                        # --- УЛУЧШЕНИЕ: Отделяем имя, чтобы Гугл его не испортил ---
+                        try:
+                            # Используем функцию из dual адаптера, если доступна
+                            nm, bd = _split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
+                            text_to_send = bd if bd else en
+                        except:
+                            text_to_send = en
+                        
+                        # Переводим только тело диалога
+                        ru = online_adapter.translate_text(text_to_send)
                 
                     
                 if getattr(self.overlay, "draw_over_original", False) and boxes_with_text:
@@ -1243,7 +1366,7 @@ class CaptureWorker(QThread):
                 name_line = None
                 if getattr(self.overlay, "dual_mode", False) and en and ru:
                     try:
-                        name_line, _body = _split_name_and_body(en)
+                        name_line, _body = _split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
                     except Exception:
                         name_line = None
 
@@ -1347,6 +1470,14 @@ class CaptureWorker(QThread):
                                     f"-> Show RU"
                                 )
 
+                                if mode_idx == 1 and commit_history_manually:
+                                    try:
+                                        # en - это сырой английский текст из текущего кадра (он стабилен)
+                                        # r.pending_ru_raw - это готовый перевод
+                                        commit_history_manually(en, r.pending_ru_raw)
+                                    except Exception as e:
+                                        print(f"[HISTORY] Error: {e}")
+                                        
                 self.msleep(self.interval_ms)
             except Exception as e:
                 print("Worker loop error:", e)
@@ -1406,8 +1537,9 @@ class Overlay(QWidget):
 
         self.edit_mode=True
         self.enabled_overlay=True
+        self.source_lang = "en"
         self.paused=False
-        self.bound_hwnd: Optional[int]=None
+        self.bound_hwnd: int | None = None
         self.edit_target='display'
         self.border_w = BORDER_WIDTH
         self.split_border_w = SPLIT_BORDER_WIDTH
@@ -1876,7 +2008,7 @@ class Overlay(QWidget):
 
 def _q(p): return f'"{str(p)}"'
 
-def scan_gguf(roots: List[Path]) -> Tuple[List[str], List[str]]:
+def scan_gguf(roots: list[Path]) -> tuple[list[str], list[str]]:
     models=[]; projs=[]
     for root in roots:
         if not root.exists(): continue
@@ -1887,10 +2019,22 @@ def scan_gguf(roots: List[Path]) -> Tuple[List[str], List[str]]:
     models.sort(); projs.sort()
     return models, projs
 
-def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, parallel, ngl):
+def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, parallel, ngl, use_fa=False, cache_type="q8_0"):
     cmd = [exe, "-m", model]
     if mmproj:
         cmd += ["--mmproj", mmproj]
+
+    # === ОПТИМИЗАЦИЯ КЭША (Выбор пользователя) ===
+    # q8_0 - стандарт (хорошее сжатие, почти без потерь)
+    # q4_0 - сильное сжатие (экономит память, чуть хуже точность)
+    # f16  - без сжатия (жрет много памяти)
+    cmd += ["-ctk", str(cache_type), "-ctv", str(cache_type)]
+    
+    # Flash Attention
+    if use_fa:
+        cmd += ["-fa", "on"]
+    # ===================
+
     cmd += [
         "-ngl", str(int(ngl)),
         "--ctx-size", str(int(ctx)),
@@ -1901,6 +2045,7 @@ def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, pa
         "--port", str(int(port)),
     ]
     return cmd
+
 
 def _ping_llama(url: str, timeout: float = 0.5) -> bool:
     try:
@@ -1920,10 +2065,19 @@ _LLAMA_PROC2 = None
 
 def _spawn(cmd_list):
     # не используем shell, даём список аргументов
-    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-             | getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
-    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+    if HIDE_CONSOLE:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    else:
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
     return subprocess.Popen(cmd_list, shell=False, creationflags=flags)
+
+def _toggle_console(hide: bool):
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0 if hide else 5)
+    except Exception:
+        pass
 
 def _ensure_llama_server(cmd_list, server_url):
     global _LLAMA_PROC
@@ -2050,6 +2204,11 @@ class ConfigWindow(QWidget):
         self.spUBatch= QSpinBox();       self.spUBatch.setRange(1, 4096);  self.spUBatch.setValue(64)
         self.spPar   = QSpinBox();       self.spPar.setRange(1, 16);       self.spPar.setValue(1)
         self.spNGL   = QSpinBox();       self.spNGL.setRange(0, 999);      self.spNGL.setValue(999)
+        self.cbFlashAttn = QCheckBox("Flash Attention (только RTX 30xx/40xx)")
+        self.cbFlashAttn.setChecked(False) 
+        self.cbFlashAttn.setToolTip("Включает оптимизацию памяти и скорости.\n"
+                            "Включать ТОЛЬКО для видеокарт RTX 30-й и 40-й серий!\n"
+                            "На GTX 10xx или старых RTX может вызывать ошибку.")
         self.edHost  = QLineEdit("127.0.0.1")
         self.spPort  = QSpinBox();       self.spPort.setRange(1, 65535);   self.spPort.setValue(8080)
 
@@ -2064,6 +2223,8 @@ class ConfigWindow(QWidget):
         self.cbSmooth = QCheckBox("Плавный вывод (smooth)"); self.cbSmooth.setChecked(RENDER_MODE=="smooth")
         self.cbOverlayBoxes = QCheckBox("Подставлять перевод на место оригинального текста")
         self.cbOverlayBoxes.setChecked(False)
+        self.cbHideConsole = QCheckBox("Скрыть консоль (Main + Llama)")
+        self.cbHideConsole.toggled.connect(lambda v: (globals().__setitem__("HIDE_CONSOLE", v), _toggle_console(v)))
         self.cbMemory = QCheckBox("Память нейросети")
         if set_memory_enabled is not None:
             self.cbMemory.toggled.connect(lambda v: set_memory_enabled(v))
@@ -2173,6 +2334,18 @@ class ConfigWindow(QWidget):
         topRow.addWidget(self.btnStart)
         topRow.addSpacing(12)
         topRow.addWidget(self.cbMode)
+        topRow.addSpacing(12)
+        topRow.addWidget(QLabel("Исходный язык:"))
+        
+        self.cbSourceLang = QComboBox()
+        self.cbSourceLang.addItem("English", "en")
+        self.cbSourceLang.addItem("Japanese", "ja")
+        self.cbSourceLang.addItem("Chinese", "ch_sim")
+        self.cbSourceLang.addItem("Korean", "ko")
+        # Делаем его не очень широким, чтобы не растягивал окно
+        self.cbSourceLang.setMinimumWidth(100) 
+        
+        topRow.addWidget(self.cbSourceLang)
         topRow.addStretch()
         formHome.addLayout(topRow)
 
@@ -2284,6 +2457,7 @@ class ConfigWindow(QWidget):
         fk.addRow("Ширина разделителя:", self.spSplit)
         fk.addRow("Плавный вывод:", self.cbSmooth)
         fk.addRow("Overlay по боксам:", self.cbOverlayBoxes)
+        fk.addRow("Скрыть консоль:", self.cbHideConsole)
         fk.addRow("Память нейросети:", self.cbMemory)
         fk.addRow("Ручка рамки:", self.spHandle)
         fk.addRow("Фон панели:", self.cbBgMode)
@@ -2333,6 +2507,27 @@ class ConfigWindow(QWidget):
         scrollModel.setWidgetResizable(True)
         innerModel = QWidget(scrollModel)
         formModel = QVBoxLayout(innerModel)
+        
+        self.gbGlobalOpt = QGroupBox("Оптимизация (действует на все режимы)")
+        fgo = QFormLayout(self.gbGlobalOpt)
+        fgo.addRow(self.cbFlashAttn)  # Flash Attention уже был
+        fgo.addRow(self.cbCache)
+
+        # --- НОВОЕ: Выбор квантования кэша ---
+        self.cbCacheType = QComboBox()
+        self.cbCacheType.addItem("q8_0 (Баланс, рек.)", "q8_0")
+        self.cbCacheType.addItem("q4_0 (Экономия VRAM)", "q4_0")
+        self.cbCacheType.addItem("f16  (Макс. качество, много VRAM)", "f16")
+        self.cbCacheType.setToolTip(
+            "Сжатие контекста (KV Cache).\n"
+            "q8_0: Стандарт. Почти без потерь.\n"
+            "q4_0: Для слабых карт (8GB и меньше). Экономит 30-50% памяти контекста.\n"
+            "f16: Без сжатия. Самое точное, но занимает много памяти."
+        )
+        fgo.addRow("Сжатие кэша (KV):", self.cbCacheType)
+        # -------------------------------------
+
+        formModel.addWidget(self.gbGlobalOpt)
 
         # OCR-сервер (DUAL)
         self.gbOCR = QGroupBox("OCR-сервер (vision)")
@@ -2431,7 +2626,6 @@ class ConfigWindow(QWidget):
         fgen.addRow("repeat_penalty:", self.spRP)
         fgen.addRow("seed:", self.spSeed)
         fgen.addRow("slot_id:", self.spSlot)
-        fgen.addRow("", self.cbCache)
         formModel.addWidget(self.gbGen)
 
         self.gbSrv = QGroupBox("Сервер (llama.cpp)")
@@ -2476,7 +2670,7 @@ class ConfigWindow(QWidget):
         infoLabel.setOpenExternalLinks(True)
         infoLabel.setWordWrap(True)
         infoLabel.setText("АИ переводчик by IgoRexa. <br>"
-                            "Версия 0.0.6 <br>"
+                            "Версия 1.0.0 <br>"
                             "GitHub: "
                             "<a href='https://github.com/igorexa225/AIGameTranslater'>"
                             "https://github.com/igorexa225/AIGameTranslater"
@@ -2603,7 +2797,6 @@ class ConfigWindow(QWidget):
         
         # 1. Группы настроек SOLO (gbLLM, gbGen, gbSrv)
         for w in (getattr(self, "gbLLM", None),
-                  getattr(self, "gbGen", None),
                   getattr(self, "gbSrv", None),
                   getattr(self, "btnPrompt", None),     # Кнопка настройки промпта SOLO
                   getattr(self, "btnPreview", None)):   # Кнопка превью SOLO
@@ -2629,6 +2822,13 @@ class ConfigWindow(QWidget):
     
     def _load_prefs_into_ui(self):
         p = _load_prefs()
+        
+        sl = p.get("source_lang", "en")
+        idx = self.cbSourceLang.findData(sl)
+        if idx >= 0:
+            self.cbSourceLang.setCurrentIndex(idx)
+        else:
+            self.cbSourceLang.setCurrentIndex(0) # En по умолчанию
         
         # Логика миграции со старого конфига
         old_dual = bool(p.get("dual_enabled", False))
@@ -2656,10 +2856,12 @@ class ConfigWindow(QWidget):
             i = self.cbMmproj.findText(mmproj)
             if i >= 0: self.cbMmproj.setCurrentIndex(i)
         # лор
-        lore = p.get("lore_path")
-        if lore: self.edLore.setText(lore)
-        pb = p.get("phrasebook_path")
-        if pb: self.edPB.setText(pb)
+        if "lore_path" in p:
+            self.edLore.setText(p["lore_path"])
+        
+        # phrasebook (исправлено)
+        if "phrasebook_path" in p:
+            self.edPB.setText(p["phrasebook_path"])
         # LLM
         self.spMaxTok.setValue(int(p.get("max_tokens", 15000)))
         self.spTO.setValue(float(p.get("timeout_s", 30.0)))
@@ -2676,6 +2878,13 @@ class ConfigWindow(QWidget):
         self.spUBatch.setValue(int(p.get("ubatch", 64)))
         self.spPar.setValue(int(p.get("parallel", 1)))
         self.spNGL.setValue(int(p.get("ngl", 999)))
+        self.cbFlashAttn.setChecked(bool(p.get("use_flash_attn", False)))
+        ctype = p.get("cache_type_k", "q8_0") # q8_0 по умолчанию
+        idx = self.cbCacheType.findData(ctype)
+        if idx >= 0:
+            self.cbCacheType.setCurrentIndex(idx)
+        else:
+            self.cbCacheType.setCurrentIndex(0) # q8_0
         self.edHost.setText(p.get("host", "127.0.0.1"))
         try: self.spPort.setValue(int(p.get("port", 8080)))
         except Exception: pass
@@ -2723,6 +2932,12 @@ class ConfigWindow(QWidget):
         self.spCanonHits.setValue(int(p.get("en_canon_hits", 2)))
         self.cbSmooth.setChecked(p.get("render_mode", "smooth") == "smooth")
         self.cbOverlayBoxes.setChecked(bool(p.get("draw_over_original", False)))
+        
+        hide_c = bool(p.get("hide_console", False))
+        self.cbHideConsole.setChecked(hide_c)
+        globals()["HIDE_CONSOLE"] = hide_c
+        _toggle_console(hide_c)
+
         self.cbMemory.setChecked(bool(p.get("memory_enabled", True)))
         if set_memory_enabled is not None:
             try:
@@ -2847,6 +3062,7 @@ class ConfigWindow(QWidget):
     def _collect_prefs(self) -> dict:
         prefs = {
             "font_family": self.fontFamily.currentFont().family(),
+            "source_lang": self.cbSourceLang.currentData(),
             "font_size": int(self.fontSize.value()),
             "font_bold": bool(self.fontBold.isChecked()),
             "model_path": self.cbModel.currentText().strip(),
@@ -2863,6 +3079,7 @@ class ConfigWindow(QWidget):
             "split_border_w": int(self.spSplit.value()),
             "render_mode": "smooth" if self.cbSmooth.isChecked() else "instant",
             "draw_over_original": bool(self.cbOverlayBoxes.isChecked()),
+            "hide_console": bool(self.cbHideConsole.isChecked()),
             "memory_enabled": bool(self.cbMemory.isChecked()),
             "handle": int(self.spHandle.value()),
             "bg_mode": self.cbBgMode.currentData(),
@@ -2881,6 +3098,8 @@ class ConfigWindow(QWidget):
             "ubatch": int(self.spUBatch.value()),
             "parallel": int(self.spPar.value()),
             "ngl": int(self.spNGL.value()),
+            "use_flash_attn": self.cbFlashAttn.isChecked(),
+            "cache_type_k": self.cbCacheType.currentData(),
             "host": self.edHost.text().strip(),
             "port": int(self.spPort.value()),
         }
@@ -3100,12 +3319,20 @@ class ConfigWindow(QWidget):
         llm_cfg.seed           = int(self.spSeed.value())
         llm_cfg.slot_id        = int(self.spSlot.value())
         llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        llm_cfg.source_lang    = self.cbSourceLang.currentData()
+        self.overlay.source_lang = self.cbSourceLang.currentData()
+        print(f"[START] Source Language: {self.overlay.source_lang}")
         mode_idx = self.cbMode.currentIndex()
 
         MAX_OCR_FPS    = float(self.spFps.value())
         RENDER_MODE    = "smooth" if self.cbSmooth.isChecked() else "instant"
         HANDLE         = int(self.spHandle.value())
         DRAW_OVER_ORIGINAL = bool(self.cbOverlayBoxes.isChecked())
+        
+        global HIDE_CONSOLE
+        HIDE_CONSOLE = self.cbHideConsole.isChecked()
+        _toggle_console(HIDE_CONSOLE)
+
         self._apply_bg_settings()
         try:
             for r in getattr(self.overlay, "regions", []):
@@ -3145,6 +3372,10 @@ class ConfigWindow(QWidget):
             print("[LLM] server exe not found in expected locations")
             return
 
+        sel_cache = self.cbCacheType.currentData() or "q8_0"
+        
+        use_fa = getattr(self, "cbFlashAttn", None) and self.cbFlashAttn.isChecked()
+        
         model_path  = self.cbModel.currentText().strip()
         mmproj_path = self.cbMmproj.currentText().strip()
         cmd = rebuild_server_cmd(
@@ -3155,6 +3386,8 @@ class ConfigWindow(QWidget):
             ubatch=int(self.spUBatch.value()),
             parallel=int(self.spPar.value()),
             ngl=int(self.spNGL.value()),
+            use_fa=use_fa,
+            cache_type=sel_cache
         )
         print("[LLM] server exe:", SERVER_EXE)
 
@@ -3178,6 +3411,8 @@ class ConfigWindow(QWidget):
                 ubatch=int(self.spUBatch.value()),
                 parallel=int(self.spPar.value()),
                 ngl=int(self.spNGL.value()),
+                use_fa=use_fa,
+                cache_type=sel_cache
             )
 
             print("[LLM] model:", model_path)
@@ -3214,6 +3449,8 @@ class ConfigWindow(QWidget):
                 ubatch=int(self.spUB1.value()),
                 parallel=int(self.spPar1.value()),
                 ngl=int(self.spNGL1.value()),
+                use_fa=use_fa,
+                cache_type=sel_cache
             )
             cmd2 = rebuild_server_cmd(
                 SERVER_EXE, tr_model, "",          # <- переводчик БЕЗ mmproj
@@ -3223,6 +3460,8 @@ class ConfigWindow(QWidget):
                 ubatch=int(self.spUB2.value()),
                 parallel=int(self.spPar2.value()),
                 ngl=int(self.spNGL2.value()),
+                use_fa=use_fa,
+                cache_type=sel_cache
             )
 
             print("[LLM] spawn OCR:", cmd1)
@@ -3238,6 +3477,7 @@ class ConfigWindow(QWidget):
                 max_tokens=int(self.spMaxTok1.value()),
                 slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
                 system_override=(getattr(self,"_ocr_prompt_override","") or None),
+                source_lang=self.overlay.source_lang,
             )
             self.overlay.tr_cfg_dual = LLMConfigDual(
                 server=f"http://{host2}:{port2}",
@@ -3250,6 +3490,8 @@ class ConfigWindow(QWidget):
                 system_override=(getattr(self,"_tr_prompt_override","") or None),
                 lore_path=llm_cfg.lore_path,
                 phrasebook_path=llm_cfg.phrasebook_path,
+                source_lang=self.overlay.source_lang,
+                use_prompt_cache=bool(self.cbCache.isChecked()),
             )
             # ============================
             
@@ -3272,6 +3514,7 @@ class ConfigWindow(QWidget):
                 ubatch=int(self.spUB1.value()),
                 parallel=int(self.spPar1.value()),
                 ngl=int(self.spNGL1.value()),
+                cache_type=sel_cache
             )
             print("[LLM] spawn OCR (Online mode):", cmd1)
             _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
@@ -3335,6 +3578,18 @@ class ConfigWindow(QWidget):
 # ========================= main ==========================
 
 def main():
+    # --- Скрываем консоль максимально рано, если это сохранено в настройках ---
+    try:
+        p = _load_prefs()
+        if p.get("hide_console", False):
+            globals()["HIDE_CONSOLE"] = True
+            _toggle_console(True)
+    except Exception:
+        pass
+    # --------------------------------------------------------------------------
+
+    _setup_logging()
+
     app = QApplication(sys.argv)
     w = ConfigWindow()
     w.show()

@@ -3,17 +3,28 @@
 
 import os, time, json, base64, threading, re
 from dataclasses import dataclass
-from typing import Optional
 import requests
 
 DEFAULT_MODEL = "Qwen3-VL-8B-Instruct"
 _SESSION = requests.Session()
+
+def _strip_wrapper(text_ru: str, text_en: str) -> str:
+    s_ru = text_ru.strip()
+    s_en = text_en.strip()
+    wrappers = [
+        ("**", "**"), ("*", "*"), ('"', '"'), ("'", "'"), ("“", "”"), ("«", "»")
+    ]
+    for start, end in wrappers:
+        if s_ru.startswith(start) and s_ru.endswith(end) and len(s_ru) >= len(start)+len(end):
+            if not (s_en.startswith(start) and s_en.endswith(end)):
+                return s_ru[len(start):-len(end)].strip()
+    return s_ru
 # ===================== Конфиг LLM =========================
 
 @dataclass
 class LLMConfig:
     enabled: bool = True
-    server: Optional[str] = "http://127.0.0.1:8080"
+    server: str | None = "http://127.0.0.1:8080"
     model: str = DEFAULT_MODEL
 
     # поведение запроса
@@ -26,6 +37,7 @@ class LLMConfig:
     repeat_penalty: float = 1.0
     seed: int = 0
     slot_id: int = 0
+    source_lang: str = "en"
 
     # лор
     lore_path: str = "assets/game_bible_exilium.txt"
@@ -36,7 +48,7 @@ class LLMConfig:
     use_prompt_cache: bool = True
 
     # кастомизация system-подсказки из UI
-    system_override: Optional[str] = None
+    system_override: str | None = None
 
 
 # ================== Лор + System prompt ===================
@@ -218,7 +230,7 @@ def preload_prompt_cache(cfg: LLMConfig) -> bool:
 # =========== ЕДИНСТВЕННЫЙ ВЫЗОВ: картинка → перевод =======
 
 def vision_translate_from_images(region_png_b64: str,
-                                full_png_b64: Optional[str],
+                                full_png_b64: str | None,
                                 cfg: LLMConfig,
                                 tgt_lang: str = "ru") -> str:
     """
@@ -235,14 +247,22 @@ def vision_translate_from_images(region_png_b64: str,
     system = _SYSTEM_PROMPT
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
 
+    lang_map = {
+        "en": "English",
+        "ja": "Japanese",
+        "ch_sim": "Chinese",
+        "ko": "Korean"
+    }
+    src_lang_name = lang_map.get(getattr(cfg, "source_lang", "en"), "English")
+
     def _content_variant(kind: str):
         base_text = (
             "This image is a cropped in-game dialogue or UI box.\n"
-            "1) Read ALL clearly visible ENGLISH text EXACTLY as it appears "
+            f"1) Read ALL clearly visible {src_lang_name} text EXACTLY as it appears "
             "(preserve line breaks).\n"
             "2) Translate it into natural Russian, using the system instructions and LORE.\n"
             "3) Respond with a SINGLE JSON object ONLY, in one line:\n"
-            '   {\"en\": \"<original English text>\", \"ru\": \"<Russian translation>\"}\n'
+            f'   {{\"en\": \"<original {src_lang_name} text>\", \"ru\": \"<Russian translation>\"}}\n'
             "- Use \\n inside strings for line breaks.\n"
             "- Do NOT add comments, extra fields, or any text before/after the JSON."
         )
@@ -295,14 +315,23 @@ def vision_translate_from_images(region_png_b64: str,
             js = r.json()
             out = (js.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
 
+            # Clean special tokens (like <|im_end|>, </s>, etc.)
+            out = re.sub(r"(?:<\|.*?\|>|&lt;\|.*?\|?&gt;|<s>|</s>|&lt;/s&gt;|<end_of_turn>|<start_of_turn>)", "", out, flags=re.IGNORECASE).strip()
+
             if not out:
                 print(f"[LLM] vision empty kind={kind} in {dt:.0f} ms")
                 continue
+            
+            # === ВСТАВКА 1: Очистка от вступлений (Intro Cleaner) ===
+            # Если модель написала "Here is the JSON: { ... }", мы вырезаем лишнее
+            intro_match = re.match(r"^.*?(?:json|translation|output).*?:\s*(\{.*)", out, re.IGNORECASE | re.DOTALL)
+            if intro_match:
+                out = intro_match.group(1).strip()
+            # ========================================================
 
-            # иногда модели заворачивают в ```json ... ```
+            # (Дальше идет твой старый код очистки ```json)
             txt = out.strip()
             if txt.startswith("```"):
-                # убираем первую строку с ```...
                 first_nl = txt.find("\n")
                 if first_nl != -1:
                     txt = txt[first_nl + 1:]
@@ -319,11 +348,18 @@ def vision_translate_from_images(region_png_b64: str,
                     en_text = str(obj.get("en", "") or "").strip()
                     ru_text = str(obj.get("ru", "") or "").strip()
                 else:
-                    # на всякий случай: если это массив/что-то ещё
                     ru_text = str(obj).strip()
             except Exception:
-                # не получилось распарсить как JSON — считаем, что это просто RU как раньше
                 ru_text = out.strip()
+
+            # === ВСТАВКА 2: Очистка кавычек/Markdown в русском тексте ===
+            # Применяем ту же логику, что и в DUAL: если в EN кавычек нет, а в RU есть — убираем.
+            # (Запускаем 2 раза, чтобы снять и **bold**, и "кавычки")
+            for _ in range(2):
+                new_ru = _strip_wrapper(ru_text, en_text)
+                if new_ru == ru_text:
+                    break
+                ru_text = new_ru
 
             # --- Translation Memory по EN ---
             if en_text:
