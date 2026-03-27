@@ -23,6 +23,9 @@
 	"recent context",
     "lore snippet",
     "end of context",
-    "current line"
+    "current line",
+    "recent dialogue history",
+    "end of history",
+    "### history"
   ]
 }

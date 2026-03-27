@@ -35,22 +35,28 @@ _load_bad_phrases()
 
 # ============== Мини-история диалога (EN) для MT-модели ================
 _HISTORY_LOCK = threading.Lock()
-_HISTORY_MAX = 25  # Увеличиваем память до 25 фраз
+_HISTORY_MAX = 10  # Уменьшаем до 10 для стабильности (было 25)
 _HISTORY_EN: list[str] = []
 _HISTORY_LOG_PATH = os.path.join(os.path.dirname(__file__), "dialog_history.txt")
 _MEMORY_ENABLED = True
+_LAST_EN_TEXT = ""
+_LAST_RU_TEXT = ""
+
+# ============== РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ ================
+_RE_MYSTERY = re.compile(r"[?？]+")
+_RE_LEADING_DOTS = re.compile(r"^[.…\s]+")
+_RE_PAREN_STD = re.compile(r"\(.*?\)")
+_RE_PAREN_CJK = re.compile(r"（.*?）")
+_RE_NON_WORD = re.compile(r"[^\w\s]+", flags=re.UNICODE)
+_RE_NUMERIC_LIKE = re.compile(r"^(?:Room|Level|Floor|Timer|Stage|Chapter|Part)\s*[\d\s\:\-\.]+$|^[\d\s\:\-\.]+$", re.IGNORECASE)
+_RE_SPECIAL_TOKENS = re.compile(r"(?:<\|.*?\|>|&lt;\|.*?\|?&gt;|<s>|</s>|&lt;/s&gt;|<end_of_turn>|<start_of_turn>)", flags=re.IGNORECASE)
 
 # ============== LORE DB (персонажи/имена) ================
 _LORE_DB_LOCK = threading.Lock()
 _LORE_DB_INIT = False
 _CHAR_DB: dict[str, dict] = {}  # canon_en_name -> {en, ru, gender, raw}
 
-_RE_MYSTERY = re.compile(r"[?？]+")
-_RE_LEADING_DOTS = re.compile(r"^[.…\s]+")
-_RE_PAREN_STD = re.compile(r"\(.*?\)")
-_RE_PAREN_CJK = re.compile(r"（.*?）")
-_RE_NON_WORD = re.compile(r"[^\w\s]+", flags=re.UNICODE)
-_RE_SPECIAL_TOKENS = re.compile(r"(?:<\|.*?\|>|&lt;\|.*?\|?&gt;|<s>|</s>|&lt;/s&gt;|<end_of_turn>|<start_of_turn>)", flags=re.IGNORECASE)
+from difflib import SequenceMatcher
 
 def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
     """Сохраняем реплику вида 'Name: text >>> translation'."""
@@ -59,6 +65,12 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
     body = " ".join((body or "").split())
     if not body:
         return
+    
+    # Очистка от мусора для сравнения
+    clean_body = re.sub(r"[\s.…?！!]+", "", body).lower()
+    if not clean_body:
+        return # Не сохраняем в историю пустые вздохи/троеточия
+
     line = body
     if name:
         name = " ".join((name or "").split())
@@ -72,13 +84,25 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
             line += f"  >>>  {ru_clean}"
 
     with _HISTORY_LOCK:
-        # не дублируем подряд одинаковые строки
+        # 1. Проверка на идентичность последней строки
         if _HISTORY_EN and _HISTORY_EN[-1] == line:
             return
+        
+        # 2. Проверка на высокую схожесть (анти-спам при шуме OCR)
+        if _HISTORY_EN:
+            last_line = _HISTORY_EN[-1]
+            # Сравниваем только английскую часть (до >>>)
+            last_en = last_line.split("  >>>  ")[0]
+            curr_en = line.split("  >>>  ")[0]
+            if SequenceMatcher(None, last_en, curr_en).ratio() > 0.85:
+                # Если фразы почти одинаковые (разница в пару символов), обновляем последнюю
+                _HISTORY_EN[-1] = line
+                return
+
         _HISTORY_EN.append(line)
         if len(_HISTORY_EN) > _HISTORY_MAX:
-            # храним только последние N
             del _HISTORY_EN[0 : len(_HISTORY_EN) - _HISTORY_MAX]
+            
         try:
             with open(_HISTORY_LOG_PATH, "w", encoding="utf-8") as f:
                 for ln in _HISTORY_EN:
@@ -87,7 +111,7 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
             print("[CTX] history log write error:", e)
 
 
-def _build_dialog_context_block(max_chars: int = 5000) -> str:
+def _build_dialog_context_block(max_chars: int = 4000) -> str:
     """Формируем текстовый блок с последними репликами для промпта."""
     with _HISTORY_LOCK:
         if not _HISTORY_EN:
@@ -95,18 +119,19 @@ def _build_dialog_context_block(max_chars: int = 5000) -> str:
         collected: list[str] = []
         total = 0
         for ln in reversed(_HISTORY_EN):
-            extra = len(ln) + 4
+            extra = len(ln) + 2
             if collected and total + extra > max_chars:
                 break
             collected.append(ln)
             total += extra
         collected.reverse()
 
-    numbered = "\n".join(f"{i+1}) {ln}" for i, ln in enumerate(collected))
+    # Используем формат чата без нумерации, чтобы не провоцировать списки
+    history_text = "\n".join(collected)
     return (
-        "RECENT CONTEXT (Original >>> Translation):\n"
-        f"{numbered}\n"
-        "END OF CONTEXT.\n\n"
+        "### Recent Dialogue History:\n"
+        f"{history_text}\n"
+        "### End of History\n\n"
     )
 
 def set_memory_enabled(enabled: bool) -> None:
@@ -163,12 +188,13 @@ def _load_lore_db_from_text(lore_text: str) -> None:
 
         for line in lore_text.splitlines():
             t = line.strip()
-            if not t or t.startswith("#") or t.startswith("//"):
+            if not t or t.startswith("#") or t.startswith("//") or "===" in t:
                 continue
 
             # Формат: NameEN -> NameRU | пол: женский/мужской
+            # Поддерживаем разделители: ->, →, - (с пробелами)
             m = re.match(
-                r"^(?P<en>[^#=\-:|]+?)\s*->\s*(?P<ru>[^|#]+?)\s*(?:\|\s*пол\s*:\s*(?P<gender>[^|#]+))?\s*$",
+                r"^(?P<en>[^#=→:|]+?)\s*(?:->|→| - )\s*(?P<ru>[^|#]+?)\s*(?:\|\s*пол\s*:\s*(?P<gender>[^|#]+))?\s*$",
                 t,
                 re.IGNORECASE,
             )
@@ -299,9 +325,9 @@ def _build_lore_snippet_for_text(
         return "", speaker_gender
 
     snippet = (
-        "LORE SNIPPET (context only, do NOT translate):\n"
+        "<lore>\n"
         + "\n".join(snippet_lines)
-        + "\n"
+        + "\n</lore>\n"
     )
     return snippet, speaker_gender
 
@@ -311,7 +337,7 @@ class LLMConfig:
     server: str = "http://127.0.0.1:8080"
     model: str = ""
     timeout_s: float = 30.0
-    max_tokens: int = 4096
+    max_tokens: int = 1024
     temp: float = 0.0
     top_p: float = 1.0
     top_k: int = 0
@@ -319,6 +345,7 @@ class LLMConfig:
     seed: int = 0
     slot_id: int = 0
     source_lang: str = "en"  # en, ja, ko, ch_sim
+    mode: str = "game"       # "game" | "wiki"
     # system:
     system_override: str | None = None
     # контекстные файлы:
@@ -327,12 +354,18 @@ class LLMConfig:
     max_ctx_chars: int = 30000
     # prompt-cache:
     use_prompt_cache: bool = True
+    disable_name_split: bool = False
 
 # ======= OCR: минимальный system для считывания текста =====
 _OCR_SYSTEM_DEFAULT = (
-    "You are an OCR tool.\n"
-    "Return EXACTLY the visible text from the image. No translation. No comments.\n"
-    "Preserve original line breaks."
+    "You are a professional OCR tool. Your ONLY task is to transcribe visible text from the image.\n"
+    "- Return ONLY the exact text you see. NO summaries, NO explanations, NO continuations.\n"
+    "- If a character is silent (e.g., just '...'), output ONLY the name and '...'. DO NOT invent thoughts.\n"
+    "- CRITICAL: DO NOT guess, hallucinate, or 'complete' sentences that are not there.\n"
+    "- CRITICAL: If no readable text is found, output EXACTLY: <NO_TEXT_FOUND>\n"
+    "- IMPORTANT: Pay absolute attention to punctuation like ellipses (...) or multiple dots.\n"
+    "- Preserve layout: keep speaker names on a separate line or format as 'Name: Dialogue'.\n"
+    "- Do NOT add any text that is not physically present on the image."
 )
 
 # ======= Translator: system с LORE/PHRASEBOOK вшитыми ======
@@ -362,41 +395,31 @@ def _build_tr_system(lore_text: str, phrasebook_text: str, lang_code: str = "en"
     src_lang = lang_map.get(lang_code, "English")
     
     # 2. Подбираем стиль в зависимости от языка
-    if lang_code in ("ja", "ch_sim", "ko", "en"):
-        # === РЕЖИМ: Минимализм (Visual Novel Mode) ===
-        style_block = (
-            "STYLE & TONE\n"
-            "- Style: Literary, natural Russian translation.\n"
-            "- Brackets: Keep 「...」 and 『...』 distinctions if present.\n"
-            "- CRITICAL: Do NOT merge separate sentences.\n"
-            "- NOTE: Source text may omit subjects. Infer them from context.\n"
-        )
-    else:
-        # Резерв
-        style_block = (
-            "STYLE & STRUCTURE\n"
-            "- Style: Natural Russian.\n"
-        )
+    style_block = (
+        "STYLE & TONE\n"
+        "- Style: Literary, natural Russian translation.\n"
+        "- Do NOT invent or add any text not present in the User message.\n"
+        "- If the input text consists only of ellipses, sighs, or punctuation (e.g., '...', '!!!', '—'), return it UNCHANGED.\n"
+        "- CRITICAL: Do NOT complete the sentence using the provided history. Translate ONLY the current message.\n"
+    )
 
     # 3. Собираем итоговый промпт
     return (
         f"You are a professional literary translator from {src_lang} to Russian.\n"
         "Your goal is high-quality localization, preserving the original tone and atmosphere.\n\n"
-        "INPUT DATA\n"
-        "- LORE SNIPPET: authoritative dictionary for names/terms.\n"
-        "- CONTEXT: previous lines (do not translate).\n"
-        "- NAME: speaker name (do not translate).\n"
-        "- TEXT TO TRANSLATE: the content you must process.\n\n"
+        "INPUT STRUCTURE:\n"
+        "The system prompt includes 'Recent Dialogue History' for context ONLY. Do NOT repeat it.\n"
+        "System tags like <lore>, <speaker>, <instructions> provide specific rules.\n"
+        "User message contains the ONLY text you must translate.\n\n"
         "OUTPUT RULES\n"
-        "- Output ONLY Russian text (Cyrillic). No comments.\n"
-        f"- Translate ONLY the content under 'TEXT TO TRANSLATE' from {src_lang}.\n"
-        "- Do NOT output the NAME line or [F]/[M] tags.\n\n"
+        "- Output ONLY the Russian translation. No comments, no notes.\n"
+        f"- Translate ONLY the text provided in the User message from {src_lang}.\n"
+        "- Do NOT output XML tags or speaker names.\n"
+        "- If there is nothing in the text, display the word - (затуп)"
+        "- If you are unsure or the text is empty/silent, return the original punctuation.\n\n"
         f"{style_block}\n"
         "NAMES & LORE\n"
-        "- Use the LORE SNIPPET/PHRASEBOOK as absolute truth.\n"
-        "- Use [F]/[M] tags to determine grammatical gender (verb endings).\n\n"
-        "CONSISTENCY\n"
-        "- If the text repeats, return EXACTLY the same translation.\n"
+        "- Use <lore> and PHRASEBOOK as absolute truth.\n\n"
         "PHRASEBOOK (Exact matches only):\n"
         f"{phrasebook_text[:15000]}\n"
     )
@@ -404,16 +427,28 @@ def _build_tr_system(lore_text: str, phrasebook_text: str, lang_code: str = "en"
 _LORE_INIT = False
 _LORE_LOCK = threading.Lock()
 _TR_SYSTEM_CACHED = ""
+_TR_SYSTEM_KEY = "" # Ключ для проверки актуальности кэша
+
 def _ensure_tr_system(cfg: LLMConfig) -> str:
-    global _LORE_INIT, _TR_SYSTEM_CACHED
-    if _LORE_INIT and _TR_SYSTEM_CACHED:
+    global _LORE_INIT, _TR_SYSTEM_CACHED, _TR_SYSTEM_KEY
+    
+    # Формируем уникальный ключ для текущих настроек
+    current_key = f"{cfg.source_lang}|{cfg.lore_path}|{cfg.phrasebook_path}|{cfg.system_override}"
+    
+    if _LORE_INIT and _TR_SYSTEM_CACHED and _TR_SYSTEM_KEY == current_key:
         return _TR_SYSTEM_CACHED
+        
     with _LORE_LOCK:
+        # Если ключ изменился, нужно переинициализировать лор
+        if _TR_SYSTEM_KEY != current_key:
+            global _LORE_DB_INIT
+            _LORE_DB_INIT = False 
+            
         lore = _read_text(cfg.lore_path)[:cfg.max_ctx_chars] if cfg.lore_path else ""
         pb   = _read_text(cfg.phrasebook_path)[:cfg.max_ctx_chars] if cfg.phrasebook_path else ""
 
         if lore:
-            _load_lore_db_from_text(lore)  # ← грузим персонажей/пол в память
+            _load_lore_db_from_text(lore)
 
         if cfg.system_override:
             sys_txt = (cfg.system_override
@@ -421,9 +456,11 @@ def _ensure_tr_system(cfg: LLMConfig) -> str:
                        .replace("{{PHRASEBOOK}}", pb))
         else:
             sys_txt = _build_tr_system(lore, pb, cfg.source_lang)
+            
         _TR_SYSTEM_CACHED = sys_txt
+        _TR_SYSTEM_KEY = current_key
         _LORE_INIT = True
-        print(f"[DUAL] translator system ready: lore={len(lore)} chars, pb={len(pb)} chars")
+        print(f"[DUAL] translator system ready (cache updated): lore={len(lore)} chars, pb={len(pb)} chars")
         return sys_txt
 
 def reset_tr_system_cache():
@@ -431,6 +468,12 @@ def reset_tr_system_cache():
     with _LORE_LOCK:
         _LORE_INIT = False
         _TR_SYSTEM_CACHED = ""
+
+def reset_translation_cache():
+    """Сброс кэша последнего перевода (анти-эхо)."""
+    global _LAST_EN_TEXT, _LAST_RU_TEXT
+    _LAST_EN_TEXT = ""
+    _LAST_RU_TEXT = ""
 
 def _split_name_and_body_cjk(text: str) -> tuple[str | None, str]:
     """Спец-логика для CJK (Япония/Китай)."""
@@ -486,16 +529,62 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
     if not lines:
         return None, ""
 
+    # FIX: Защита цифр от фильтра имён (Баг "Комната 456")
+    if _RE_NUMERIC_LIKE.fullmatch(en_text.strip()):
+        return None, en_text # Вся строка - это не имя, а номер/таймер
+
     raw_first = lines[0].strip()
     first = re.sub(r"^[.…\s]+", "", raw_first)
     
+    # Проверяем, есть ли имя в базе (LORE), игнорируя точки
+    is_known_name = False
+    try:
+        cn = _canon_name(first)
+        with _LORE_DB_LOCK:
+            if cn in _CHAR_DB:
+                is_known_name = True
+            else:
+                # Умный фильтр мусора: если OCR приклеил анимацию/иконку спереди (например "I... Chiloveig")
+                for k_cn, v_info in _CHAR_DB.items():
+                    if cn.endswith(k_cn):
+                        diff_len = len(cn) - len(k_cn)
+                        # Разрешаем до 4 символов каноничного мусора (например "i " или "a ")
+                        if 0 < diff_len <= 4 and cn.endswith(" " + k_cn):
+                            is_known_name = True
+                            first = v_info["en"] # Подменяем грязное имя на чистое из базы
+                            break
+    except Exception: pass
+
     # Если строк несколько — проверяем первую как имя
+    # FIX: Защита цифр от фильтра имён (Баг "Комната 456")
+    if _RE_NUMERIC_LIKE.fullmatch(first):
+        return None, en_text # Первая строка - это не имя, а номер/таймер
+
     if len(lines) > 1:
         # Разрешаем ??? как имя, даже если там есть знак вопроса
         is_mystery = bool(re.fullmatch(r"[?？]+", first))
         
-        if is_mystery or (len(first) <= 32 and len(first.split()) <= 3 and not any(ch in first for ch in ".!?;:")):
-            return first, "\n".join(lines[1:]).lstrip("\n")
+        if is_known_name or is_mystery or (len(first) <= 32 and len(first.split()) <= 3 and not any(ch in first for ch in ".!?;:")):
+            found_name = first
+            body_lines = lines[1:]
+
+            # --- FIX: Проверка на второе имя (для сцен с двумя персонажами) ---
+            if body_lines:
+                raw_sec = body_lines[0].strip()
+                sec = re.sub(r"^[.…\s]+", "", raw_sec)
+                
+                is_sec_known = False
+                try:
+                    cn_sec = _canon_name(sec)
+                    with _LORE_DB_LOCK:
+                        if cn_sec in _CHAR_DB: is_sec_known = True
+                except: pass
+                
+                # Если вторая строка тоже похожа на имя (есть в базе ИЛИ короткая/без знаков/с большой буквы)
+                if is_sec_known or (len(sec) <= 25 and len(sec.split()) <= 3 and not re.search(r"[.,!?;:]", sec) and sec and sec[0].isupper() and len(sec) > 1):
+                    body_lines = body_lines[1:] # Пропускаем вторую строку (имя собеседника)
+
+            return found_name, "\n".join(body_lines).lstrip("\n")
     
     # --- ЧАСТЬ 2: Горизонтальная проверка (УМНАЯ) ---
     full_line = lines[0].strip()
@@ -520,11 +609,15 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
     canon_line = _canon_name(full_line)
     
     for cname in known_names:
-        if canon_line.startswith(cname):
+        idx = canon_line.find(cname)
+        # Разрешаем до 4 символов мусора перед именем (спасает горизонтальный формат)
+        if idx == 0 or (0 < idx <= 4 and canon_line[:idx].endswith(" ")):
             orig_name_en = _CHAR_DB[cname]["en"]
             
-            # Ищем имя в оригинальной строке (регистронезависимо)
-            match = re.match(re.escape(orig_name_en), full_line, re.IGNORECASE)
+            # Ищем имя в оригинальной строке (регистронезависимо), допуская мусор
+            esc_name = re.escape(orig_name_en)
+            pattern = r"^.{0,6}?" + esc_name if idx > 0 else r"^" + esc_name
+            match = re.search(pattern, full_line, re.IGNORECASE)
             
             if match:
                 end_pos = match.end()
@@ -551,7 +644,7 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
                     is_separator = True
                     
                 if is_separator:
-                    found_name = match.group(0)
+                    found_name = orig_name_en # Используем чистое имя вместо захваченного мусора
                     # Очищаем остаток от разделителей/пробелов в начале
                     rest_body = re.sub(r"^[:\-\–\s]+", "", remainder)
                     
@@ -559,6 +652,68 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
                         rest_body += "\n" + "\n".join(lines[1:])
                         
                     return found_name, rest_body
+
+    # Г. Эвристика для неизвестных имен в горизонтальном тексте.
+    # Логика переработана, чтобы избежать ложных срабатываний на обычных предложениях.
+    words = full_line.split()
+    if len(words) > 1:
+        first_word = words[0]
+        second_word = words[1]
+
+        # 1. Проверяем кандидата в имена (первое слово)
+        # Имя может заканчиваться на знаки препинания, которые нужно отсечь для проверки
+        name_candidate = first_word.rstrip(',.…!?:')
+
+        # Условие: Слово с большой буквы, без знаков препинания в середине.
+        # Разрешаем дефисы в именах (Mosin-Nagant).
+        PUNCTUATION_IN_NAME = ".!?;:"
+        if (
+            first_word[0].isupper() and
+            len(name_candidate) > 1 and
+            not any(c in name_candidate for c in PUNCTUATION_IN_NAME)
+        ):
+            # 2. Проверяем, не является ли это слово обычным началом предложения.
+            # Расширенный список для фильтрации.
+            common_starters = (
+                # pronouns
+                "i", "a", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them",
+                # possessive
+                "my", "your", "his", "her", "its", "our", "their",
+                # articles/determiners
+                "the", "an", "this", "that", "these", "those", "all", "any", "some", "every", "no", "such",
+                # conjunctions
+                "and", "but", "or", "so", "for", "nor", "yet",
+                # prepositions
+                "as", "at", "by", "in", "into", "of", "on", "to", "with", "from", "over", "under", "about", "after",
+                # question words
+                "what", "when", "where", "why", "how", "who", "which",
+                # common verbs / aux
+                "is", "are", "was", "were", "be", "been", "am", "has", "have", "had", "do", "does", "did",
+                "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+                "let", "let's", "said", "get", "go", "make", "know", "think", "see", "come", "take", "want",
+                # common adverbs/etc
+                "good", "well", "just", "only", "not", "then", "there", "here", "now", "very", "too", "also", "up",
+                # contractions
+                "i'm", "i've", "i'll", "i'd", "you're", "you've", "he's", "she's", "it's", "we're", "they're",
+                "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't", "can't", "won't", "wouldn't"
+            )
+            if name_candidate.lower() in common_starters:
+                pass # Это обычное слово, пропускаем эвристику
+            else:
+                # 3. Ключевая эвристика: смотрим на второе слово.
+                # Если оно тоже с заглавной, или это кавычка/скобка, то скорее всего первое - имя.
+                if second_word and (second_word[0].isupper() or second_word[0] in "\"'(“‘["):
+                     print(f"[_split_name_and_body DBG] Horizontal heuristic matched unknown name: '{first_word}'")
+                     body_part = " ".join(words[1:])
+                     if len(lines) > 1:
+                         body_part += "\n" + "\n".join(lines[1:])
+                     return first_word, body_part
+
+    # В. Эвристика для "Имя ... " (Тишина/Мысли)
+    # Любое имя (без пробелов и знаков) + 2 или более знаков препинания (включая пробелы между ними)
+    silence_match = re.match(r"^([^\s.…?？!！:]{1,25})\s*([\s.…?？!！]{2,})$", full_line)
+    if silence_match:
+        return silence_match.group(1), silence_match.group(2).strip()
 
     return None, "\n".join(lines)
 
@@ -575,6 +730,18 @@ def _strip_leading_gender_tag(s: str) -> str:
     s = re.sub(r'^(?:[.…\s]*)\[(?:m|f|м|ф)\]\s*', "", s, flags=re.IGNORECASE)
     return s
 
+def _normalize_homoglyphs(s: str) -> str:
+    """
+    Приводим кириллицу к похожей латинице для проверки 'ленивого' перевода.
+    Помогает отловить случаи, когда 'O-123' (Lat) превращается в 'О-123' (Cyr).
+    """
+    s = s.lower()
+    table = str.maketrans({
+        'а': 'a', 'в': 'b', 'е': 'e', 'к': 'k', 'м': 'm', 'н': 'h', 
+        'о': 'o', 'р': 'p', 'с': 'c', 'т': 't', 'у': 'y', 'х': 'x',
+        'ё': 'e'
+    })
+    return s.translate(table)
 
 # ===================== Прогрев cache_prompt ======================
 def preload_prompt_cache_ocr(cfg: LLMConfig) -> bool:
@@ -634,12 +801,15 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
     current_seed = int(cfg.seed)
     current_penalty = 1.2    # Базовый штраф за повторы
     
+    limit_tokens = int(cfg.max_tokens)
+
     for attempt in range(max_retries + 1):
         payload = {
             "model": cfg.model,
             "messages": [
                 {"role": "system", "content": system_txt},
                 {"role": "user", "content": [
+                    {"type": "text", "text": "Transcribe all text from this image. Output ONLY the text found, or <NO_TEXT_FOUND> if empty. Be extremely accurate, do not imagine anything."},
                     {"type": "image_url",
                      "image_url": {"url": f"data:image/png;base64,{region_png_b64}", "detail": "high"}}
                 ]},
@@ -648,10 +818,11 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
             "top_p": 1.0,
             "top_k": 40,
             "repeat_penalty": current_penalty,
-            "max_tokens": 256,  # Жесткий лимит, чтобы не ждать 1.5 секунды при сбое
+            "max_tokens": limit_tokens,
             "add_generation_prompt": True,
             "slot_id": cfg.slot_id,
             "seed": current_seed,
+            "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
         }
         
         t0 = time.perf_counter()
@@ -673,6 +844,31 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
 
         # Clean special tokens (like <|im_end|>, </s>, etc.)
         out = _RE_SPECIAL_TOKENS.sub("", out).strip()
+        
+        # === УМНЫЙ ФИЛЬТР ПУСТОТЫ / ГАЛЛЮЦИНАЦИЙ ===
+        # 1. Проверка на "Тишину" с галлюцинацией.
+        # Если модель выдает "Имя\n... [куча текста]", а в оригинале скорее всего только "..."
+        # Мы можем попробовать детектировать это по паттерну: "... " (многоточие с пробелом) в начале тела.
+        if "\n..." in out or out.startswith("..."):
+            parts = out.split("\n", 1)
+            body = parts[1] if len(parts) > 1 else parts[0]
+            if body.startswith("...") and len(body) > 15:
+                # Если после многоточия идет ОЧЕНЬ много текста БЕЗ знаков препинания и пробелов — это галлюцинация.
+                # Если же там нормальное предложение (есть пробелы, разные буквы) — доверяем OCR.
+                letters_only = re.findall(r'[a-zA-Zа-яА-Я\u4e00-\u9fff\u3040-\u30ff]', body)
+                words_count = len(body.split())
+                if len(letters_only) > 60 and words_count < 2:
+                    print(f"[DUAL][OCR] Potential hallucination after ellipsis detected (no spaces). Truncating. Original: {repr(out[:60])}")
+                    if len(parts) > 1: out = parts[0] + "\n..."
+                    else: out = "..."
+
+        # 2. Проверка на петлю повторений
+        if len(out) > 30 and (out.count("?") + out.count("？")) / len(out) > 0.4 or re.search(r"(.{2,})\1{5,}", out):
+            print(f"[DUAL][OCR] Repetition loop detected in OCR output: {out[:50]}... Returning empty.")
+            return ""
+        if "<NO_TEXT_FOUND>" in out.upper():
+            print(f"[DUAL][OCR] VLM explicitly reported no text. Clearing output.")
+            return ""
 
         # --- ПРОВЕРКА НА ПЕТЛЮ (Repetition Check) ---
         # Если строка длинная и состоит в основном из '?' или '？' или повторяющегося мусора
@@ -731,129 +927,170 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
     if not en_text or not en_text.strip():
         return ""
 
-    # Проверка на наличие букв (Latin + CJK + Hangul)
+    # --- ФИЛЬТР ПУНКТУАЦИИ (Если букв нет, возвращаем как есть) ---
     if not re.search(r'[a-zA-Z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', en_text):
-        print(f"[DUAL][TR] Ignored non-text input (no letters): {repr(en_text)}")
+        # Если в строке есть хоть какие-то знаки, возвращаем их вместо пустой строки
+        if en_text.strip():
+            return en_text.strip()
         return ""
     
-    system = _ensure_tr_system(cfg)
+    # === WIKI MODE: Простой перевод без контекста и лора ===
+    if getattr(cfg, "mode", "game") == "wiki":
+        system = "You are a professional translator. Translate the text to Russian. Output ONLY the translation."
+        user_content = (
+            f"Translate the following text to Russian:\n\n{en_text}\n\n"
+            "Output ONLY the Russian translation.\n"
+            "Do NOT add notes, explanations, or advice."
+        )
+        # Используем базовые настройки, но без сложной логики
+        # (код отправки запроса ниже общий, просто подменили system/user_content)
+        # Но нужно пропустить логику split_name_and_body
+        name_line = None
+        target_ru_name_for_cleaning = None
+    else:
+        # === GAME MODE: Стандартная логика ===
+        system = _ensure_tr_system(cfg)
+        # 1. Пробуем разделить Имя и Тело красиво
+        if not cfg.disable_name_split:
+            name_line, body = _split_name_and_body(en_text or "", cfg.source_lang)
+        else:
+            name_line, body = None, en_text
+        if not body:
+            body = en_text or ""
+
+        # --- FIX: Если тело состоит только из тишины/пунктуации — не переводим ---
+        if not re.sub(r"[\s.…?？!！]+", "", body) and body.strip():
+             return body
+
+        # 2. АВАРИЙНАЯ ПРОВЕРКА ПОЛА (Если разделение не сработало)
+        # Если имя не выделилось (name_line is None), проверяем, не начинается ли текст с имени персонажа
+        forced_gender = None
+        target_ru_name_for_cleaning = None
+
+        if not name_line:
+            # Ищем первое слово-кандидат
+            first_word_match = re.match(r"^([a-zA-Z0-9_\-]+)", body)
+            if first_word_match:
+                fw = first_word_match.group(1)
+                cn = _canon_name(fw)
+                with _LORE_DB_LOCK:
+                    # Проверяем в базе
+                    char_info = None
+                    if cn in _CHAR_DB:
+                        char_info = _CHAR_DB[cn]
+                    # Если не нашли, пробуем найти вхождение любой длинной фразы из базы в начале строки
+                    # (для имен с пробелами, типа "Mosin Nagant")
+                    else:
+                        for k_cn, v_info in _CHAR_DB.items():
+                            if _canon_name(body).startswith(k_cn):
+                                char_info = v_info
+                                break
+                    
+                    if char_info:
+                        forced_gender = char_info.get("gender")
+                        # target_ru_name_for_cleaning = char_info.get("ru") # ОТКЛЮЧАЕМ ЧИСТКУ ДЛЯ НАРРАТИВА
+                        # print(f"[DUAL] Gender inferred from merged text: {forced_gender}")
+
+        # Если имя выделилось штатно — берем данные оттуда
+        if name_line:
+            cn = _canon_name(name_line)
+            with _LORE_DB_LOCK:
+                if cn in _CHAR_DB:
+                    target_ru_name_for_cleaning = _CHAR_DB[cn]["ru"]
+
+        # 3. Собираем контекст и определяем собеседника
+        if _MEMORY_ENABLED:
+            ctx_block = _build_dialog_context_block(max_chars=min(2048, cfg.max_ctx_chars))
+        else:
+            ctx_block = ""
+
+        # --- ОПРЕДЕЛЕНИЕ СОБЕСЕДНИКА (Addressee) ---
+        addressee_gender = None
+        addressee_name = None
+        
+        if _MEMORY_ENABLED:
+            with _HISTORY_LOCK:
+                if _HISTORY_EN:
+                    last_line = _HISTORY_EN[-1]
+                    # Извлекаем имя из последней строки истории "Name: Body"
+                    h_match = re.match(r"^(.*?):\s", last_line)
+                    if h_match:
+                        last_speaker = h_match.group(1)
+                        # Если текущий спикер - это НЕ последний спикер, то скорее всего он говорит последнему
+                        if not name_line or _canon_name(name_line) != _canon_name(last_speaker):
+                            addressee_name = last_speaker
+                            a_info = _get_char_info_from_name(addressee_name)
+                            if a_info:
+                                addressee_gender = a_info.get("gender")
+
+        lore_snippet, gender_tag = _build_lore_snippet_for_text(name_line, body)
+        
+        # Если штатный тег пола пуст, но мы нашли его "аварийно" — используем аварийный
+        final_gender = gender_tag or forced_gender
+
+        # --- ИНСТРУКЦИЯ ДЛЯ ГРАММАТИЧЕСКОГО РОДА ---
+        special_instruction = ""
+        
+        # Если текст в скобках
+        if body.strip().startswith("(") and body.strip().endswith(")"):
+            special_instruction += "The text is a narration/action in parentheses. Translate it as description without adding a speaker name.\n"
+        
+        # ПРИНУДИТЕЛЬНОЕ УКАЗАНИЕ ПОЛА ГОВОРЯЩЕГО
+        if final_gender == "F":
+            special_instruction += "SPEAKER is FEMALE. Use feminine grammatical gender for 'I' (e.g., 'я поняла', 'я сама').\n"
+        elif final_gender == "M":
+            special_instruction += "SPEAKER is MALE. Use masculine grammatical gender for 'I' (e.g., 'я понял', 'я сам').\n"
+
+        # ПРИНУДИТЕЛЬНОЕ УКАЗАНИЕ ПОЛА СОБЕСЕДНИКА (Для обращений на 'Ты')
+        if addressee_gender == "F":
+            special_instruction += f"ADDRESSEE (the person being spoken to) is FEMALE. Use feminine grammatical gender for 'you/thou' (e.g., 'ты пришла', 'ты была').\n"
+        elif addressee_gender == "M":
+            special_instruction += f"ADDRESSEE (the person being spoken to) is MALE. Use masculine grammatical gender for 'you/thou' (e.g., 'ты пришел', 'ты был').\n"
+        elif addressee_name:
+             # Если пол не знаем, но знаем имя - просто намекаем
+             special_instruction += f"The speaker is talking to {addressee_name}. Ensure grammatical agreement.\n"
+
+        # Определяем название языка для промпта
+        lang_map = {
+            "en": "English",
+            "ja": "Japanese",
+            "ch_sim": "Chinese",
+            "ko": "Korean"
+        }
+        src_lang_name = lang_map.get(cfg.source_lang, "English")
+
+        dynamic_system_parts = []
+        if ctx_block:
+            dynamic_system_parts.append(ctx_block.strip())
+        if lore_snippet:
+            dynamic_system_parts.append(lore_snippet.strip())
+
+        if name_line:
+            tag = ""
+            if final_gender in ("F", "M"):
+                tag = f"[{final_gender}] "
+            name_for_prompt = f"{tag}{name_line}"
+            dynamic_system_parts.append(f"<speaker>\n{name_for_prompt}\n</speaker>")
+            
+        if special_instruction:
+            dynamic_system_parts.append(f"<instructions>\n{special_instruction.strip()}\n</instructions>")
+
+        dynamic_system_content = "\n\n".join(dynamic_system_parts).strip()
+
+        if dynamic_system_content:
+            system += "\n\n" + dynamic_system_content
+        
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": body}
+        ]
+
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
 
-    # 1. Пробуем разделить Имя и Тело красиво
-    name_line, body = _split_name_and_body(en_text or "", cfg.source_lang)
-    if not body:
-        body = en_text or ""
-
-    # 2. АВАРИЙНАЯ ПРОВЕРКА ПОЛА (Если разделение не сработало)
-    # Если имя не выделилось (name_line is None), проверяем, не начинается ли текст с имени персонажа
-    forced_gender = None
-    target_ru_name_for_cleaning = None
-
-    if not name_line:
-        # Ищем первое слово-кандидат
-        first_word_match = re.match(r"^([a-zA-Z0-9_\-]+)", body)
-        if first_word_match:
-            fw = first_word_match.group(1)
-            cn = _canon_name(fw)
-            with _LORE_DB_LOCK:
-                # Проверяем в базе
-                char_info = None
-                if cn in _CHAR_DB:
-                    char_info = _CHAR_DB[cn]
-                # Если не нашли, пробуем найти вхождение любой длинной фразы из базы в начале строки
-                # (для имен с пробелами, типа "Mosin Nagant")
-                else:
-                    for k_cn, v_info in _CHAR_DB.items():
-                        if _canon_name(body).startswith(k_cn):
-                            char_info = v_info
-                            break
-                
-                if char_info:
-                    forced_gender = char_info.get("gender")
-                    # target_ru_name_for_cleaning = char_info.get("ru") # ОТКЛЮЧАЕМ ЧИСТКУ ДЛЯ НАРРАТИВА
-                    # print(f"[DUAL] Gender inferred from merged text: {forced_gender}")
-
-    # Если имя выделилось штатно — берем данные оттуда
-    if name_line:
-        cn = _canon_name(name_line)
-        with _LORE_DB_LOCK:
-            if cn in _CHAR_DB:
-                target_ru_name_for_cleaning = _CHAR_DB[cn]["ru"]
-
-    # 3. Собираем контекст
-    if _MEMORY_ENABLED:
-        ctx_block = _build_dialog_context_block(max_chars=min(2048, cfg.max_ctx_chars))
-    else:
-        ctx_block = ""
-
-    lore_snippet, gender_tag = _build_lore_snippet_for_text(name_line, body)
-    
-    # Если штатный тег пола пуст, но мы нашли его "аварийно" — используем аварийный
-    final_gender = gender_tag or forced_gender
-
-    gender_hint = (
-        "[F] before a name = female speaker.\n"
-        "[M] before a name = male speaker.\n"
-    )
-
-    # --- ИНСТРУКЦИЯ ДЛЯ ГРАММАТИЧЕСКОГО РОДА ---
-    special_instruction = ""
-    
-    # Если текст в скобках
-    if body.strip().startswith("(") and body.strip().endswith(")"):
-        special_instruction += "\nIMPORTANT: The text is a narration/action in parentheses. Translate it as description. DO NOT add a speaker name!\n"
-    
-    # ПРИНУДИТЕЛЬНОЕ УКАЗАНИЕ ПОЛА (Самое важное!)
-    if final_gender == "F":
-        special_instruction += "\nIMPORTANT: SPEAKER IS FEMALE. Use feminine grammatical gender (я сделала, я должна).\n"
-    elif final_gender == "M":
-        special_instruction += "\nIMPORTANT: SPEAKER IS MALE. Use masculine grammatical gender (я сделал, я должен).\n"
-
-    # Определяем название языка для промпта
-    lang_map = {
-        "en": "English",
-        "ja": "Japanese",
-        "ch_sim": "Chinese",
-        "ko": "Korean"
-    }
-    src_lang_name = lang_map.get(cfg.source_lang, "English")
-
-    # Формируем промпт
-    if name_line:
-        tag = ""
-        if final_gender in ("F", "M"):
-            tag = f"[{final_gender}] "
-        name_for_prompt = f"{tag}{name_line}"
-
-        user_content = (
-            "You are given recent dialogue CONTEXT, a small LORE SNIPPET and one CURRENT line "
-            f"to translate from {src_lang_name} to Russian.\n"
-            "LORE SNIPPET is for understanding names and gender only — do NOT translate it.\n"
-            "Use [F]/[M] tags on the NAME line to choose correct Russian gender endings.\n"
-            f"{special_instruction}\n"
-            + gender_hint
-            + (lore_snippet or "")
-            + (ctx_block or "")
-            + "CURRENT LINE:\n"
-              "NAME (context only, do NOT translate or output this line):\n"
-            f"{name_for_prompt}\n\n"
-            "TEXT TO TRANSLATE (output Russian only, keep the same line breaks as in this section):\n"
-            f"{body}"
-        )
-    else:
-        # Случай, когда имя внутри текста (как у тебя сейчас)
-        user_content = (
-            "You are given recent dialogue CONTEXT and a small LORE SNIPPET (if present) "
-            f"and one {src_lang_name} text to translate into Russian.\n"
-            "LORE SNIPPET is for understanding only — do NOT translate it.\n"
-            f"{special_instruction}\n" # <--- Сюда попадет "SPEAKER IS FEMALE"
-            + (lore_snippet or "")
-            + (ctx_block or "")
-            + "TEXT TO TRANSLATE (output Russian only, keep the same line breaks as in this section):\n"
-            f"{body}"
-        )
-
-    max_out = max(64, min(512, int(len(en_text) * 2.2) + 64))
+    # Dynamic max_tokens to prevent runaway hallucinations if the model's template is broken
+    # For translation, we rarely need more than 4-5x the source length in tokens.
+    estimated_max = max(150, len(body) * 5)
+    max_out = min(int(cfg.max_tokens), estimated_max)
 
     # === ЦИКЛ ПОПЫТОК (RETRY LOOP) ===
     current_temp = cfg.temp
@@ -863,19 +1100,20 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
     for attempt in range(max_retries + 1):
         payload = {
             "model": cfg.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
+            "messages": messages,
             "temperature": current_temp,
             "top_p": cfg.top_p,
             "top_k": int(cfg.top_k),
             "repeat_penalty": float(cfg.repeat_penalty),
-            "max_tokens": min(cfg.max_tokens, max_out),
+            "max_tokens": max_out,
             "add_generation_prompt": True,
             "slot_id": cfg.slot_id,
             "seed": current_seed,
             "cache_prompt": cfg.use_prompt_cache,
+            "stop": [
+                "<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]",
+                "\n<instructions", "\n<context", "\n<lore", "\n<speaker"
+            ],
         }
         
         t0 = time.perf_counter()
@@ -894,11 +1132,14 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         out = (js.get("choices", [{}])[0]
                   .get("message", {})
                   .get("content") or "").strip()
+                  
+        print(f"[DUAL][TR-RAW] Attempt {attempt} output: {repr(out)}")
 
         # Clean special tokens (like <|im_end|>, </s>, etc.)
         out = _RE_SPECIAL_TOKENS.sub("", out).strip()
 
         out = _strip_leading_gender_tag(out)
+        # print(f"[DUAL][TR-CLEANED] After gender tag strip: {repr(out)}")
         
         # Intro cleaner
         intro_match = re.match(r"^.*?(?:перевод|перевести|translation|translate).*?:\s*(.*)", out, re.IGNORECASE | re.DOTALL)
@@ -906,6 +1147,9 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             clean_part = intro_match.group(1).strip()
             if clean_part:
                 out = clean_part
+                
+        # Clean possible XML tags if the model hallucinates them
+        out = re.sub(r"</?(?:text|translation|ru|output)>", "", out, flags=re.IGNORECASE).strip()
 
         # Wrapper cleaner
         def _strip_wrapper(text_ru: str, text_en: str) -> str:
@@ -922,7 +1166,20 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             if new_out == out: break
             out = new_out
         
+        # --- Проверка на "(затуп)" ---
+        # Если модель вернула сигнал о том, что не может перевести, пробуем еще раз с другими параметрами
+        if "(затуп)" in out:
+            print(f"[DUAL][TR] '(затуп)' detected on attempt {attempt+1}, retrying...")
+            if attempt < max_retries:
+                current_temp = min(1.0, current_temp + 0.25) # Повышаем "креативность"
+                current_seed += 222 # Меняем зерно
+                continue # Переходим к следующей попытке
+            else:
+                print("[DUAL][TR] All retries for '(затуп)' failed. Returning empty.")
+                return "" # Все попытки провалены
+
         # --- Name Echo Cleaner (УЛУЧШЕННЫЙ) ---
+        # 1. Сначала чистим Русское имя (если оно есть в базе лора)
         if target_ru_name_for_cleaning:
             esc_name = re.escape(target_ru_name_for_cleaning)
             # Режем "Доберман," "Доберман:" "Доберман - " и даже "Доберман " (просто пробел)
@@ -932,21 +1189,39 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
                 print(f"[DUAL][TR] Name echo detected ('{match_echo.group(0).strip()}'). Stripping.")
                 out = out[match_echo.end():].strip()
         
+        # 2. Затем чистим Английское имя (на случай, если модель не перевела его или его нет в базе)
+        if name_line:
+            esc_en_name = re.escape(name_line)
+            pattern_en = r"^[\s\W]*" + esc_en_name + r"[\s:,\.\-\n]+"
+            match_echo_en = re.match(pattern_en, out, re.IGNORECASE)
+            if match_echo_en:
+                print(f"[DUAL][TR] English Name echo detected ('{match_echo_en.group(0).strip()}'). Stripping.")
+                out = out[match_echo_en.end():].strip()
+        
+        # print(f"[DUAL][TR-CLEANED] After name echo strip: {repr(out)}")
         # Дополнительная чистка для "???", если модель повторила их в начале перевода
         if name_line and re.fullmatch(r"[?？]+", name_line.strip()):
             match_mystery = re.match(r"^[\s]*[?？]+[\s:,\.\-\n]+", out)
             if match_mystery:
                 out = out[match_mystery.end():].strip()
+        
+        # 3. Защита от утечки истории (если модель начала повторять формат "EN >>> RU")
+        if "  >>>  " in out:
+            print(f"[DUAL][TR] History format leak detected (>>>). Taking only the last part.")
+            parts = out.split("  >>>  ")
+            # Берем последнюю часть, которая скорее всего и есть нужный перевод
+            out = parts[-1].strip()
 
         lower = out.lower()
+        # print(f"[DUAL][TR-CLEANED] After mystery strip: {repr(out)}")
         # 1. Фильтр галлюцинаций JSON
         prompt_echo_snippets = _BAD_PHRASES.get("translation", [])
         if any(s in lower for s in prompt_echo_snippets):
             print(f"[DUAL][TR] prompt echo detected (json), ignoring")
             return ""
 
-        if out.strip().lower() == en_text.strip().lower():
-             print(f"[DUAL][TR] Output equals Input (lazy echo), retrying...")
+        if _normalize_homoglyphs(out.strip()) == _normalize_homoglyphs(en_text.strip()):
+             print(f"[DUAL][TR] Output equals Input (homoglyph echo), retrying...")
              if attempt < max_retries:
                  current_temp = min(1.0, current_temp + 0.2) # Делаем модель "креативнее"
                  current_seed += 333
@@ -955,20 +1230,24 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
                  return "" # Лучше ничего не показать, чем английский поверх английского
 
         # Б. Нет кириллицы (English only)
+        # FIX: Улучшенный анти-эхо фильтр: если есть буквы, но нет кириллицы, или смешанный язык.
         # Если в тексте есть буквы, но нет НИ ОДНОЙ русской буквы
         has_letters = re.search(r'[a-zA-Zа-яА-Я]', out)
         has_cyrillic = re.search(r'[а-яА-ЯёЁ]', out)
         
-        if has_letters and not has_cyrillic:
-             print(f"[DUAL][TR] No Cyrillic chars found (lazy english), retrying...")
-             if attempt < max_retries:
-                 current_temp = min(0.9, current_temp + 0.15)
-                 current_seed += 444
-                 continue
-             else:
-                 return ""
+        # Проверка на "чистый английский" (модель не перевела)
+        if has_letters and not has_cyrillic and not re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', out): # И не CJK
+            print(f"[DUAL][TR] No Cyrillic chars found (lazy english). Cleaned output was: {repr(out)} -> retrying...")
+            if attempt < max_retries:
+                current_temp = min(0.9, current_temp + 0.15)
+                current_seed += 444
+                continue
+            else:
+                return ""
         
-        has_cjk = re.search(r'[\u4e00-\u9fff]', out)
+        # Проверка на CJK (модель перевела не на тот язык)
+        has_cjk = re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', out)
+        
         if has_cjk and not has_cyrillic:
              print(f"[DUAL][TR] CJK chars detected in output (wrong language), retrying...")
              if attempt < max_retries:
@@ -977,6 +1256,7 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
                  continue
              else:
                  return ""
+        # print(f"[DUAL][TR-CLEANED] After language check: {repr(out)}")
         
         if re.match(r"^\d+\)", out.strip()):
              print(f"[DUAL][TR] Context leak detected (starts with 'N)'), retrying...")
@@ -987,14 +1267,16 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
              else:
                  return ""
         
-        # 1.5. Фильтр "Полу-перевода"
+        # FIX: Улучшенный анти-эхо фильтр: Фильтр "Полу-перевода"
+        # Если есть кириллица, но также есть 3+ английских слова подряд (признак смешанного языка)
         if re.search(r'[а-яА-Я]', out) and re.search(r'[a-zA-Z]{2,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}', out):
              if attempt < max_retries:
                  current_temp = min(0.7, current_temp + 0.1)
                  current_seed += 999
                  continue
         
-        # 1.6. Фильтр "Самозванца" (резервный)
+        # FIX: Улучшенный анти-эхо фильтр: Фильтр "Самозванца" (резервный)
+        # Если модель сама добавила "Имя: " в начало, хотя его не было в EN
         rp_match = re.match(r"^[\*\_]*([а-яА-ЯёЁa-zA-Z0-9_\- ]{2,20})[\*\_]*:\s+(.*)", out)
         if rp_match:
             found_label_ru = rp_match.group(1)
@@ -1012,6 +1294,18 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
                     else:
                         out = clean_text
 
+        global _LAST_EN_TEXT, _LAST_RU_TEXT
+
+        # === ЖЕСТКИЙ АНТИ-ЭХО ФИЛЬТР ===
+        if out and out == _LAST_RU_TEXT and en_text.strip().lower() != _LAST_EN_TEXT:
+            print(f"[DUAL][TR-WARN] LLM Echo detected! English changed but RU is identical: '{out}'")
+            if attempt < max_retries:
+                current_temp = min(0.8, current_temp + 0.15)
+                current_seed += 999
+                continue
+            else:
+                out = "" # Сбрасываем перевод, чтобы не плодить галлюцинации на экране
+
         # 2. Защита от вывода истории
         is_leak = False
         if len(en_text) > 5 and len(out) > 100 and len(out) > len(en_text) * 4.0:
@@ -1019,6 +1313,9 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             
         if not is_leak:
             print(f"[DUAL][TR] {len(out)} chars in {dt:.0f} ms, text = {repr(out[:200])}")
+            # Сохраняем успешный перевод в память для проверки следующей фразы
+            _LAST_EN_TEXT = en_text.strip().lower()
+            _LAST_RU_TEXT = out
             return out
         
         if attempt < max_retries:

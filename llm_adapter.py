@@ -5,7 +5,7 @@ import os, time, json, base64, threading, re
 from dataclasses import dataclass
 import requests
 
-DEFAULT_MODEL = "Qwen3-VL-8B-Instruct"
+DEFAULT_MODEL = "Qwen3-VL-2B-Instruct"
 _SESSION = requests.Session()
 
 def _strip_wrapper(text_ru: str, text_en: str) -> str:
@@ -30,7 +30,7 @@ class LLMConfig:
     # поведение запроса
     temp: float = 0.2
     top_p: float = 0.9
-    max_tokens: int = 15000
+    max_tokens: int = 1024
     timeout_s: float = 30.0
     budget_ms: int = 4000
     top_k: int = 0
@@ -38,6 +38,7 @@ class LLMConfig:
     seed: int = 0
     slot_id: int = 0
     source_lang: str = "en"
+    mode: str = "game"  # "game" | "wiki"
 
     # лор
     lore_path: str = "assets/game_bible_exilium.txt"
@@ -245,6 +246,11 @@ def vision_translate_from_images(region_png_b64: str,
     
     init_lore_once(cfg)
     system = _SYSTEM_PROMPT
+
+    # В режиме Wiki ставим простой системный промпт, чтобы инструкции "для игр" не сбивали модель
+    if getattr(cfg, "mode", "game") == "wiki":
+        system = "You are a professional translator. Translate the text from the image to Russian."
+
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
 
     lang_map = {
@@ -256,16 +262,24 @@ def vision_translate_from_images(region_png_b64: str,
     src_lang_name = lang_map.get(getattr(cfg, "source_lang", "en"), "English")
 
     def _content_variant(kind: str):
-        base_text = (
-            "This image is a cropped in-game dialogue or UI box.\n"
-            f"1) Read ALL clearly visible {src_lang_name} text EXACTLY as it appears "
-            "(preserve line breaks).\n"
-            "2) Translate it into natural Russian, using the system instructions and LORE.\n"
-            "3) Respond with a SINGLE JSON object ONLY, in one line:\n"
-            f'   {{\"en\": \"<original {src_lang_name} text>\", \"ru\": \"<Russian translation>\"}}\n'
-            "- Use \\n inside strings for line breaks.\n"
-            "- Do NOT add comments, extra fields, or any text before/after the JSON."
-        )
+        if getattr(cfg, "mode", "game") == "wiki":
+            base_text = (
+                f"Analyze the image containing a large block of text (document/wiki) in {src_lang_name}.\n"
+                "1) Read the text completely.\n"
+                "2) Translate it into Russian.\n"
+                "Output ONLY the Russian translation. Do NOT use JSON. Do NOT add explanations."
+            )
+        else:
+            base_text = (
+                "This image is a cropped in-game dialogue or UI box.\n"
+                f"1) Read ALL clearly visible {src_lang_name} text EXACTLY as it appears "
+                "(preserve line breaks).\n"
+                "2) Translate it into natural Russian, using the system instructions and LORE.\n"
+                "3) Respond with a SINGLE JSON object ONLY, in one line:\n"
+                f'   {{\"en\": \"<original {src_lang_name} text>\", \"ru\": \"<Russian translation>\"}}\n'
+                "- Use \\n inside strings for line breaks.\n"
+                "- Do NOT add comments, extra fields, or any text before/after the JSON."
+            )
 
         # НОВОЕ: одна последняя EN-реплика как контекст
         if prev_en:
@@ -304,6 +318,7 @@ def vision_translate_from_images(region_png_b64: str,
             "max_tokens": min(15000, cfg.max_tokens),
             "add_generation_prompt": True,
             "slot_id": cfg.slot_id,
+            "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
         }
         t0 = time.perf_counter()
         try:
@@ -329,28 +344,35 @@ def vision_translate_from_images(region_png_b64: str,
                 out = intro_match.group(1).strip()
             # ========================================================
 
-            # (Дальше идет твой старый код очистки ```json)
-            txt = out.strip()
-            if txt.startswith("```"):
-                first_nl = txt.find("\n")
-                if first_nl != -1:
-                    txt = txt[first_nl + 1:]
-                if txt.endswith("```"):
-                    txt = txt[:-3]
-                txt = txt.strip()
-
             en_text: str = ""
             ru_text: str = ""
 
-            try:
-                obj = json.loads(txt)
-                if isinstance(obj, dict):
-                    en_text = str(obj.get("en", "") or "").strip()
-                    ru_text = str(obj.get("ru", "") or "").strip()
-                else:
-                    ru_text = str(obj).strip()
-            except Exception:
-                ru_text = out.strip()
+            # === РАЗДЕЛЕНИЕ ЛОГИКИ ПАРСИНГА ===
+            if getattr(cfg, "mode", "game") == "wiki":
+                # Для WIKI режима мы не ждем JSON, просто берем весь текст как перевод
+                # Очищаем от возможных маркдаун-блоков, если модель их добавила
+                clean_out = out.strip()
+                if clean_out.startswith("```"):
+                    clean_out = re.sub(r"^```(?:json|text)?\s*", "", clean_out)
+                    clean_out = re.sub(r"\s*```$", "", clean_out)
+                ru_text = clean_out.strip()
+                en_text = "" # В этом режиме мы не извлекаем оригинал отдельно
+            else:
+                # Для GAME режима парсим JSON
+                txt = out.strip()
+                if txt.startswith("```"):
+                    txt = re.sub(r"^```(?:json)?\s*", "", txt)
+                    txt = re.sub(r"\s*```$", "", txt)
+                
+                try:
+                    obj = json.loads(txt)
+                    if isinstance(obj, dict):
+                        en_text = str(obj.get("en", "") or "").strip()
+                        ru_text = str(obj.get("ru", "") or "").strip()
+                    else:
+                        ru_text = str(obj).strip()
+                except Exception:
+                    ru_text = out.strip()
 
             # === ВСТАВКА 2: Очистка кавычек/Markdown в русском тексте ===
             # Применяем ту же логику, что и в DUAL: если в EN кавычек нет, а в RU есть — убираем.

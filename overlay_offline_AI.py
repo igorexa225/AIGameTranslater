@@ -1,7 +1,3 @@
-# overlay_offline_AI.py — Конфиг + оверлей (две картинки → перевод через llama.cpp)
-# Требует: PySide6, pywin32, numpy, opencv-python, requests
-# Запуск: python overlay_offline_AI.py
-
 import sys, os, time, re, subprocess, base64, difflib, ctypes, json, requests
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -21,6 +17,9 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QDialog,
 import win32con, win32gui, win32ui, win32api, win32process
 import ctypes.wintypes as wt
 import online_adapter
+import fullscreen_overlay
+
+_RE_MYSTERY = re.compile(r"[?？]+")
 
 #========================== Вызов EasyOCR ==============================
 
@@ -32,7 +31,7 @@ except Exception:
     _EASYOCR_AVAILABLE = False
 
 _easyocr_reader = None
-_current_ocr_lang = None  # <--- Запоминаем текущий язык
+_current_ocr_lang = None
 
 def get_easyocr_reader(lang_code="en"):
     """Ленивое создание EasyOCR-ридера с поддержкой переключения языков."""
@@ -53,9 +52,15 @@ def get_easyocr_reader(lang_code="en"):
     if lang_code != "en":
         langs.append("en") 
 
+    # Указываем локальную папку для моделей, чтобы EasyOCR не лез в папку пользователя
+    # и чтобы можно было поставлять модели вместе с exe.
+    model_storage = BASE_DIR / "models" / "easyocr"
+    try: model_storage.mkdir(parents=True, exist_ok=True)
+    except Exception: pass
+
     try:
         # gpu=False (на CPU), чтобы не отжирать память у нейросетей
-        _easyocr_reader = easyocr.Reader(langs, gpu=False)
+        _easyocr_reader = easyocr.Reader(langs, gpu=False, model_storage_directory=str(model_storage))
         _current_ocr_lang = lang_code
         print(f"[OCR-BOXES] EasyOCR initialized for {langs}")
     except Exception as e:
@@ -187,8 +192,8 @@ except Exception:
 llm_cfg = LLMConfig(
     enabled=True,
     server="http://127.0.0.1:8080",
-    model="Qwen3-VL-8B-Instruct",
-    temp=0.2, top_p=0.9, max_tokens=15000, timeout_s=30.0, budget_ms=4000,
+    model="Qwen3-VL-2B-Instruct",
+    temp=0.2, top_p=0.9, max_tokens=1024, timeout_s=30.0, budget_ms=4000,
     slot_id=0, use_prompt_cache=True,
     lore_path=str(BASE_DIR / "assets" / "game_bible_exilium.txt"), max_ctx_chars=30000,
 )
@@ -250,6 +255,36 @@ def canon_en(s: str) -> str:
         
     return s
 
+# Regex для определения строк, которые выглядят как номера комнат, таймеры и т.п.
+# Используется для защиты от ошибочного принятия за имена.
+_RE_NUMERIC_LIKE = re.compile(r"^(?:Room|Level|Floor|Timer|Stage|Chapter|Part)\s*[\d\s\:\-\.]+$|^[\d\s\:\-\.]+$", re.IGNORECASE)
+
+
+def safe_split_name_and_body(en_full: str, lang: str = "en") -> tuple[str|None, str]:
+    """Безопасная обертка для разделения имени и диалога, защищающая от потери текста."""
+    if not en_full: return None, ""
+    splitter = globals().get("_split_name_and_body")
+    if not splitter: return None, en_full
+    try:
+        try:
+            nm, bd = splitter(en_full, lang)
+        except TypeError:
+            nm, bd = splitter(en_full) # fallback если аргумент 1
+            
+        en_chars = len(re.sub(r"[^\w]", "", en_full))
+        bd_chars = len(re.sub(r"[^\w]", "", bd)) if bd else 0
+        nm_chars = len(re.sub(r"[^\w]", "", nm)) if nm else 0
+        
+        # Если сплиттер выкинул значимую часть текста (потеряно больше 4 букв)
+        if en_chars > (nm_chars + bd_chars + 4):
+            print(f"[SPLITTER-FIX] Rejected bad split. Full='{en_full}', Nm='{nm}', Bd='{bd}'")
+            return None, en_full
+            
+        return nm, bd
+    except Exception as e:
+        return None, en_full
+
+
 def detect_text_boxes(frame_bgr: np.ndarray, lang_code: str = "en") -> list[tuple[int, int, int, int, str]]:
     """
     Детектор прямоугольников с текстом на EasyOCR.
@@ -275,9 +310,10 @@ def detect_text_boxes(frame_bgr: np.ndarray, lang_code: str = "en") -> list[tupl
 
         # --- НОВОЕ: уменьшаем картинку перед EasyOCR ---
         # Масштаб 0.7–0.8 обычно сильно снижает нагрузку без потери качества для субтитров.
-        SCALE = 0.7
+        SCALE = 1.0
 
-        if SCALE < 1.0:
+        # Не сжимаем, если картинка и так маленькая (чтобы не убить мелкий текст в манге)
+        if SCALE < 1.0 and (w > 600 or h > 600):
             small_w = max(1, int(w * SCALE))
             small_h = max(1, int(h * SCALE))
             # INTER_LINEAR быстрее и достаточен для детекции боксов
@@ -324,7 +360,7 @@ def detect_text_boxes(frame_bgr: np.ndarray, lang_code: str = "en") -> list[tupl
                 continue
 
             aspect = bw / float(bh) if bh > 0 else 999.0
-            if aspect < 1.2 and bw < w * 0.4:
+            if aspect < 0.5 and bw < w * 0.4:
                 continue
 
             boxes.append((int(x0), int(y0), int(bw), int(bh), text))
@@ -339,208 +375,148 @@ def _filter_boxes_by_llm_text(
     boxes_with_text: list[tuple[int, int, int, int, str]],
     en_full: str,
 ) -> list[tuple[int, int, int, int]]:
-    """
-    Пытаемся выбрать только те боксы, которые соответствуют основному диалогу
-    из LLM-OCR (en_full), и выкинуть имя / мусор.
-
-    boxes_with_text: [(x, y, w, h, text), ...]
-    возвращаем:      [(x, y, w, h), ...]
-    """
-    # ЖЁСТКАЯ ЗАЩИТА: вообще ничего нет → ничего не делаем
     if not boxes_with_text:
         return []
 
-    # Нормализуем входные боксы — отбрасываем кривые кортежи
-    safe_boxes: list[tuple[int, int, int, int, str]] = []
-    try:
-        for b in boxes_with_text:
-            if not b:
-                continue
-            # Иногда EasyOCR/что-то ещё может вернуть список не той длины
-            if len(b) < 5:
-                try:
-                    print("[OCR-BOXES] bad box tuple (len<5):", b)
-                except Exception:
-                    pass
-                continue
-            x, y, w, h, txt = b[0], b[1], b[2], b[3], b[4]
-            safe_boxes.append((int(x), int(y), int(w), int(h), txt))
-    except Exception as e:
-        print("[OCR-BOXES] _filter_boxes_by_llm_text pre-normalize error:", e)
-        # если даже тут что-то пошло не так — лучше вообще не использовать боксы
-        return []
+    # --- Внутренняя функция нормализации (мягкая, оставляет артикли) ---
+    def _norm(s):
+        if not s: return ""
+        s = str(s).lower()
+        # FIX: Заменяем апострофы и кавычки на пробел перед удалением спецсимволов
+        s = re.sub(r"['\"`’‘“”«»]", " ", s)
+        # Оставляем буквы, цифры, пробелы. Убираем мусор.
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-    boxes_with_text = safe_boxes
-    if not boxes_with_text:
-        return []
+    # 1. Разделяем LLM-текст на Имя и Тело
+    name_line, body = safe_split_name_and_body(en_full)
 
-    en_full = en_full or ""
+    if not body or not body.strip():
+        body = en_full
+        name_line = None
 
-    try:
-        # 1) Разделяем полный текст на NAME + BODY той же логикой, что и в переводчике
-        try:
-            name_line, body = _split_name_and_body(en_full)
-        except Exception:
-            name_line, body = None, en_full
+    # [DEBUG] Логируем, что мы вообще ищем
+    print(f"[BOX-DBG] LLM Split -> Name: {repr(name_line)}, Body len: {len(body) if body else 0}")
 
-        name_c = canon_en(name_line) if name_line else ""
-        body_c = canon_en(body) if body else canon_en(en_full)
+    name_c = _norm(name_line)
+    body_c = _norm(body) if body else _norm(en_full)
 
-        if not body_c:
-            # если тело пустое — лучше вернуть все боксы как есть
-            return [
-                (int(x), int(y), int(w), int(h))
-                for (x, y, w, h, _t) in boxes_with_text
-            ]
+    # 2. Сортируем боксы и разбиваем на строки (Rows)
+    boxes_with_text.sort(key=lambda b: b[1]) # Сортировка по Y
 
-        first_body_word = body_c.split()[0] if body_c.split() else ""
-
-        good: list[tuple[int, int, int, int]] = []
-
-        # --- базовая фильтрация по тексту (как было раньше) ---
-        for (x, y, w, h, txt) in boxes_with_text:
-            t = (txt or "").strip()
-            if not t:
-                continue
-
-            t_c = canon_en(t)
-
-            # 2) Если этот бокс очень похож на строку NAME — выкидываем его
-            if name_c:
-                r_name = SequenceMatcher(None, t_c, name_c).ratio()
-                if r_name >= 0.8:
-                    # почти точно nameplate
-                    continue
-
-            # 3) Короткие подписи (1–3 слова, без точки и т.п.) — потенциальный мусор,
-            #    но если они явно совпадают с началом BODY, считаем диалогом
-            is_short_label = (
-                len(t_c) > 0
-                and len(t_c.split()) <= 3
-                and not any(ch in t_c for ch in ".!?:")
-            )
-
-            prefix_match = False
-            if first_body_word:
-                if t_c.startswith(first_body_word):
-                    prefix_match = True
-                else:
-                    parts = t_c.split()
-                    if parts and parts[0] == first_body_word:
-                        prefix_match = True
-
-            # 4) Похож ли текст бокса на начало основного текста?
-            body_prefix = body_c[: len(t_c) + 16]
-            ratio = SequenceMatcher(None, t_c, body_prefix).ratio()
-
-            if prefix_match or ratio >= 0.6:
-                # это кусок основного диалога
-                good.append((int(x), int(y), int(w), int(h)))
+    rows = []
+    if boxes_with_text:
+        curr_row = [boxes_with_text[0]]
+        last_y = boxes_with_text[0][1]
+        last_h = boxes_with_text[0][3]
+        
+        for b in boxes_with_text[1:]:
+            y, h = b[1], b[3]
+            if abs(y - last_y) < max(h, last_h) * 0.5:
+                curr_row.append(b)
             else:
-                # если это короткий лейбл и он не совпал с началом BODY — скорее всего имя/мусор
-                if not is_short_label:
-                    # длинную строку всё-таки лучше не терять вообще
-                    good.append((int(x), int(y), int(w), int(h)))
+                curr_row.sort(key=lambda box: box[0])
+                rows.append(curr_row)
+                curr_row = [b]
+                last_y = y
+                last_h = h
+        curr_row.sort(key=lambda box: box[0])
+        rows.append(curr_row)
 
-        # если вообще ничего не прошло — не ломаем поведение
-        if not good:
-            return [
-                (int(x), int(y), int(w), int(h))
-                for (x, y, w, h, _t) in boxes_with_text
-            ]
+    print(f"[BOX-DBG] OCR clustered into {len(rows)} rows.")
 
-        # --- НОВОЕ: кластеризация по строкам и выкидывание верхнего "имени" ---
-        # Собираем карту box -> текст для дальнейшей эвристики
-        text_by_box = {
-            (int(x), int(y), int(w), int(h)): (txt or "").strip()
-            for (x, y, w, h, txt) in boxes_with_text
-        }
+    # 3. Фильтруем боксы индивидуально
+    good_boxes = []
+    name_skipped_count = 0
+    
+    for r_idx, row in enumerate(rows):
+        boxes_to_keep_in_row = []
+        is_top_row = (r_idx == 0)
+        for b_idx, box in enumerate(row):
+            txt = box[4]
+            t_c = _norm(txt)
+            
+            is_name_box = False
+            # 1. Проверка на ИМЯ (Name)
+            if name_c:
+                ratio_name = SequenceMatcher(None, t_c, name_c).ratio()
+                    # Смягченный порог для имени, чтобы прощать ошибки EasyOCR
+                if ratio_name > 0.55 or (t_c and t_c in name_c and len(t_c) >= 2) or (name_c in t_c and len(name_c) >= 2):
+                    is_name_box = True
+                elif _RE_MYSTERY.fullmatch(txt) and _RE_MYSTERY.fullmatch(name_line or ""):
+                    is_name_box = True
 
-        # канонизированный EN-лейбл
-        def _canon_label(s: str) -> str:
-            s = s or ""
-            # Разрешаем ??? как лейбл
-            if re.fullmatch(r"[?？]+", s.strip()):
-                return s.strip()
-            return re.sub(r"[^0-9a-zA-Zа-яА-Я]+", "", s).lower()
+                # Структурная эвристика: если это первая строка, LLM нашел имя, 
+                # а текст бокса короткий и не совпадает с телом диалога — это испорченный неймплейт
+                if is_top_row and name_line and not is_name_box:
+                    if len(txt.split()) <= 4:
+                        s_check = SequenceMatcher(None, t_c, body_c)
+                        m_check = s_check.find_longest_match(0, len(t_c), 0, len(body_c))
+                        if m_check.size < len(t_c) * 0.4 and t_c not in body_c:
+                            is_name_box = True
 
-        name_label = _canon_label(name_line) if name_line else ""
+            if is_name_box:
+                print(f"[BOX-DBG] Skipping name box: '{txt}'")
+                name_skipped_count += 1
+                continue
 
-        # сортируем боксы по Y
-        boxes_for_rows = sorted(good, key=lambda b: b[1])
-        heights = [h for (_x, _y, _w, h) in boxes_for_rows]
-        avg_h = sum(heights) / max(len(heights), 1)
-        row_thresh = max(4, avg_h * 0.7)
-
-        # разбиваем на строки (ряды) по вертикали
-        rows: list[list[tuple[int, int, int, int]]] = []
-        cur: list[tuple[int, int, int, int]] = []
-        if boxes_for_rows:
-            base_y = boxes_for_rows[0][1]
-            cur.append(boxes_for_rows[0])
-            for box in boxes_for_rows[1:]:
-                y = box[1]
-                if abs(y - base_y) <= row_thresh:
-                    cur.append(box)
+            # 2. Проверка на ТЕКСТ (Body)
+            matched_chars = 0
+            total_chars = len(t_c)
+            
+            # Если в боксе только знаки препинания (...)
+            if not t_c:
+                if re.search(r"[.…?!]+", txt):
+                    raw_body_text = body if body else en_full
+                    if raw_body_text and re.search(r"[.…?!]+", raw_body_text):
+                        matched_chars = len(txt.strip())
+                        total_chars = matched_chars
+            else:
+                # Если текст бокса есть в ответе LLM
+                if t_c in body_c or body_c in t_c:
+                    matched_chars = len(t_c)
                 else:
-                    rows.append(cur)
-                    cur = [box]
-                    base_y = y
-            rows.append(cur)
+                    # Частичное совпадение (порог 0.5)
+                    s = SequenceMatcher(None, t_c, body_c)
+                    m = s.find_longest_match(0, len(t_c), 0, len(body_c))
+                    if m.size > len(t_c) * 0.4:
+                        matched_chars = m.size
+            
+            keep_box = (matched_chars > 0)
+            if total_chars > 0:
+                if matched_chars / total_chars > 0.35:
+                    keep_box = True
+                elif total_chars < 4 and matched_chars > 0:
+                    keep_box = True
+            
+            if keep_box:
+                boxes_to_keep_in_row.append(box)
+            else:
+                print(f"[BOX-DBG] Filtering out noise/name box: '{txt}' (match {matched_chars}/{total_chars})")
 
-        # если строк нет, просто вернём good
-        if not rows:
-            good.sort(key=lambda b: b[1])
-            return good
+        for box in boxes_to_keep_in_row:
+            good_boxes.append((int(box[0]), int(box[1]), int(box[2]), int(box[3])))
 
-        top_row = rows[0]
+    print(f"[BOX-DBG] Total good boxes: {len(good_boxes)} / {len(boxes_with_text)}")
 
-        # Текст верхней строки
-        row_text = " ".join(
-            text_by_box.get((int(x), int(y), int(w), int(h)), "")
-            for (x, y, w, h) in top_row
-        ).strip()
-        tokens = row_text.split()
-
-        looks_like_label = False
-        if row_text:
-            # короткая строка, мало слов, нет знаков конца предложения
-            if (
-                len(row_text) <= 32
-                and 1 <= len(tokens) <= 3
-                and not any(ch in row_text for ch in ".!?:")
-            ):
-                looks_like_label = True
-
-        # доп. проверка по совпадению с EN-именем
-        if looks_like_label and name_label:
-            top_label = _canon_label(row_text)
-            if top_label and (
-                top_label == name_label
-                or top_label in name_label
-                or name_label in top_label
-            ):
-                # считаем верхнюю строку неймплейтом → выкидываем её целиком
-                new_good: list[tuple[int, int, int, int]] = []
-                for row in rows[1:]:
-                    new_good.extend(row)
-                if new_good:
-                    good = new_good  # если после этого что-то осталось — используем это
-
-        # финальная сортировка по вертикали
-        good.sort(key=lambda b: b[1])
-        return good
-
-    except Exception as e:
-        # Любая внутренняя ошибка: лог + фолбэк
-        print("[OCR-BOXES] _filter_boxes_by_llm_text error:", e)
-        try:
-            return [
-                (int(x), int(y), int(w), int(h))
-                for (x, y, w, h, _t) in boxes_with_text
-            ]
-        except Exception:
+    # FALLBACK
+    if not good_boxes and boxes_with_text and en_full:
+        print(f"[BOXES-FIX] Filter removed all boxes! Fallback triggered.")
+        fallback_boxes = []
+        for r_idx, row in enumerate(rows):
+            for b_idx, box in enumerate(row):
+                if name_skipped_count > 0 and r_idx == 0:
+                    continue
+                fallback_boxes.append((box[0], box[1], box[2], box[3]))
+        
+        if not fallback_boxes and name_skipped_count > 0:
             return []
+        if not fallback_boxes and name_line and len(boxes_with_text) > 1:
+                return [(int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in boxes_with_text[1:]]
+        return fallback_boxes if fallback_boxes else [(b[0], b[1], b[2], b[3]) for b in boxes_with_text]
+
+    return good_boxes
 
 def _bgr_to_png_b64(img, max_side: int = 1400) -> str:
     h, w = img.shape[:2]
@@ -609,60 +585,146 @@ class ModelHubDialog(QDialog):
 
         lay = QVBoxLayout(self)
 
-        # Пресеты
-        gb = QGroupBox("Рекомендованные пресеты")
-        v = QVBoxLayout(gb)
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Название", "Тип", "Формат", "Примечание", "Размер"])
-        v.addWidget(self.tree)
-        lay.addWidget(gb)
+        # --- БЛОК ФИЛЬТРОВ ---
+        filter_layout = QHBoxLayout()
+        
+        self.cbFilterCreator = QComboBox()
+        self.cbFilterParams = QComboBox()
+        self.cbFilterQuant = QComboBox()
+        self.cbFilterType = QComboBox()
 
-        # — наполняем пресеты (URL — примеры-плейсхолдеры; подставьте свои)
-        presets = [
-            # OCR / VL
-            {"name": "Qwen3-VL-2B-Instruct (OCR)", "kind": "OCR (VL)", "fmt": "GGUF Q4_K_M", "note":"Vision-модель для OCR (распознавалка текста)", "size": "~1.1 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF/resolve/main/Qwen3-VL-2B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-VL-2B-Instruct (OCR).gguf"},
-            {"name": "Qwen3-VL-2B-mmproj", "kind": "mmproj", "fmt": "F16/BF16", "note":"Проектор к Qwen-VL-2B (название будет просто mmproj-F16!!!) (необходим для Qwen-B2)", "size": "~800 MB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-2B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-VL-2B-mmproj.gguf"},
-            # Translator / TEXT
-            {"name": "Qwen3-4B-Instruct", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_K_M", "note":"Только текст для дуал режима", "size": "~2.5 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true", "filename":"Qwen3-4B-Instruct.gguf"},
-            {"name": "Qwen3-4B-Instruct", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_NL", "note":"Только текст для дуал режима (ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~2.4 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-IQ4_NL.gguf?download=true", "filename":"Qwen3-4B-Instruct.gguf"},
-            {"name": "Hunyuan-MT-7B-GGUF", "kind": "Translator (TEXT)", "fmt": "GGUF Q4_K_M", "note":"Хорошее алтернатива между качеством и качеством). Переводит очень хорошо, читать приятно, но абсолютно клал болт на лор и фразбук", "size": "~4.6 GB",
-             "url":"https://huggingface.co/mradermacher/Hunyuan-MT-7B-GGUF/resolve/main/Hunyuan-MT-7B.Q4_K_M.gguf?download=true", "filename":"Hunyuan-MT-7B-GGUF.gguf"},
-            # Всё в одном
-            {"name": "Qwen3-8B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_K_M", "note":"Модель для соло режима (И читает и переводит)", "size": "~5 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct.gguf"},
-            {"name": "Qwen3-8B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_NL", "note":"Модель для соло режима (И читает и переводит)(ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~4.8 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3-VL-8B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct.gguf"},
-            {"name": "Qwen3-8B-VL-Instruct-mmproj", "kind": "Translator/OCR (All in one)", "fmt": "GGUF F16", "note":"Гляделка для модели 8B", "size": "~1.2 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-8B-VL-Instruct-mmproj.gguf"},
-            {"name": "Qwen3-4B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_K_M", "note":"Альтернатива для соло 8B (лечге и хуже по качеству)(ТОЛЬКО ДЛЯ RTX 40 СЕРИИ)", "size": "~2.4 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-4B-Instruct-GGUF/resolve/main/Qwen3-VL-4B-Instruct-Q4_K_M.gguf?download=true", "filename":"Qwen3-4B-VL-Instruct.gguf"},
-            {"name": "Qwen3-4B-VL-Instruct", "kind": "Translator/OCR (All in one)", "fmt": "GGUF Q4_NL", "note":"Альтернатива для соло 8B (лечге и хуже по качеству)", "size": "~2.5 GB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-4B-Instruct-GGUF/resolve/main/Qwen3-VL-4B-Instruct-IQ4_NL.gguf?download=true", "filename":"Qwen3-4B-VL-Instruct.gguf"},
-            {"name": "Qwen3-4B-VL-Instruct-mmproj", "kind": "Translator/OCR (All in one)", "fmt": "GGUF F16", "note":"Гляделка для 4B", "size": "~800 MB",
-             "url":"https://huggingface.co/unsloth/Qwen3-VL-4B-Instruct-GGUF/resolve/main/mmproj-F16.gguf?download=true", "filename":"Qwen3-4B-VL-Instruct-mmproj.gguf"},
-        ]
+        for cb in (self.cbFilterCreator, self.cbFilterParams, self.cbFilterQuant, self.cbFilterType):
+            cb.currentIndexChanged.connect(self._apply_filters)
+
+        filter_layout.addWidget(QLabel("Производитель:"))
+        filter_layout.addWidget(self.cbFilterCreator)
+        filter_layout.addSpacing(10)
+        filter_layout.addWidget(QLabel("Параметры:"))
+        filter_layout.addWidget(self.cbFilterParams)
+        filter_layout.addSpacing(10)
+        filter_layout.addWidget(QLabel("Квантование:"))
+        filter_layout.addWidget(self.cbFilterQuant)
+        filter_layout.addSpacing(10)
+        filter_layout.addWidget(QLabel("Тип:"))
+        filter_layout.addWidget(self.cbFilterType)
+        filter_layout.addStretch()
+        
+        lay.addLayout(filter_layout)
+
+        # --- ОСНОВНОЙ БЛОК: СПИСОК + ОПИСАНИЕ ---
+        from PySide6.QtWidgets import QSplitter, QTextBrowser, QWidget
+        splitter = QSplitter(Qt.Horizontal)
+        
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Название", "Размер"])
+        self.tree.setSortingEnabled(True)
+        splitter.addWidget(self.tree)
+        
+        right_widget = QWidget()
+        right_lay = QVBoxLayout(right_widget)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        
+        self.descPanel = QTextBrowser()
+        self.descPanel.setOpenExternalLinks(True)
+        self.descPanel.setHtml("<h3 style='text-align:center;'><br><br>Выберите модель для просмотра описания</h3>")
+        right_lay.addWidget(self.descPanel, 1)
+        
+        self.quantLay = QHBoxLayout()
+        self.quantLay.addWidget(QLabel("Выбор квантования:"))
+        self.cbItemQuant = QComboBox()
+        self.cbItemQuant.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.cbItemQuant.setMinimumWidth(250)
+        self.cbItemQuant.currentIndexChanged.connect(self._on_quant_changed)
+        self.quantLay.addWidget(self.cbItemQuant)
+        self.quantLay.addStretch()
+        right_lay.addLayout(self.quantLay)
+        
+        # Скрыть выбор квантования пока модель не выбрана
+        self.cbItemQuant.setVisible(False)
+        self.quantLay.itemAt(0).widget().setVisible(False)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([600, 600])
+        lay.addWidget(splitter, 1)
+
+        # --- Загружаем пресеты из JSON ---
+        presets = []
+        json_path = BASE_DIR / "assets" / "models.JSON"
+        if not json_path.exists():
+            json_path = BASE_DIR / "assets" / "models.json"
+            
+        try:
+            if json_path.exists():
+                with open(json_path, "r", encoding="utf-8") as f:
+                    presets = json.load(f)
+            else:
+                print(f"[ModelHub] Файл списка моделей не найден: {json_path}")
+        except Exception as e:
+            print(f"[ModelHub] Ошибка чтения файла моделей {json_path}: {e}")
+
         self._presets = presets
+        
+        creators = set()
+        params = set()
+        quants = set()
+        types = set()
+        
         for p in presets:
-            it = QTreeWidgetItem([p["name"], p["kind"], p["fmt"], p["note"], p["size"]])
+            creators.add(p.get("creator", "-"))
+            params.add(p.get("params", "-"))
+            types.add(p.get("type", "-"))
+            
+            q_dict = p.get("quants", {})
+            display_size = "-"
+            
+            if q_dict:
+                valid_sizes = []
+                for q, v in q_dict.items():
+                    quants.add(q)
+                    s = str(v.get("size", "-"))
+                    if s != "-":
+                        sv = s.replace("~", "").strip().upper()
+                        try:
+                            m = re.search(r"[\d\.]+", sv)
+                            if m:
+                                num = float(m.group())
+                                if "GB" in sv: num *= 1024
+                                valid_sizes.append((num, s))
+                        except Exception:
+                            pass
+                if valid_sizes:
+                    valid_sizes.sort(key=lambda x: x[0])
+                    min_s = valid_sizes[0][1]
+                    max_s = valid_sizes[-1][1]
+                    display_size = f"{min_s} – {max_s}" if min_s != max_s else min_s
+            
+            it = QTreeWidgetItem([p["name"], display_size])
             it.setData(0, Qt.UserRole, p)
+            it.setData(1, Qt.UserRole, p.get("creator", "-"))
+            it.setData(2, Qt.UserRole, p.get("params", "-"))
+            it.setData(3, Qt.UserRole, list(q_dict.keys()))
+            it.setData(4, Qt.UserRole, p.get("type", "-"))
             self.tree.addTopLevelItem(it)
-            self._autosize_columns()
-            self.tree.setUniformRowHeights(True)                 # быстрее
-            self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            
+        self._populate_combo(self.cbFilterCreator, creators)
+        self._populate_combo(self.cbFilterParams, params)
+        self._populate_combo(self.cbFilterQuant, quants)
+        self._populate_combo(self.cbFilterType, types)
+
+        self._autosize_columns()
+        self.tree.setUniformRowHeights(True)
 
         # Поля URL/путь
         form = QFormLayout()
         self.edUrl = QLineEdit()
+        self.edFilename = QLineEdit()
         self.edPath = QLineEdit(os.path.join(self.default_dir, ""))  # папка
         self.btnBrowse = QPushButton("…")
         row = QHBoxLayout()
         row.addWidget(self.edPath, 1)
         row.addWidget(self.btnBrowse)
         form.addRow("URL файла:", self.edUrl)
+        form.addRow("Имя файла:", self.edFilename)
         form.addRow("Папка сохранения:", QWidget())
         form.itemAt(form.rowCount()-1, QFormLayout.FieldRole).widget().setLayout(row)
         lay.addLayout(form)
@@ -692,34 +754,47 @@ class ModelHubDialog(QDialog):
         self.tree.itemSelectionChanged.connect(self._fill_from_selected)
 
         self._worker: DownloadWorker|None = None
+
+    def _populate_combo(self, cb: QComboBox, items: set):
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("Все")
+        def sort_key(x):
+            num_match = re.search(r'(\d+(\.\d+)?)', x)
+            if num_match:
+                return (0, float(num_match.group(1)), x)
+            return (1, 0, x)
+        for item in sorted(list(items), key=sort_key):
+            if item != "-":
+                cb.addItem(item)
+        cb.blockSignals(False)
+
+    def _apply_filters(self):
+        f_creator = self.cbFilterCreator.currentText()
+        f_params = self.cbFilterParams.currentText()
+        f_quant = self.cbFilterQuant.currentText()
+        f_type = self.cbFilterType.currentText()
+
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            c = item.data(1, Qt.UserRole)
+            p = item.data(2, Qt.UserRole)
+            q_list = item.data(3, Qt.UserRole)
+            t = item.data(4, Qt.UserRole)
+
+            match = True
+            if f_creator != "Все" and c != f_creator: match = False
+            if f_params != "Все" and p != f_params: match = False
+            if f_quant != "Все" and f_quant not in q_list: match = False
+            if f_type != "Все" and t != f_type: match = False
+            item.setHidden(not match)
         
     def _autosize_columns(self):
         h = self.tree.header()
         h.setStretchLastSection(False)
         h.setSectionsMovable(True)
-        h.setMinimumSectionSize(80)
-
-        # 0: Название, 1: Тип, 2: Формат, 3: Примечание, 4: Размер
-        # сначала поджимаем по содержимому
-        for i in range(self.tree.columnCount()):
-            h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-
-        # чуть «подпухлить» узкие колонки и ограничить сверхширокие
-        QTimer.singleShot(0, lambda: self._finalize_columns())
-
-    def _finalize_columns(self):
-        # немного паддинга и ограничение максимальной ширины узких колонок
-        for i in (0, 1, 2, 4):
-            w = min(self.tree.sizeHintForColumn(i) + 24, 600)
-            self.tree.setColumnWidth(i, w)
-
-        # "Примечание" растягиваем на оставшееся место
-        h = self.tree.header()
-        h.setSectionResizeMode(3, QHeaderView.Stretch)
-        # чтобы пользователь мог потом руками двигать
-        for i in range(self.tree.columnCount()):
-            if i != 3:
-                h.setSectionResizeMode(i, QHeaderView.Interactive)
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
 
     def _choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Куда сохранить", self.edPath.text() or self.default_dir)
@@ -732,8 +807,67 @@ class ModelHubDialog(QDialog):
             QMessageBox.information(self, "Модели", "Выберите пресет в списке.")
             return
         p = it.data(0, Qt.UserRole) or {}
-        self.edUrl.setText(p.get("url",""))
-        # Папку не трогаем — пользователь сам управляет
+        # Наполняем выпадающий список квантований
+        self.cbItemQuant.blockSignals(True)
+        self.cbItemQuant.clear()
+        q_dict = p.get("quants", {})
+        for q in q_dict.keys():
+            self.cbItemQuant.addItem(q, q_dict[q])
+        self.cbItemQuant.blockSignals(False)
+        
+        # Показываем или скрываем панель выбора квантования
+        has_quants = len(q_dict) > 0 and list(q_dict.keys())[0] != "-"
+        self.cbItemQuant.setVisible(has_quants)
+        self.quantLay.itemAt(0).widget().setVisible(has_quants)
+            
+            # Искусственно вызываем обновление данных через эмуляцию смены индекса
+        if q_dict:
+            self._on_quant_changed()
+    
+    def _on_quant_changed(self):
+        it = self.tree.currentItem()
+        if not it: return
+        p = it.data(0, Qt.UserRole) or {}
+        
+        q_name = self.cbItemQuant.currentText()
+        q_data = self.cbItemQuant.currentData() or {}
+        
+        self.edUrl.setText(q_data.get("url",""))
+        
+        fname = q_data.get("filename", "")
+        if not fname and q_data.get("url"):
+            fname = q_data.get("url").split("/")[-1].split("?")[0]
+        self.edFilename.setText(fname)
+        
+        # Умное переключение папки (llm <-> easyocr)
+        subdir = q_data.get("subdir")
+        base = Path(self.default_dir)
+        # Если мы сейчас в models/llm, а пресет просит easyocr — переключаем
+        if subdir == "easyocr" and base.name == "llm":
+            self.edPath.setText(str(base.parent / "easyocr"))
+        # Если пресет обычный (или явно llm), а мы ушли в easyocr — возвращаем
+        elif (not subdir or subdir == "llm") and Path(self.edPath.text()).name == "easyocr":
+            self.edPath.setText(self.default_dir)
+            
+        # Получаем размер конкретного файла
+        size_str = q_data.get("size", "-")
+
+        # Update Description Panel
+        html = f"""
+        <div style="font-family: 'Segoe UI', sans-serif;">
+            <h2>{p.get('name', 'Модель')}</h2>
+            <table border="0" cellpadding="5" cellspacing="0" style="font-size: 14px;">
+                <tr><td><b>Производитель:</b></td><td>{p.get('creator', '-')}</td></tr>
+                <tr><td><b>Параметры:</b></td><td>{p.get('params', '-')}</td></tr>
+                <tr><td><b>Выбранный формат:</b></td><td>{q_name if q_name != "-" else p.get('fmt', '-')}</td></tr>
+                <tr><td><b>Размер файла:</b></td><td>{size_str}</td></tr>
+                <tr><td><b>Тип:</b></td><td>{p.get('type', '-')}</td></tr>
+            </table>
+            <hr>
+            <p style="font-size: 14px;">{p.get('note', '')}</p>
+        </div>
+        """
+        self.descPanel.setHtml(html)
 
     def _start_download(self):
         url = (self.edUrl.text() or "").strip()
@@ -743,7 +877,9 @@ class ModelHubDialog(QDialog):
         folder = (self.edPath.text() or "").strip() or self.default_dir
         os.makedirs(folder, exist_ok=True)
         # имя берём из URL
-        fname = url.split("/")[-1].split("?")[0] or "model.gguf"
+        fname = (self.edFilename.text() or "").strip()
+        if not fname:
+            fname = url.split("/")[-1].split("?")[0] or "model.gguf"
         dest = os.path.join(folder, fname)
 
         self.pb.setValue(0)
@@ -964,7 +1100,7 @@ class RegionPanel(QWidget):
                 raw_lines = text.split("\n")
                 visible_text = text
 
-                if len(raw_lines) >= 2:
+                if getattr(ov, "smart_name_removal", True) and len(raw_lines) >= 2:
                     raw_first = raw_lines[0].strip()
 
                     # сносим ведущие многоточия / точки / пробелы
@@ -1160,9 +1296,10 @@ class CaptureWorker(QThread):
                 min_interval = 1.0 / max(0.1, float(MAX_OCR_FPS))  # защита от деления на 0
                 elapsed = now - r.last_ocr_ts
                 if elapsed < min_interval:
-                    # доспим ровно до нужного FPS
-                    rem_ms = int(max(1, (min_interval - elapsed) * 1000))
-                    self.msleep(rem_ms)
+                    # Если этот регион ещё не готов (FPS limit), не блокируем поток надолго,
+                    # чтобы другие регионы могли обновиться.
+                    # Спим чуть-чуть (10мс) и переходим к следующему региону.
+                    self.msleep(10)
                     continue
 
                 cap = r.capture_rect if r.split_mode else r.display_rect
@@ -1174,6 +1311,12 @@ class CaptureWorker(QThread):
                 if hwnd:
                     frame, full = _grab_from_bound(hwnd, (px, py, pw, ph))
                     if frame is None:
+                        # Если регион вне окна игры — захват вернёт None.
+                        try:
+                            wl, wt, wr, wb = _get_window_rect(hwnd)
+                            print(f"[GRAB] Region {idx}: capture failed. Region Phys: {px},{py} {pw}x{ph} | Window Phys: {wl},{wt} to {wr},{wb}")
+                        except:
+                            print(f"[GRAB] Region {idx}: capture failed (region outside bound window?)")
                         self.msleep(self.interval_ms); continue
                 else:
                     screen = QGuiApplication.primaryScreen()
@@ -1263,6 +1406,13 @@ class CaptureWorker(QThread):
                          r.pending_ru_raw = ""
                          r.pending_hits = 0
                          r.text_boxes = []
+                         
+                         # --- Сброс глобального кэша анти-эха ---
+                         try:
+                             from llm_adapter_dual import reset_translation_cache
+                             reset_translation_cache()
+                         except: pass
+                         # --------------------------------------
 
                     # Полная остановка: не идем к нейросетям, ждем след. кадра
                     self.msleep(self.interval_ms)
@@ -1272,8 +1422,14 @@ class CaptureWorker(QThread):
                 # -----------------------------------------------------------
 
                 # LLM: одна картинка (регион) → перевод
-                reg_b64  = _bgr_to_png_b64(frame, max_side=1024)
+                # В обычном режиме увеличиваем разрешение до 1536 для четкости
+                # В режиме Wiki ставим максимум для очень мелкого текста
+                limit_side = 1536
+                if getattr(self.overlay.llm_cfg, "mode", "game") == "wiki":
+                    limit_side = 3500 
                 
+                reg_b64  = _bgr_to_png_b64(frame, max_side=limit_side)
+                full_b64 = None
                 r.last_ocr_ts = time.perf_counter()
 
                 en = ""
@@ -1290,6 +1446,19 @@ class CaptureWorker(QThread):
                 # 2. УМНАЯ ПРОВЕРКА (Страж №2): Нужно ли переводить?
                 need_translate = True
                 
+                # --- FIX: Проверка на "тишину" (только имя + троеточие) ---
+                if en:
+                    try:
+                        _nm, _bd = safe_split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
+                        
+                        _check = _bd if _bd else en
+                        # Если текст состоит только из знаков препинания
+                        if not re.sub(r"[\s.…?？!！\-~]+", "", _check) and _check.strip():
+                            print(f"[SKIP-TR] Silence detected. Output: {repr(_check)}")
+                            ru = _check
+                            need_translate = False
+                    except Exception: pass
+
                 if (mode_idx == 1 or mode_idx == 2) and en:
                     # Параметры стабилизации
                     threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
@@ -1330,12 +1499,8 @@ class CaptureWorker(QThread):
                     
                     elif mode_idx == 2: # ONLINE
                         # --- УЛУЧШЕНИЕ: Отделяем имя, чтобы Гугл его не испортил ---
-                        try:
-                            # Используем функцию из dual адаптера, если доступна
-                            nm, bd = _split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
-                            text_to_send = bd if bd else en
-                        except:
-                            text_to_send = en
+                        nm, bd = safe_split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
+                        text_to_send = bd if bd else en
                         
                         # Переводим только тело диалога
                         ru = online_adapter.translate_text(text_to_send)
@@ -1364,11 +1529,8 @@ class CaptureWorker(QThread):
 
                 # --- DUAL: вырезаем строку с именем из RU, если в EN оно есть ---
                 name_line = None
-                if getattr(self.overlay, "dual_mode", False) and en and ru:
-                    try:
-                        name_line, _body = _split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
-                    except Exception:
-                        name_line = None
+                if getattr(self.overlay, "smart_name_removal", True) and getattr(self.overlay, "dual_mode", False) and en and ru:
+                    name_line, _body = safe_split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
 
                     # Если в EN вообще есть отдельная строка с именем —
                     # считаем, что первая строка RU тоже может быть неймплейтом.
@@ -1477,6 +1639,26 @@ class CaptureWorker(QThread):
                                         commit_history_manually(en, r.pending_ru_raw)
                                     except Exception as e:
                                         print(f"[HISTORY] Error: {e}")
+                
+                elif r.last_sent_ru_raw and en:
+                    # Если перевода нет (отфильтрован/пуст), но есть новый EN текст,
+                    # и он отличается от того, что сейчас на экране — стираем старый перевод.
+                    try:
+                        curr_en_canon = canon_en(en)
+                    except:
+                        curr_en_canon = ""
+                    
+                    # Если текст сменился (например, с "Hello" на "Code 123"), а перевода нет,
+                    # то мы должны убрать старый перевод ("Привет"), иначе он будет висеть вечно.
+                    if curr_en_canon and r.last_en_canon and curr_en_canon != r.last_en_canon:
+                         print(f"[CLEAR] region {idx}: EN changed & RU empty -> Clear screen")
+                         self.textReady.emit(idx, "")
+                         r.last_sent_ru_raw = ""
+                         r.last_sent_ru_canon = ""
+                         r.last_en_canon = ""
+                         r.pending_ru_raw = ""
+                         r.pending_ru_canon = ""
+                         r.pending_hits = 0
                                         
                 self.msleep(self.interval_ms)
             except Exception as e:
@@ -1550,6 +1732,7 @@ class Overlay(QWidget):
         self.bg_alpha = PANEL_BG_ALPHA
         self.ocr_cfg_dual = None
         self.tr_cfg_dual  = None
+        self.smart_name_removal = True
 
         # шрифт панели
         self.font_family = "Segoe UI"
@@ -1645,7 +1828,7 @@ class Overlay(QWidget):
     
     def start_worker(self):
         if self.worker is None:
-            self.worker=CaptureWorker(self, interval_ms=140)
+            self.worker=CaptureWorker(self, interval_ms=50)
             self.worker.textReady.connect(self.on_text_ready)
             self.worker.start()
 
@@ -2186,7 +2369,7 @@ class ConfigWindow(QWidget):
         self.cbModelTR   = QComboBox()   # DUAL: текстовая модель перевода
 
         # настройки модели
-        self.spMaxTok = QSpinBox(); self.spMaxTok.setRange(16, 16000); self.spMaxTok.setValue(int(getattr(llm_cfg,'max_tokens',15000)))
+        self.spMaxTok = QSpinBox(); self.spMaxTok.setRange(16, 16000); self.spMaxTok.setValue(int(getattr(llm_cfg,'max_tokens',1024)))
         self.spTO     = QDoubleSpinBox(); self.spTO.setRange(1.0, 120.0); self.spTO.setDecimals(1); self.spTO.setValue(float(getattr(llm_cfg,'timeout_s',30.0)))
         self.spTemp   = QDoubleSpinBox(); self.spTemp.setRange(0.0, 1.5); self.spTemp.setSingleStep(0.05); self.spTemp.setValue(float(getattr(llm_cfg,'temp',0.2)))
         self.spTopP   = QDoubleSpinBox(); self.spTopP.setRange(0.0, 1.0); self.spTopP.setSingleStep(0.05); self.spTopP.setValue(float(getattr(llm_cfg,'top_p',0.9)))
@@ -2199,7 +2382,7 @@ class ConfigWindow(QWidget):
         self.cbCache = QCheckBox("cache_prompt (прогрев)"); self.cbCache.setChecked(bool(getattr(llm_cfg,'use_prompt_cache',True)))
 
         # серверные параметры (llama-server)
-        self.spCtx   = QSpinBox();       self.spCtx.setRange(1024, 65536); self.spCtx.setValue(15000)
+        self.spCtx   = QSpinBox();       self.spCtx.setRange(1024, 65536); self.spCtx.setValue(4096)
         self.spBatch = QSpinBox();       self.spBatch.setRange(1, 4096);   self.spBatch.setValue(256)
         self.spUBatch= QSpinBox();       self.spUBatch.setRange(1, 4096);  self.spUBatch.setValue(64)
         self.spPar   = QSpinBox();       self.spPar.setRange(1, 16);       self.spPar.setValue(1)
@@ -2216,6 +2399,8 @@ class ConfigWindow(QWidget):
         self.spFps    = QDoubleSpinBox(); self.spFps.setRange(0.1, 5.0); self.spFps.setSingleStep(0.1); self.spFps.setValue(float(MAX_OCR_FPS))
         self.spCanonHits = QSpinBox(); self.spCanonHits.setRange(0, 10); self.spCanonHits.setValue(2)  # разумное значение по умолчанию
         self.spRetr = QDoubleSpinBox(); self.spRetr.setRange(0.0, 600.0); self.spRetr.setSingleStep(0.5); self.spRetr.setDecimals(1); self.spRetr.setValue(0.0)
+        self.cbSmartNameRemoval = QCheckBox("Умное удаление имен (Game Mode)")
+        self.cbSmartNameRemoval.setToolTip("Если включено: программа пытается найти имя персонажа в первой строке и скрыть его.\nВыключите для браузера/книг, чтобы не терять первую строку.")
         self.spBorder = QSpinBox(); self.spBorder.setRange(1, 16); self.spBorder.setValue(BORDER_WIDTH)
         self.spBorder.valueChanged.connect(lambda v: (setattr(self.overlay, "border_w", int(v)), self.overlay.update()))
         self.spSplit  = QSpinBox(); self.spSplit.setRange(1, 16); self.spSplit.setValue(SPLIT_BORDER_WIDTH)
@@ -2281,6 +2466,7 @@ class ConfigWindow(QWidget):
         self.btnNavCustomize = _make_nav_button("_internal/icons/UI.png",     "Кастомизация")
         self.btnNavDownload  = _make_nav_button("_internal/icons/Download.png",  "Скачать модели")
         self.btnNavModel     = _make_nav_button("_internal/icons/Settings.png",       "Настройки моделей")
+        self.btnNavFullscreen= _make_nav_button("_internal/icons/Fullscreen.png", "Полноэкранный режим")
         self.btnNavInfo      = _make_nav_button("_internal/icons/FAQ.png",      "Информация")
 
         navLayout = QVBoxLayout()
@@ -2292,6 +2478,7 @@ class ConfigWindow(QWidget):
         navLayout.addWidget(self.btnNavCustomize)
         navLayout.addWidget(self.btnNavDownload)
         navLayout.addWidget(self.btnNavModel)
+        navLayout.addWidget(self.btnNavFullscreen)
 
         # растяжка, чтобы Info ушла в самый низ
         navLayout.addStretch()
@@ -2348,6 +2535,12 @@ class ConfigWindow(QWidget):
         topRow.addWidget(self.cbSourceLang)
         topRow.addStretch()
         formHome.addLayout(topRow)
+        
+        # Тип текста (Game / Wiki)
+        self.cbTextType = QComboBox()
+        self.cbTextType.addItems(["Game Dialogue (Default)", "Wiki / Large Text"])
+        formHome.addWidget(QLabel("Тип текста:"))
+        formHome.addWidget(self.cbTextType)
 
         # Окно для захвата
         gbWin = QGroupBox("Окно для захвата")
@@ -2419,7 +2612,7 @@ class ConfigWindow(QWidget):
         # Шрифт панели
         gbFont = QGroupBox("Шрифт панели")
         ff = QFormLayout(gbFont)
-        ff.addRow("Гарнитура:", self.fontFamily)
+        ff.addRow("Шрифты:", self.fontFamily)
         ff.addRow("Размер:", self.fontSize)
         ff.addRow("", self.fontBold)
         formCust.addWidget(gbFont)
@@ -2452,6 +2645,7 @@ class ConfigWindow(QWidget):
         gbK = QGroupBox("Вид и поведение панели")
         fk = QFormLayout(gbK)
         fk.addRow("FPS захвата:", self.spFps)
+        fk.addRow(self.cbSmartNameRemoval)
         fk.addRow("Проверок EN до фиксации:", self.spCanonHits)
         fk.addRow("Ширина рамки:", self.spBorder)
         fk.addRow("Ширина разделителя:", self.spSplit)
@@ -2533,7 +2727,7 @@ class ConfigWindow(QWidget):
         self.gbOCR = QGroupBox("OCR-сервер (vision)")
         self.edHost1 = QLineEdit("127.0.0.1")
         self.spPort1 = QSpinBox(); self.spPort1.setRange(1,65535); self.spPort1.setValue(8080)
-        self.spCtx1  = QSpinBox(); self.spCtx1.setRange(1024,65536); self.spCtx1.setValue(8192)
+        self.spCtx1  = QSpinBox(); self.spCtx1.setRange(1024,65536); self.spCtx1.setValue(4096)
         self.spBatch1= QSpinBox(); self.spBatch1.setRange(1,4096); self.spBatch1.setValue(256)
         self.spUB1   = QSpinBox(); self.spUB1.setRange(1,4096); self.spUB1.setValue(64)
         self.spPar1  = QSpinBox(); self.spPar1.setRange(1,16); self.spPar1.setValue(1)
@@ -2565,7 +2759,7 @@ class ConfigWindow(QWidget):
         self.gbTR = QGroupBox("Перевод-сервер (text)")
         self.edHost2 = QLineEdit("127.0.0.1")
         self.spPort2 = QSpinBox(); self.spPort2.setRange(1,65535); self.spPort2.setValue(8081)
-        self.spCtx2  = QSpinBox(); self.spCtx2.setRange(1024,65536); self.spCtx2.setValue(6000)
+        self.spCtx2  = QSpinBox(); self.spCtx2.setRange(1024,65536); self.spCtx2.setValue(4096)
         self.spBatch2= QSpinBox(); self.spBatch2.setRange(1,4096); self.spBatch2.setValue(256)
         self.spUB2   = QSpinBox(); self.spUB2.setRange(1,4096); self.spUB2.setValue(64)
         self.spPar2  = QSpinBox(); self.spPar2.setRange(1,16); self.spPar2.setValue(1)
@@ -2660,7 +2854,94 @@ class ConfigWindow(QWidget):
         self.stack.addWidget(pageModel)
 
         # --------------------------------------------------------
-        # СТРАНИЦА 4 — ИНФО
+        # СТРАНИЦА 4 — ПОЛНОЭКРАННЫЙ РЕЖИМ (FULLSCREEN)
+        # --------------------------------------------------------
+
+        pageFullscreen = QWidget()
+        fsLayout = QVBoxLayout(pageFullscreen)
+        fsLayout.setContentsMargins(0, 0, 0, 0)
+
+        scrollFS = QScrollArea(pageFullscreen)
+        scrollFS.setWidgetResizable(True)
+        innerFS = QWidget(scrollFS)
+        formFS = QVBoxLayout(innerFS)
+
+        # Начать перевод (FS)
+        topRowFS = QHBoxLayout()
+        self.btnStartFS = QPushButton("Начать полноэкранный перевод (BETA)")
+        self.btnStartFS.clicked.connect(self._start_fullscreen)
+        self.cbModeFS = QComboBox()
+        self.cbModeFS.addItems([
+            "SOLO (Все в одной модели)",
+            "DUAL (Две нейросети)",
+            "ONLINE (OCR + Google)"
+        ])
+        self.cbModeFS.currentIndexChanged.connect(self._reflow_mode_ui)
+
+        self.cbSourceLangFS = QComboBox()
+        self.cbSourceLangFS.addItem("English", "en")
+        self.cbSourceLangFS.addItem("Japanese", "ja")
+        self.cbSourceLangFS.addItem("Chinese", "ch_sim")
+        self.cbSourceLangFS.addItem("Korean", "ko")
+        self.cbSourceLangFS.setMinimumWidth(100)
+
+        topRowFS.addWidget(self.btnStartFS)
+        topRowFS.addSpacing(12)
+        topRowFS.addWidget(self.cbModeFS)
+        topRowFS.addSpacing(12)
+        topRowFS.addWidget(QLabel("Исходный язык:"))
+        topRowFS.addWidget(self.cbSourceLangFS)
+        topRowFS.addStretch()
+        formFS.addLayout(topRowFS)
+
+        # Тип текста (Game / Wiki)
+        self.cbTextTypeFS = QComboBox()
+        self.cbTextTypeFS.addItems(["Game Dialogue (Default)", "Wiki / Large Text"])
+        formFS.addWidget(QLabel("Тип текста:"))
+        formFS.addWidget(self.cbTextTypeFS)
+
+        # Окно для захвата
+        gbWinFS = QGroupBox("Окно для захвата")
+        lwFS = QHBoxLayout(gbWinFS)
+        self.cbWindowFS = QComboBox()
+        self.btnRefreshWinFS = QPushButton("Обновить список")
+        self.btnRefreshWinFS.clicked.connect(self._fill_windows)
+        lwFS.addWidget(QLabel("Окно:"))
+        lwFS.addWidget(self.cbWindowFS, 1)
+        lwFS.addWidget(self.btnRefreshWinFS)
+        formFS.addWidget(gbWinFS)
+
+        # Выбор модели
+        gbModelsFS = QGroupBox("Модели")
+        fmModelsFS = QFormLayout(gbModelsFS)
+
+        self.lblSoloModelFS   = QLabel("SOLO .gguf:")
+        self.lblSoloMmprojFS  = QLabel("SOLO mmproj:")
+        self.lblOcrModelFS    = QLabel("DUAL OCR .gguf:")
+        self.lblOcrMmprojFS   = QLabel("DUAL OCR mmproj:")
+        self.lblTrModelFS     = QLabel("DUAL TR .gguf:")
+
+        self.cbModelFS  = QComboBox()
+        self.cbMmprojFS = QComboBox()
+        self.cbModelOCR_FS  = QComboBox()
+        self.cbMmprojOCR_FS = QComboBox()
+        self.cbModelTR_FS   = QComboBox()
+
+        fmModelsFS.addRow(self.lblSoloModelFS,  self.cbModelFS)
+        fmModelsFS.addRow(self.lblSoloMmprojFS, self.cbMmprojFS)
+        fmModelsFS.addRow(self.lblOcrModelFS,   self.cbModelOCR_FS)
+        fmModelsFS.addRow(self.lblOcrMmprojFS,  self.cbMmprojOCR_FS)
+        fmModelsFS.addRow(self.lblTrModelFS,    self.cbModelTR_FS)
+
+        formFS.addWidget(gbModelsFS)
+        formFS.addStretch()
+
+        scrollFS.setWidget(innerFS)
+        fsLayout.addWidget(scrollFS)
+        self.stack.addWidget(pageFullscreen)
+
+        # --------------------------------------------------------
+        # СТРАНИЦА 5 — ИНФО
         # --------------------------------------------------------
 
         pageInfo = QWidget()
@@ -2670,7 +2951,7 @@ class ConfigWindow(QWidget):
         infoLabel.setOpenExternalLinks(True)
         infoLabel.setWordWrap(True)
         infoLabel.setText("АИ переводчик by IgoRexa. <br>"
-                            "Версия 1.0.0 <br>"
+                            "Версия 1.0.2 <br>"
                             "GitHub: "
                             "<a href='https://github.com/igorexa225/AIGameTranslater'>"
                             "https://github.com/igorexa225/AIGameTranslater"
@@ -2689,10 +2970,12 @@ class ConfigWindow(QWidget):
         self.btnNavCustomize.clicked.connect(lambda: self._switch_page(1))
         self.btnNavDownload.clicked.connect(lambda: self._switch_page(2))
         self.btnNavModel.clicked.connect(lambda: self._switch_page(3))
-        self.btnNavInfo.clicked.connect(lambda: self._switch_page(4))
+        self.btnNavFullscreen.clicked.connect(lambda: self._switch_page(4))
+        self.btnNavInfo.clicked.connect(lambda: self._switch_page(5))
         
         self.overlay = Overlay(on_quit=self._back_from_overlay, start_worker_immediately=False)
         self.overlay.show()
+        self.fs_overlay = None  # Для полноэкранного режима
         self.raise_()  # держим окно настроек сверху
 
         self._rescan_models()
@@ -2732,11 +3015,17 @@ class ConfigWindow(QWidget):
             getattr(self, "btnNavCustomize", None),
             getattr(self, "btnNavDownload", None),
             getattr(self, "btnNavModel", None),
+            getattr(self, "btnNavFullscreen", None),
             getattr(self, "btnNavInfo", None),
         ]
         for i, b in enumerate(btns):
             if b is not None:
                 b.setChecked(i == index)
+                
+        if index == 4:
+            if not getattr(self, "_fs_warning_shown", False):
+                QMessageBox.warning(self, "Внимание", "Полноэкранный режим всё еще в процессе разработки и может не работать должным образом.")
+                self._fs_warning_shown = True
     
     def _reflow_mode_ui(self, *_):
         """Управление видимостью настроек в зависимости от режима."""
@@ -2819,16 +3108,51 @@ class ConfigWindow(QWidget):
             self.cbMemory.setToolTip("В режиме ONLINE контекст и память недоступны (Google переводит фразы изолированно).")
         else:
             self.cbMemory.setToolTip("Сохранять историю диалога для улучшения перевода (кто говорит, пол персонажа).")
+
+        # === Вкладка "Полноэкранный режим" (Fullscreen) ===
+        if hasattr(self, "cbModeFS"):
+            mode_fs = self.cbModeFS.currentIndex()
+            is_solo_fs   = (mode_fs == 0)
+            is_dual_fs   = (mode_fs == 1)
+            is_online_fs = (mode_fs == 2)
+            needs_separate_ocr_fs = (is_dual_fs or is_online_fs)
+            needs_local_tr_fs = is_dual_fs
+
+            self.lblSoloModelFS.setVisible(is_solo_fs)
+            self.cbModelFS.setVisible(is_solo_fs)
+            self.lblSoloMmprojFS.setVisible(is_solo_fs)
+            self.cbMmprojFS.setVisible(is_solo_fs)
+
+            self.lblOcrModelFS.setVisible(needs_separate_ocr_fs)
+            self.cbModelOCR_FS.setVisible(needs_separate_ocr_fs)
+            self.lblOcrMmprojFS.setVisible(needs_separate_ocr_fs)
+            self.cbMmprojOCR_FS.setVisible(needs_separate_ocr_fs)
+
+            self.lblTrModelFS.setVisible(needs_local_tr_fs)
+            self.cbModelTR_FS.setVisible(needs_local_tr_fs)
     
     def _load_prefs_into_ui(self):
         p = _load_prefs()
         
+        def _set_combo(cb, text):
+            if cb is not None:
+                i = cb.findText(text)
+                if i >= 0: cb.setCurrentIndex(i)
+
         sl = p.get("source_lang", "en")
         idx = self.cbSourceLang.findData(sl)
         if idx >= 0:
             self.cbSourceLang.setCurrentIndex(idx)
+            if hasattr(self, "cbSourceLangFS"): self.cbSourceLangFS.setCurrentIndex(idx)
         else:
             self.cbSourceLang.setCurrentIndex(0) # En по умолчанию
+            if hasattr(self, "cbSourceLangFS"): self.cbSourceLangFS.setCurrentIndex(0)
+            
+        # Text Type
+        tt = p.get("text_type_mode", "game")
+        self.cbTextType.setCurrentIndex(1 if tt == "wiki" else 0)
+        if hasattr(self, "cbTextTypeFS"):
+            self.cbTextTypeFS.setCurrentIndex(1 if tt == "wiki" else 0)
         
         # Логика миграции со старого конфига
         old_dual = bool(p.get("dual_enabled", False))
@@ -2836,9 +3160,11 @@ class ConfigWindow(QWidget):
 
         if saved_mode is not None:
             self.cbMode.setCurrentIndex(int(saved_mode))
+            if hasattr(self, "cbModeFS"): self.cbModeFS.setCurrentIndex(int(saved_mode))
         else:
             # Если параметра нет, конвертируем старый флаг dual
             self.cbMode.setCurrentIndex(1 if old_dual else 0)
+            if hasattr(self, "cbModeFS"): self.cbModeFS.setCurrentIndex(1 if old_dual else 0)
         # шрифт
         fam = p.get("font_family")
         if fam:
@@ -2851,10 +3177,12 @@ class ConfigWindow(QWidget):
         if model:
             i = self.cbModel.findText(model)
             if i >= 0: self.cbModel.setCurrentIndex(i)
+            if hasattr(self, "cbModelFS"): _set_combo(self.cbModelFS, model)
         mmproj = p.get("mmproj_path", "")
         if mmproj:
             i = self.cbMmproj.findText(mmproj)
             if i >= 0: self.cbMmproj.setCurrentIndex(i)
+            if hasattr(self, "cbMmprojFS"): _set_combo(self.cbMmprojFS, mmproj)
         # лор
         if "lore_path" in p:
             self.edLore.setText(p["lore_path"])
@@ -2863,7 +3191,7 @@ class ConfigWindow(QWidget):
         if "phrasebook_path" in p:
             self.edPB.setText(p["phrasebook_path"])
         # LLM
-        self.spMaxTok.setValue(int(p.get("max_tokens", 15000)))
+        self.spMaxTok.setValue(int(p.get("max_tokens", 1024)))
         self.spTO.setValue(float(p.get("timeout_s", 30.0)))
         self.spTemp.setValue(float(p.get("temp", 0.2)))
         self.spTopP.setValue(float(p.get("top_p", 0.9)))
@@ -2873,32 +3201,34 @@ class ConfigWindow(QWidget):
         self.spSlot.setValue(int(p.get("slot_id", 0)))
         self.cbCache.setChecked(bool(p.get("use_prompt_cache", True)))
 
-        self.spCtx.setValue(int(p.get("ctx", 15000)))
+        self.spCtx.setValue(int(p.get("ctx", 4096)))
         self.spBatch.setValue(int(p.get("batch", 256)))
         self.spUBatch.setValue(int(p.get("ubatch", 64)))
         self.spPar.setValue(int(p.get("parallel", 1)))
         self.spNGL.setValue(int(p.get("ngl", 999)))
         self.cbFlashAttn.setChecked(bool(p.get("use_flash_attn", False)))
-        ctype = p.get("cache_type_k", "q8_0") # q8_0 по умолчанию
+        ctype = p.get("cache_type_k", "q4_0") # q4_0 по умолчанию для легкого пресета
         idx = self.cbCacheType.findData(ctype)
         if idx >= 0:
             self.cbCacheType.setCurrentIndex(idx)
         else:
-            self.cbCacheType.setCurrentIndex(0) # q8_0
+            self.cbCacheType.setCurrentIndex(1) # q4_0
         self.edHost.setText(p.get("host", "127.0.0.1"))
         try: self.spPort.setValue(int(p.get("port", 8080)))
         except Exception: pass
         # OCR
         if (m := p.get("dual_ocr_model","")):
             i=self.cbModelOCR.findText(m);    self.cbModelOCR.setCurrentIndex(max(i,0))
+            if hasattr(self, "cbModelOCR_FS"): _set_combo(self.cbModelOCR_FS, m)
         if (mm := p.get("dual_ocr_mmproj","")):
             i=self.cbMmprojOCR.findText(mm);  self.cbMmprojOCR.setCurrentIndex(max(i,0))
+            if hasattr(self, "cbMmprojOCR_FS"): _set_combo(self.cbMmprojOCR_FS, mm)
         self.edHost1.setText(p.get("dual_ocr_host","127.0.0.1"))
         try: self.spPort1.setValue(int(p.get("dual_ocr_port",8080)))
         except: pass
         try: self.spMaxTok1.setValue(int(p.get("dual_ocr_max_tokens", 512)))
         except: pass
-        self.spCtx1.setValue(int(p.get("dual_ocr_ctx",8192)))
+        self.spCtx1.setValue(int(p.get("dual_ocr_ctx",4096)))
         self.spBatch1.setValue(int(p.get("dual_ocr_batch",256)))
         self.spUB1.setValue(int(p.get("dual_ocr_ubatch",64)))
         self.spPar1.setValue(int(p.get("dual_ocr_parallel",1)))
@@ -2909,12 +3239,13 @@ class ConfigWindow(QWidget):
         # TR
         if (m := p.get("dual_tr_model","")):
             i=self.cbModelTR.findText(m);     self.cbModelTR.setCurrentIndex(max(i,0))
+            if hasattr(self, "cbModelTR_FS"): _set_combo(self.cbModelTR_FS, m)
         self.edHost2.setText(p.get("dual_tr_host","127.0.0.1"))
         try: self.spPort2.setValue(int(p.get("dual_tr_port",8081)))  
         except: pass
         try: self.spMaxTok2.setValue(int(p.get("dual_tr_max_tokens", 1024)))
         except: pass
-        self.spCtx2.setValue(int(p.get("dual_tr_ctx",6000)))
+        self.spCtx2.setValue(int(p.get("dual_tr_ctx",4096)))
         self.spBatch2.setValue(int(p.get("dual_tr_batch",256)))
         self.spUB2.setValue(int(p.get("dual_tr_ubatch",64)))
         self.spPar2.setValue(int(p.get("dual_tr_parallel",1)))
@@ -2930,6 +3261,7 @@ class ConfigWindow(QWidget):
         # константы
         self.spFps.setValue(float(p.get("fps", 1.0)))
         self.spCanonHits.setValue(int(p.get("en_canon_hits", 2)))
+        self.cbSmartNameRemoval.setChecked(bool(p.get("smart_name_removal", True)))
         self.cbSmooth.setChecked(p.get("render_mode", "smooth") == "smooth")
         self.cbOverlayBoxes.setChecked(bool(p.get("draw_over_original", False)))
         
@@ -2998,6 +3330,7 @@ class ConfigWindow(QWidget):
         if want:
             i = self.cbWindow.findText(want)
             if i >= 0: self.cbWindow.setCurrentIndex(i)
+            if hasattr(self, "cbWindowFS"): _set_combo(self.cbWindowFS, want)
         # system override (если был сохранён)
         sys_ovr = p.get("system_override")
         if sys_ovr:
@@ -3063,6 +3396,7 @@ class ConfigWindow(QWidget):
         prefs = {
             "font_family": self.fontFamily.currentFont().family(),
             "source_lang": self.cbSourceLang.currentData(),
+            "text_type_mode": "wiki" if self.cbTextType.currentIndex() == 1 else "game",
             "font_size": int(self.fontSize.value()),
             "font_bold": bool(self.fontBold.isChecked()),
             "model_path": self.cbModel.currentText().strip(),
@@ -3075,6 +3409,7 @@ class ConfigWindow(QWidget):
             "top_p": float(self.spTopP.value()),
             "fps": float(self.spFps.value()),
             "en_canon_hits": int(self.spCanonHits.value()),
+            "smart_name_removal": bool(self.cbSmartNameRemoval.isChecked()),
             "border_w": int(self.spBorder.value()),
             "split_border_w": int(self.spSplit.value()),
             "render_mode": "smooth" if self.cbSmooth.isChecked() else "instant",
@@ -3167,11 +3502,15 @@ class ConfigWindow(QWidget):
 
     def _fill_windows(self):
         self.cbWindow.clear(); self._hwnd_map = {}
+        if hasattr(self, "cbWindowFS"):
+            self.cbWindowFS.clear()
         try:
             wins = list_user_windows()
             for title, cls, pid, hwnd in wins:
                 text=f"{title}  (PID {pid}, {cls})"
                 self.cbWindow.addItem(text)
+                if hasattr(self, "cbWindowFS"):
+                    self.cbWindowFS.addItem(text)
                 self._hwnd_map[text]=hwnd
         except Exception as e:
             QMessageBox.warning(self,"Список окон",f"Ошибка: {e}")
@@ -3180,11 +3519,14 @@ class ConfigWindow(QWidget):
         self.cbModel.clear(); self.cbMmproj.clear()
         roots = [BASE_DIR/"models"/"lmm", BASE_DIR/"models"/"llm"]
         models, projs = scan_gguf(roots)
-        for p in models: self.cbModel.addItem(p)
-        for p in projs:  self.cbMmproj.addItem(p)
-        for p in models: self.cbModelOCR.addItem(p)
-        for p in projs:  self.cbMmprojOCR.addItem(p)
-        for p in models: self.cbModelTR.addItem(p)
+        for p in models:
+            self.cbModel.addItem(p); self.cbModelOCR.addItem(p); self.cbModelTR.addItem(p)
+            if hasattr(self, "cbModelFS"):
+                self.cbModelFS.addItem(p); self.cbModelOCR_FS.addItem(p); self.cbModelTR_FS.addItem(p)
+        for p in projs:
+            self.cbMmproj.addItem(p);  self.cbMmprojOCR.addItem(p)
+            if hasattr(self, "cbMmprojFS"):
+                self.cbMmprojFS.addItem(p); self.cbMmprojOCR_FS.addItem(p)
 
     def _browse_lore(self):
         path,_ = QFileDialog.getOpenFileName(self,"Выберите файл лора", str(BASE_DIR), "Text (*.txt);;All (*.*)")
@@ -3321,6 +3663,7 @@ class ConfigWindow(QWidget):
         llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
         llm_cfg.source_lang    = self.cbSourceLang.currentData()
         self.overlay.source_lang = self.cbSourceLang.currentData()
+        llm_cfg.mode = "wiki" if self.cbTextType.currentIndex() == 1 else "game"
         print(f"[START] Source Language: {self.overlay.source_lang}")
         mode_idx = self.cbMode.currentIndex()
 
@@ -3345,6 +3688,7 @@ class ConfigWindow(QWidget):
         self.overlay.border_w = int(self.spBorder.value())
         self.overlay.split_border_w = int(self.spSplit.value())
         self.overlay.en_canon_hits = int(self.spCanonHits.value())
+        self.overlay.smart_name_removal = bool(self.cbSmartNameRemoval.isChecked())
         self.overlay.draw_over_original = bool(self.cbOverlayBoxes.isChecked())
 
         # применим лор
@@ -3478,6 +3822,7 @@ class ConfigWindow(QWidget):
                 slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
                 system_override=(getattr(self,"_ocr_prompt_override","") or None),
                 source_lang=self.overlay.source_lang,
+                mode=llm_cfg.mode,
             )
             self.overlay.tr_cfg_dual = LLMConfigDual(
                 server=f"http://{host2}:{port2}",
@@ -3492,7 +3837,15 @@ class ConfigWindow(QWidget):
                 phrasebook_path=llm_cfg.phrasebook_path,
                 source_lang=self.overlay.source_lang,
                 use_prompt_cache=bool(self.cbCache.isChecked()),
+                mode=llm_cfg.mode,
             )
+            
+            # Preload LORE for splitter
+            try:
+                from llm_adapter_dual import _ensure_tr_system
+                _ensure_tr_system(self.overlay.tr_cfg_dual)
+            except Exception as e:
+                print("[UI] Failed to preload LORE for splitter:", e)
             # ============================
             
             self.overlay.dual_mode = True
@@ -3527,10 +3880,22 @@ class ConfigWindow(QWidget):
                 max_tokens=int(self.spMaxTok1.value()),
                 slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
                 system_override=(getattr(self,"_ocr_prompt_override","") or None),
+                mode=llm_cfg.mode,
             )
             # Конфиг TR ставим None, чтобы воркер понимал, что локального перевода нет
             self.overlay.tr_cfg_dual = None 
             self.overlay.dual_mode = True # Технически это dual (разные этапы), но флаг work_mode_idx главнее
+            
+            # Preload LORE for splitter (Online mode)
+            try:
+                from llm_adapter_dual import _ensure_tr_system
+                dummy_cfg = LLMConfigDual(
+                    lore_path=llm_cfg.lore_path,
+                    phrasebook_path=llm_cfg.phrasebook_path
+                )
+                _ensure_tr_system(dummy_cfg)
+            except Exception as e:
+                print("[UI] Failed to preload LORE for Online splitter:", e)
 
             # Прогрев только OCR
             try: preload_prompt_cache_ocr(self.overlay.ocr_cfg_dual)
@@ -3568,12 +3933,180 @@ class ConfigWindow(QWidget):
             print("[UI] overlay.stop_worker on close error:", ex)
 
         try:
+            if getattr(self, "fs_overlay", None) is not None:
+                self.fs_overlay.stop_worker()
+                self.fs_overlay.close()
+        except Exception: pass
+
+        try:
             stop_all_llama_servers()
         except Exception as ex:
             print("[UI] stop_all_llama_servers on close error:", ex)
 
         super().closeEvent(e)
 
+
+    def _start_fullscreen(self):
+        """Запуск полноэкранного режима (плагин)."""
+        
+        # Синхронизируем настройки из вкладки Fullscreen в основную, чтобы они правильно сохранились и использовались
+        self.cbMode.setCurrentIndex(self.cbModeFS.currentIndex())
+        idx_lang = self.cbSourceLang.findData(self.cbSourceLangFS.currentData())
+        if idx_lang >= 0: self.cbSourceLang.setCurrentIndex(idx_lang)
+        self.cbTextType.setCurrentIndex(self.cbTextTypeFS.currentIndex())
+
+        def _sync_cb(main_cb, fs_cb):
+            i = main_cb.findText(fs_cb.currentText())
+            if i >= 0: main_cb.setCurrentIndex(i)
+
+        _sync_cb(self.cbWindow, self.cbWindowFS)
+        _sync_cb(self.cbModel, self.cbModelFS)
+        _sync_cb(self.cbMmproj, self.cbMmprojFS)
+        _sync_cb(self.cbModelOCR, self.cbModelOCR_FS)
+        _sync_cb(self.cbMmprojOCR, self.cbMmprojOCR_FS)
+        _sync_cb(self.cbModelTR, self.cbModelTR_FS)
+
+        # 1. Применяем настройки (аналогично _start)
+        global MAX_OCR_FPS, RENDER_MODE, HANDLE, SERVER_EXE, DRAW_OVER_ORIGINAL, PANEL_BG_MODE, PANEL_BG_ALPHA
+        
+        sel = self.cbWindow.currentText(); hwnd = getattr(self, "_hwnd_map", {}).get(sel)
+
+        llm_cfg.max_tokens = int(self.spMaxTok.value())
+        llm_cfg.timeout_s  = float(self.spTO.value())
+        llm_cfg.temp       = float(self.spTemp.value())
+        llm_cfg.top_p      = float(self.spTopP.value())
+        llm_cfg.top_k          = int(self.spTopK.value())
+        llm_cfg.repeat_penalty = float(self.spRP.value())
+        llm_cfg.seed           = int(self.spSeed.value())
+        llm_cfg.slot_id        = int(self.spSlot.value())
+        llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        llm_cfg.source_lang    = self.cbSourceLang.currentData()
+        llm_cfg.mode = "wiki" if self.cbTextType.currentIndex() == 1 else "game"
+        # Отключаем разделение имен, если галочка снята (для UI это критично)
+        llm_cfg.disable_name_split = not self.cbSmartNameRemoval.isChecked()
+        
+        mode_idx = self.cbMode.currentIndex()
+        
+        # Глобальные настройки (хотя fullscreen может их не использовать напрямую, но серверы используют)
+        global HIDE_CONSOLE
+        HIDE_CONSOLE = self.cbHideConsole.isChecked()
+        _toggle_console(HIDE_CONSOLE)
+
+        # Лор
+        lore_path = (self.edLore.text() or "").strip()
+        if lore_path and not os.path.isabs(lore_path):
+            lore_path = str((BASE_DIR / lore_path).resolve())
+        llm_cfg.lore_path = lore_path
+        
+        pb_path = (self.edPB.text() or "").strip()
+        if pb_path and not os.path.isabs(pb_path):
+            pb_path = str((BASE_DIR / pb_path).resolve())
+        llm_cfg.phrasebook_path = pb_path
+        
+        reset_lore_cache()
+        
+        host = (self.edHost.text() or "127.0.0.1").strip()
+        port = int(self.spPort.value())
+        llm_cfg.server = f"http://{host}:{port}"
+
+        # 2. Запуск серверов (копируем логику _start)
+        if SERVER_EXE is None:
+            QMessageBox.critical(self, "Error", "llama-server.exe not found")
+            return
+
+        sel_cache = self.cbCacheType.currentData() or "q8_0"
+        use_fa = getattr(self, "cbFlashAttn", None) and self.cbFlashAttn.isChecked()
+        
+        _stop_llama_server()
+        _stop_llama_server2()
+
+        # Инициализация оверлея
+        if self.fs_overlay is None:
+            self.fs_overlay = fullscreen_overlay.FullscreenOverlay(on_quit=self._back_from_overlay)
+
+        # Передача настроек в оверлей
+        self.fs_overlay.llm_cfg = llm_cfg
+        self.fs_overlay.source_lang = self.cbSourceLang.currentData()
+        self.fs_overlay.work_mode_idx = mode_idx
+        self.fs_overlay.capture_fps = float(self.spFps.value()) # Передаем FPS
+        if hwnd: self.fs_overlay.bound_hwnd = hwnd
+
+        # Визуал
+        self.fs_overlay.font_family = self.fontFamily.currentFont().family()
+        self.fs_overlay.font_size = int(self.fontSize.value())
+        self.fs_overlay.font_bold = bool(self.fontBold.isChecked())
+        self.fs_overlay.bg_mode = self.cbBgMode.currentData()
+        # Конвертация 1..10 -> 0..255
+        alpha_val = int(round(max(1, min(10, self.spBgAlpha.value())) / 10.0 * 255))
+        self.fs_overlay.bg_alpha = alpha_val
+        
+        self.fs_overlay.box_bg_mode = self.cbBoxBgMode.currentData()
+        alpha_box = int(round(max(1, min(10, self.spBoxBgAlpha.value())) / 10.0 * 255))
+        self.fs_overlay.box_bg_alpha = alpha_box
+
+        # Запуск серверов в зависимости от режима
+        if mode_idx == 0: # SOLO
+            model_path  = self.cbModel.currentText().strip()
+            mmproj_path = self.cbMmproj.currentText().strip()
+            cmd = rebuild_server_cmd(SERVER_EXE, model_path, mmproj_path, host=host, port=port,
+                ctx=int(self.spCtx.value()), batch=int(self.spBatch.value()), ubatch=int(self.spUBatch.value()),
+                parallel=int(self.spPar.value()), ngl=int(self.spNGL.value()), use_fa=use_fa, cache_type=sel_cache)
+            _ensure_llama_server(cmd, llm_cfg.server)
+            try: preload_prompt_cache(llm_cfg)
+            except: pass
+            
+        elif mode_idx == 1: # DUAL
+            host1, port1 = (self.edHost1.text() or "127.0.0.1").strip(), int(self.spPort1.value())
+            host2, port2 = (self.edHost2.text() or "127.0.0.1").strip(), int(self.spPort2.value())
+            ocr_model, ocr_mmproj = self.cbModelOCR.currentText().strip(), self.cbMmprojOCR.currentText().strip()
+            tr_model = self.cbModelTR.currentText().strip()
+
+            cmd1 = rebuild_server_cmd(SERVER_EXE, ocr_model, ocr_mmproj, host=host1, port=port1,
+                ctx=int(self.spCtx1.value()), batch=int(self.spBatch1.value()), ubatch=int(self.spUB1.value()),
+                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), use_fa=use_fa, cache_type=sel_cache)
+            cmd2 = rebuild_server_cmd(SERVER_EXE, tr_model, "", host=host2, port=port2,
+                ctx=int(self.spCtx2.value()), batch=int(self.spBatch2.value()), ubatch=int(self.spUB2.value()),
+                parallel=int(self.spPar2.value()), ngl=int(self.spNGL2.value()), use_fa=use_fa, cache_type=sel_cache)
+            
+            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
+            _ensure_llama_server2(cmd2, f"http://{host2}:{port2}")
+
+            self.fs_overlay.ocr_cfg_dual = LLMConfigDual(server=f"http://{host1}:{port1}", model=ocr_model,
+                timeout_s=float(self.spTO.value()), max_tokens=int(self.spMaxTok1.value()), slot_id=int(self.spSlot1.value()),
+                system_override=(getattr(self,"_ocr_prompt_override","") or None), source_lang=self.fs_overlay.source_lang, mode=llm_cfg.mode,
+                disable_name_split=llm_cfg.disable_name_split)
+            self.fs_overlay.tr_cfg_dual = LLMConfigDual(server=f"http://{host2}:{port2}", model=tr_model,
+                timeout_s=float(self.spTO2.value()), max_tokens=int(self.spMaxTok2.value()), slot_id=int(self.spSlot2.value()),
+                temp=float(self.spTemp2.value()), top_p=float(self.spTopP2.value()), system_override=(getattr(self,"_tr_prompt_override","") or None),
+                lore_path=llm_cfg.lore_path, phrasebook_path=llm_cfg.phrasebook_path, source_lang=self.fs_overlay.source_lang, mode=llm_cfg.mode,
+                disable_name_split=llm_cfg.disable_name_split)
+
+        elif mode_idx == 2: # ONLINE
+            host1, port1 = (self.edHost1.text() or "127.0.0.1").strip(), int(self.spPort1.value())
+            ocr_model, ocr_mmproj = self.cbModelOCR.currentText().strip(), self.cbMmprojOCR.currentText().strip()
+            
+            cmd1 = rebuild_server_cmd(SERVER_EXE, ocr_model, ocr_mmproj, host=host1, port=port1,
+                ctx=int(self.spCtx1.value()), batch=int(self.spBatch1.value()), ubatch=int(self.spUB1.value()),
+                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), cache_type=sel_cache)
+            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
+
+            self.fs_overlay.ocr_cfg_dual = LLMConfigDual(server=f"http://{host1}:{port1}", model=ocr_model,
+                timeout_s=float(self.spTO.value()), max_tokens=int(self.spMaxTok1.value()), slot_id=int(self.spSlot1.value()),
+                system_override=(getattr(self,"_ocr_prompt_override","") or None), mode=llm_cfg.mode,
+                disable_name_split=llm_cfg.disable_name_split)
+            self.fs_overlay.tr_cfg_dual = None
+
+        # 1. Сначала скрываем обычный оверлей, чтобы он ОСВОБОДИЛ хоткеи (Ctrl+Alt+Q)
+        if self.overlay:
+            self.overlay.close()
+
+        # 2. Теперь запускаем полноэкранный режим (он успешно займет хоткеи)
+        self.fs_overlay.show()
+        self.fs_overlay.start_worker()
+        
+        self.hide()
+        try: _save_prefs(self._collect_prefs())
+        except: pass
 
 # ========================= main ==========================
 
