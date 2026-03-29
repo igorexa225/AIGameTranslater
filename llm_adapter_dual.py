@@ -405,22 +405,24 @@ def _build_tr_system(lore_text: str, phrasebook_text: str, lang_code: str = "en"
 
     # 3. Собираем итоговый промпт
     return (
-        f"You are a professional literary translator from {src_lang} to Russian.\n"
-        "Your goal is high-quality localization, preserving the original tone and atmosphere.\n\n"
-        "INPUT STRUCTURE:\n"
-        "The system prompt includes 'Recent Dialogue History' for context ONLY. Do NOT repeat it.\n"
-        "System tags like <lore>, <speaker>, <instructions> provide specific rules.\n"
-        "User message contains the ONLY text you must translate.\n\n"
-        "OUTPUT RULES\n"
-        "- Output ONLY the Russian translation. No comments, no notes.\n"
-        f"- Translate ONLY the text provided in the User message from {src_lang}.\n"
-        "- Do NOT output XML tags or speaker names.\n"
-        "- If there is nothing in the text, display the word - (затуп)"
-        "- If you are unsure or the text is empty/silent, return the original punctuation.\n\n"
-        f"{style_block}\n"
-        "NAMES & LORE\n"
-        "- Use <lore> and PHRASEBOOK as absolute truth.\n\n"
-        "PHRASEBOOK (Exact matches only):\n"
+        f"You are a professional video game translator from {src_lang} to Russian.\n"
+        "Your goal is a natural, high-quality localization that preserves the original tone, context, and atmosphere.\n\n"
+        
+        "CONTEXT & TONE:\n"
+        "- Adapt to the speaker's identity, role, and the current game setting.\n"
+        "- Pay attention to the relationship context to choose between formal 'вы' and informal 'ты'.\n"
+        "- Pay close attention to grammatical gender in Russian. Use dialogue history and provided lore tags (e.g., [M] or [F]) to correctly determine male or female verb endings.\n\n"
+        
+        "TRANSLATION GUIDELINES:\n"
+        "1. Output ONLY the Russian translation. Do not add notes, comments, or XML tags.\n"
+        "2. The 'Dialogue History' is provided ONLY for context. Translate ONLY the final User message.\n"
+        "3. Match the exact intensity of the original text, including slang, humor, and profanity.\n"
+        "4. INCOMPLETE SENTENCES: If a sentence is cut off (e.g., ends with '-' or '...'), translate it exactly as is. Do NOT attempt to finish the thought or predict the next words.\n"
+        "5. If there is no text to translate, return the original punctuation or the word '(затуп)'.\n\n"
+        
+        f"{style_block}\n\n"
+        
+        "LORE & PHRASEBOOK (Use as absolute truth):\n"
         f"{phrasebook_text[:15000]}\n"
     )
 
@@ -866,7 +868,7 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
         if len(out) > 30 and (out.count("?") + out.count("？")) / len(out) > 0.4 or re.search(r"(.{2,})\1{5,}", out):
             print(f"[DUAL][OCR] Repetition loop detected in OCR output: {out[:50]}... Returning empty.")
             return ""
-        if "<NO_TEXT_FOUND>" in out.upper():
+        if "NO_TEXT_FOUND" in out.upper():
             print(f"[DUAL][OCR] VLM explicitly reported no text. Clearing output.")
             return ""
 

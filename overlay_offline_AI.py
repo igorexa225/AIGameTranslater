@@ -277,6 +277,19 @@ def safe_split_name_and_body(en_full: str, lang: str = "en") -> tuple[str|None, 
         
         # Если сплиттер выкинул значимую часть текста (потеряно больше 4 букв)
         if en_chars > (nm_chars + bd_chars + 4):
+            # Попытка спасти ситуацию: если имя определено, а тело потерялось,
+            # попробуем вырезать имя из исходного текста
+            if nm:
+                idx = en_full.find(nm)
+                if idx != -1:
+                    rescued_bd = en_full[idx + len(nm):].strip()
+                    # Убираем возможные разделители после имени (двоеточия, тире, переносы)
+                    rescued_bd = re.sub(r"^[:\-\n\s]+", "", rescued_bd).strip()
+                    rescued_bd_chars = len(re.sub(r"[^\w]", "", rescued_bd))
+                    if en_chars <= (nm_chars + rescued_bd_chars + 4):
+                        print(f"[SPLITTER-FIX] Rescued bad split. Nm='{nm}', Bd='{rescued_bd}'")
+                        return nm, rescued_bd
+
             print(f"[SPLITTER-FIX] Rejected bad split. Full='{en_full}', Nm='{nm}', Bd='{bd}'")
             return None, en_full
             
@@ -435,26 +448,54 @@ def _filter_boxes_by_llm_text(
         is_top_row = (r_idx == 0)
         for b_idx, box in enumerate(row):
             txt = box[4]
+            # Фильтр мусорных боксов.
+            # Если в боксе нет ни одной буквы или цифры, это мусор (например, "|||").
+            if not re.search(r'[a-zA-Zа-яА-Я0-9]', txt):
+                print(f"[BOX-DBG] Filtering out pure symbol box: '{txt}'")
+                continue
+
             t_c = _norm(txt)
             
             is_name_box = False
             # 1. Проверка на ИМЯ (Name)
-            if name_c:
+            if name_line:
+                # Прямое совпадение сырого текста (полезно для мусора вроде "||...")
+                txt_s = txt.strip()
+                if txt_s and txt_s in name_line:
+                    if is_top_row or len(txt_s) > 2:
+                        is_name_box = True
+
+            if name_c and not is_name_box:
                 ratio_name = SequenceMatcher(None, t_c, name_c).ratio()
-                    # Смягченный порог для имени, чтобы прощать ошибки EasyOCR
-                if ratio_name > 0.55 or (t_c and t_c in name_c and len(t_c) >= 2) or (name_c in t_c and len(name_c) >= 2):
+                # Умный порог: для коротких имен (Taki) требуем больше совпадений, чтобы не "съедало" слова вроде Thank
+                threshold = 0.6 if len(name_c) >= 6 else 0.75
+                if ratio_name > threshold or (t_c and t_c in name_c and len(t_c) >= 2) or (name_c in t_c and len(name_c) >= 2):
                     is_name_box = True
                 elif _RE_MYSTERY.fullmatch(txt) and _RE_MYSTERY.fullmatch(name_line or ""):
                     is_name_box = True
 
-                # Структурная эвристика: если это первая строка, LLM нашел имя, 
-                # а текст бокса короткий и не совпадает с телом диалога — это испорченный неймплейт
-                if is_top_row and name_line and not is_name_box:
+            # Структурные эвристики (работают независимо от того, нашла ли LLM имя!)
+            if is_top_row and not is_name_box:
+                # Эвристика 1: Испорченный неймплейт (когда LLM нашла имя, но текст бокса не совпал с body)
+                if name_line:
                     if len(txt.split()) <= 4:
                         s_check = SequenceMatcher(None, t_c, body_c)
                         m_check = s_check.find_longest_match(0, len(t_c), 0, len(body_c))
                         if m_check.size < len(t_c) * 0.4 and t_c not in body_c:
                             is_name_box = True
+                            
+                # Эвристика №2: LLM вообще не нашел имя (например, нет двоеточия), 
+                # но физически бокс выглядит как классический неймплейт:
+                # первая строка, стоит один, 1-3 слова с заглавной буквы, без пунктуации.
+                if not is_name_box and not name_line and len(row) == 1 and len(rows) > 1:
+                    txt_core = re.sub(r"^[.…\s\|]+", "", txt).strip()
+                    if txt_core:
+                        tokens = txt_core.split()
+                        if 1 <= len(tokens) <= 3 and not re.search(r"[.,!?;:]", txt_core):
+                            if all(t[0].isupper() or t[0].isdigit() for t in tokens if t):
+                                if len(body_c) > len(t_c) + 3:
+                                    print(f"[BOX-DBG] LLM missed name. Structurally '{txt}' is a nameplate.")
+                                    is_name_box = True
 
             if is_name_box:
                 print(f"[BOX-DBG] Skipping name box: '{txt}'")
@@ -464,14 +505,16 @@ def _filter_boxes_by_llm_text(
             # 2. Проверка на ТЕКСТ (Body)
             matched_chars = 0
             total_chars = len(t_c)
+            keep_box = False # По умолчанию считаем, что бокс невалиден
             
             # Если в боксе только знаки препинания (...)
             if not t_c:
-                if re.search(r"[.…?!]+", txt):
-                    raw_body_text = body if body else en_full
-                    if raw_body_text and re.search(r"[.…?!]+", raw_body_text):
+                raw_body_text = body if body else en_full
+                if raw_body_text:
+                    box_punct = re.sub(r"[^\.…?!]", "", txt)
+                    if box_punct and box_punct in raw_body_text:
                         matched_chars = len(txt.strip())
-                        total_chars = matched_chars
+                        total_chars = matched_chars # Для этого случая считаем совпадение 100%
             else:
                 # Если текст бокса есть в ответе LLM
                 if t_c in body_c or body_c in t_c:
@@ -483,12 +526,29 @@ def _filter_boxes_by_llm_text(
                     if m.size > len(t_c) * 0.4:
                         matched_chars = m.size
             
-            keep_box = (matched_chars > 0)
+            # Более строгая логика для коротких боксов, чтобы отсечь шум типа "I..."
             if total_chars > 0:
-                if matched_chars / total_chars > 0.35:
+                ratio = matched_chars / total_chars
+                # Для длинных боксов достаточно совпадения > 40%
+                if ratio > 0.4:
                     keep_box = True
-                elif total_chars < 4 and matched_chars > 0:
+                # Для коротких (1-3 символа) требуем почти идеального совпадения
+                elif total_chars < 4 and ratio > 0.8:
                     keep_box = True
+
+            # --- АНТИ-ФАНТОМ (Убийца мусорных боксов возле имени) ---
+            # Если бокс выжил, но находится на первой строке (рядом с именем) и LLM нашла имя:
+            if keep_box and is_top_row and name_line and not is_name_box:
+                if not t_c:
+                    print(f"[BOX-DBG] Phantom box killer: dropping pure symbol box '{txt}' on name row.")
+                    keep_box = False
+                elif len(t_c) < 4:
+                    if len(t_c) <= len(txt.strip()) / 2.0:
+                        print(f"[BOX-DBG] Phantom box killer: dropping mostly-symbol garbage '{txt}' on name row.")
+                        keep_box = False
+                    elif len(t_c) == 1:
+                        print(f"[BOX-DBG] Phantom box killer: dropping single-letter garbage '{txt}' on name row.")
+                        keep_box = False
             
             if keep_box:
                 boxes_to_keep_in_row.append(box)
