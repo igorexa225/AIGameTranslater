@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QDialog,
     QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox,
     QFontComboBox, QFileDialog, QPlainTextEdit, QHBoxLayout, QVBoxLayout, QFormLayout,
     QGroupBox, QScrollArea, QTreeWidget, QTreeWidgetItem, QProgressBar, QHeaderView,
-    QSlider, QStackedWidget, QToolButton, QFrame)
+    QSlider, QStackedWidget, QToolButton, QFrame, QKeySequenceEdit)
 
 import win32con, win32gui, win32ui, win32api, win32process
 import ctypes.wintypes as wt
@@ -26,22 +26,97 @@ _RE_MYSTERY = re.compile(r"[?？]+")
 try:
     import easyocr
     _EASYOCR_AVAILABLE = True
-except Exception:
+    _EASYOCR_IMPORT_ERROR = ""
+except Exception as _e:
+    # Раньше здесь молча стоял pass, и в собранной версии всё, что можно было
+    # узнать, — «not available». Причину видно только тут: в бандле может не
+    # хватать модуля, который PyInstaller не нашёл по статическому анализу.
+    import traceback as _tb
     easyocr = None
     _EASYOCR_AVAILABLE = False
+    _EASYOCR_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+    print("[OCR-BOXES] easyocr не импортировался:", _EASYOCR_IMPORT_ERROR)
+    print(_tb.format_exc())
 
 _easyocr_reader = None
 _current_ocr_lang = None
+_current_ocr_gpu = None   # на чём поднят текущий ридер (для перезагрузки при смене настройки)
+
+# Где считать EasyOCR: True | False | "auto" (авто = на GPU, если он есть).
+# Задаётся ключом easyocr_gpu в config/ui_prefs.json.
+EASYOCR_GPU = "auto"
+
+
+def _warmup_easyocr(reader, on_gpu: bool) -> None:
+    """
+    Первый вызов readtext всегда дорогой (ленивая инициализация ядер и автотюнинг
+    под форму входа): 320 мс против 66 мс на последующих. Съедаем этот штраф здесь,
+    на старте, а не на первом кадре с диалогом.
+    """
+    if reader is None:
+        return
+    try:
+        img = np.zeros((220, 900, 3), np.uint8)
+        cv2.putText(img, "Dobermann", (40, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(img, "the quick brown fox jumps over the lazy dog 0123", (40, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        t0 = time.perf_counter()
+        reader.readtext(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), detail=1, paragraph=False)
+        print(f"[OCR-BOXES] warmup {(time.perf_counter()-t0)*1000:.0f} ms "
+              f"({'GPU' if on_gpu else 'CPU'})")
+    except Exception as e:
+        print("[OCR-BOXES] warmup skipped:", e)
+
+
+_GPU_REASON_LOGGED = False
+
+
+def _resolve_easyocr_gpu() -> bool:
+    """Решаем, поднимать EasyOCR на GPU или на CPU."""
+    global _GPU_REASON_LOGGED
+    if EASYOCR_GPU is True or str(EASYOCR_GPU).lower() == "true":
+        return True
+    if EASYOCR_GPU is False or str(EASYOCR_GPU).lower() == "false":
+        return False
+    # Функция зовётся на каждом кадре (через get_easyocr_reader), поэтому
+    # объяснение выбора печатаем ровно один раз за сессию.
+    say = not _GPU_REASON_LOGGED
+    _GPU_REASON_LOGGED = True
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+            # ~290 МиБ нужно самому EasyOCR, ниже 700 свободных не лезем —
+            # на слабой карте место важнее для модели в llama-server.
+            if free_mb >= 700:
+                return True
+            if say:
+                print(f"[OCR-BOXES] auto: на GPU свободно {free_mb:.0f} МиБ — остаёмся на CPU")
+        else:
+            # Самый частый случай: стоит CPU-сборка torch (в т.ч. внутри .venv и
+            # в собранном exe). Тогда GPU недоступен в принципе, а не "выключен".
+            if say:
+                print(f"[OCR-BOXES] auto: torch {getattr(torch, '__version__', '?')} без CUDA "
+                      f"(cuda={torch.version.cuda}) — GPU в этой сборке недоступен, идём на CPU")
+        return False
+    except Exception as e:
+        if say:
+            print("[OCR-BOXES] auto: не удалось опросить torch/CUDA:", e)
+        return False
+
 
 def get_easyocr_reader(lang_code="en"):
     """Ленивое создание EasyOCR-ридера с поддержкой переключения языков."""
-    global _easyocr_reader, _current_ocr_lang
+    global _easyocr_reader, _current_ocr_lang, _current_ocr_gpu
     if not _EASYOCR_AVAILABLE:
-        print("[OCR-BOXES] EasyOCR not available (import failed)")
+        print("[OCR-BOXES] EasyOCR недоступен:", _EASYOCR_IMPORT_ERROR or "причина не сохранена")
         return None
-    
-    # Если ридер уже есть и язык тот же — возвращаем готовый
-    if _easyocr_reader is not None and _current_ocr_lang == lang_code:
+
+    want_gpu = _resolve_easyocr_gpu()
+
+    # Если ридер уже есть, язык тот же и устройство то же — возвращаем готовый
+    if _easyocr_reader is not None and _current_ocr_lang == lang_code and _current_ocr_gpu == want_gpu:
         return _easyocr_reader
 
     print(f"[OCR-BOXES] Reloading EasyOCR for language: {lang_code}...")
@@ -58,24 +133,57 @@ def get_easyocr_reader(lang_code="en"):
     try: model_storage.mkdir(parents=True, exist_ok=True)
     except Exception: pass
 
+    # EasyOCR работает на КАЖДОМ кадре (страж L1), поэтому CPU тут смертелен:
+    # замер на 900x220 — readtext 730 мс на CPU против 66 мс на GPU.
+    # Весь EasyOCR вместе с CUDA-контекстом занимает ~290 МиБ VRAM.
+    use_gpu = want_gpu
+
     try:
-        # gpu=False (на CPU), чтобы не отжирать память у нейросетей
-        _easyocr_reader = easyocr.Reader(langs, gpu=False, model_storage_directory=str(model_storage))
+        t0 = time.perf_counter()
+        _easyocr_reader = easyocr.Reader(langs, gpu=use_gpu, model_storage_directory=str(model_storage))
         _current_ocr_lang = lang_code
-        print(f"[OCR-BOXES] EasyOCR initialized for {langs}")
+        _current_ocr_gpu = use_gpu
+        print(f"[OCR-BOXES] EasyOCR initialized for {langs} on "
+              f"{'GPU' if use_gpu else 'CPU'} in {(time.perf_counter()-t0)*1000:.0f} ms")
+        if not use_gpu:
+            _cuda_ok = False
+            try:
+                import torch as _t; _cuda_ok = bool(_t.cuda.is_available())
+            except Exception:
+                pass
+            _hint = ("Включить: easyocr_gpu=true в config/ui_prefs.json"
+                     if _cuda_ok else
+                     "В этой сборке стоит CPU-torch, GPU недоступен — держите регион "
+                     "поменьше, стоимость линейна по его площади")
+            print(f"[OCR-BOXES] ВНИМАНИЕ: EasyOCR на CPU, кадры будут стоить секунды. {_hint}")
+        _warmup_easyocr(_easyocr_reader, use_gpu)
     except Exception as e:
-        print(f"[OCR-BOXES] Init error for {lang_code}:", e)
-        # Если упало (например, нет модели для корейского), пробуем откатиться на EN
-        if lang_code != "en":
+        print(f"[OCR-BOXES] Init error for {lang_code} (gpu={use_gpu}):", e)
+        _easyocr_reader = None
+
+        # 1) Если не завелась CUDA — пробуем то же самое на CPU
+        if use_gpu:
+            print("[OCR-BOXES] Fallback to CPU...")
+            try:
+                _easyocr_reader = easyocr.Reader(langs, gpu=False, model_storage_directory=str(model_storage))
+                _current_ocr_lang = lang_code
+                _current_ocr_gpu = False
+                _warmup_easyocr(_easyocr_reader, False)
+            except Exception as e2:
+                print("[OCR-BOXES] CPU fallback failed:", e2)
+                _easyocr_reader = None
+
+        # 2) Если упало из-за языка (например, нет модели для корейского) — откат на EN
+        if _easyocr_reader is None and lang_code != "en":
             print("[OCR-BOXES] Fallback to English...")
             try:
-                _easyocr_reader = easyocr.Reader(['en'], gpu=False)
+                _easyocr_reader = easyocr.Reader(['en'], gpu=use_gpu, model_storage_directory=str(model_storage))
                 _current_ocr_lang = "en"
-            except:
+                _current_ocr_gpu = use_gpu
+                _warmup_easyocr(_easyocr_reader, use_gpu)
+            except Exception:
                 _easyocr_reader = None
-        else:
-            _easyocr_reader = None
-            
+
     return _easyocr_reader
 
 # ======================== CONFIG (по умолчанию) =========================
@@ -154,6 +262,10 @@ def _save_prefs(d: dict):
     except Exception as e:
         print("[UI] save prefs error:", e)
 
+# Версия приложения. Держим ОДНОЙ константой: раньше она была зашита в HTML
+# на странице «Информация», и при выпуске о ней забывали.
+APP_VERSION = "1.0.3"
+
 # llama.cpp server — ищем EXE и в models\lmm\llama.cpp, и в models\llm\llama.cpp
 SERVER_CANDIDATES = [
     BASE_DIR / "models" / "lmm" / "llama.cpp" / ("llama-server.exe" if os.name == "nt" else "llama-server"),
@@ -181,6 +293,10 @@ try:
         preload_prompt_cache_tr,
         reset_tr_system_cache,
         _split_name_and_body,
+        _get_char_info_from_name,
+        find_char_fuzzy,
+        build_solo_context,
+        load_dialog_history,
         set_memory_enabled,
         commit_history_manually,
     )
@@ -188,6 +304,11 @@ except Exception:
     LLMConfigDual = None
     set_memory_enabled = None
     commit_history_manually = None
+    _get_char_info_from_name = None
+    find_char_fuzzy = None
+    build_solo_context = None
+    load_dialog_history = None
+    _split_name_and_body = None
 
 llm_cfg = LLMConfig(
     enabled=True,
@@ -254,6 +375,425 @@ def canon_en(s: str) -> str:
         s = " ".join(tokens)
         
     return s
+
+# ============ Стражи "текст не изменился" (экономия вызовов VLM) ============
+# L0 — пиксельный диф ТОЛЬКО внутри рамок с текстом (анимация фона не мешает).
+# L1 — подпись EasyOCR: строка кривая, но на одних пикселях кривая одинаково.
+
+# Все пороги настроены АСИММЕТРИЧНО: пропустить лишний кадр к распознаванию дёшево
+# (EasyOCR ~66 мс), а не показать перевод вовсе — дорого. Поэтому при сомнении
+# стражи пропускают кадр дальше, а не глушат его.
+_EDGE_DILATE_K = np.ones((5, 5), np.uint8)   # допуск на дрожание в 2px
+L0_CHANGE_FRAC   = 0.04   # доля краёв ТЕКСТА, которую считаем изменением реплики
+SIG_SAME_RATIO   = 0.94   # подписи считаются одинаковыми (для КОРОТКИХ, по строке)
+# Доля общих слов, при которой подпись считается той же. Замеры на живых кадрах:
+# одна реплика с разным мусором — 0.71..0.85, разные реплики — 0.00. То есть
+# опасность только с одной стороны: мусор давит долю вниз. Отсюда низкий порог.
+SIG_TOKEN_RATIO  = 0.55
+SIG_TOKEN_MIN    = 6      # от скольких слов переходим на сравнение по словам
+SIG_GROW_KEPT    = 0.95   # доля уцелевших слов, чтобы счесть это дописыванием
+SIG_GROW_RATIO   = 0.85   # подпись "доросла" (эффект печатной машинки)
+SIG_MAX_FAILS    = 5      # промахов VLM подряд, прежде чем бросить кадр
+# Кадров подряд с неизменной подписью до вызова VLM. 1 = переводим сразу, но тогда
+# первый же кадр печатающейся строки уходит в VLM огрызком ("Mai: So w"). 2 = ждём
+# один лишний кадр (~200 мс при fps 5), зато обрывки не переводятся.
+SIG_MIN_HITS     = 2
+GATE_DEBUG       = False  # покадровый лог решений стражей (включить для отладки)
+
+
+def _mask_from_boxes(shape, boxes_px, scale: float, pad_lines: float = 0.3):
+    """
+    Маска по строкам с текстом в координатах карты краёв.
+    ВАЖНО: полосы во ВСЮ ШИРИНУ кадра, а не тесные рамки вокруг слов. Тесная рамка
+    ловит только те пиксели, где текст уже есть, — и дописанное правее слово
+    (эффект печатной машинки) оказывается вне маски, кадр глушится, перевод
+    залипает на первом слове. Полоса режет анимацию сверху и снизу от диалога,
+    но горизонтальный рост строки видит.
+    None -> рамок ещё нет, считаем по всему кадру.
+    """
+    if not boxes_px:
+        return None
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    drawn = 0
+    for (bx, by, bw, bh) in boxes_px:
+        pad = int(max(1, bh * scale) * pad_lines)
+        y0 = max(0, int(by * scale) - pad)
+        y1 = min(h, int((by + bh) * scale) + pad)
+        if y1 > y0:
+            cv2.rectangle(mask, (0, y0), (w, y1), 255, -1)
+            drawn += 1
+    return mask if drawn else None
+
+
+def _mask_tight_from_boxes(shape, boxes_px, scale: float, pad: int = 4):
+    """Маска строго по рамкам текста — по ней меряем, СКОЛЬКО текста в кадре."""
+    if not boxes_px:
+        return None
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    drawn = 0
+    for (bx, by, bw, bh) in boxes_px:
+        x0, y0 = max(0, int(bx * scale) - pad), max(0, int(by * scale) - pad)
+        x1, y1 = min(w, int((bx + bw) * scale) + pad), min(h, int((by + bh) * scale) + pad)
+        if x1 > x0 and y1 > y0:
+            cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
+            drawn += 1
+    return mask if drawn else None
+
+
+def _edges_changed(edges, last_edges, mask=None, ref_mask=None) -> tuple[int, int]:
+    """
+    Считаем края, которые ПОЯВИЛИСЬ или ПРОПАЛИ относительно прошлого кадра,
+    с допуском в пару пикселей (сдвиг текста на 1px больше не лавина отличий).
+
+    mask     — ГДЕ ищем изменения (полоса во всю ширину, чтобы видеть дописывание).
+    ref_mask — по чему нормируем порог. Это разные вещи: полоса на насыщенном фоне
+               набирает тысячи краёв от декораций, порог взлетает, и смена реплики
+               перестаёт его перешагивать. Нормировать надо по краям САМОГО ТЕКСТА.
+    Возвращает (сколько_изменилось, сколько_краёв_было_для_нормировки).
+    """
+    appeared = cv2.bitwise_and(edges, cv2.bitwise_not(cv2.dilate(last_edges, _EDGE_DILATE_K)))
+    vanished = cv2.bitwise_and(last_edges, cv2.bitwise_not(cv2.dilate(edges, _EDGE_DILATE_K)))
+    changed = cv2.bitwise_or(appeared, vanished)
+    if mask is not None:
+        changed = cv2.bitwise_and(changed, mask)
+    rm = ref_mask if ref_mask is not None else mask
+    if rm is not None:
+        ref = cv2.countNonZero(cv2.bitwise_and(last_edges, rm))
+    else:
+        ref = cv2.countNonZero(last_edges)
+    return cv2.countNonZero(changed), ref
+
+
+def _boxes_signature(boxes_with_text) -> str:
+    """Дешёвый отпечаток текста кадра из результата EasyOCR."""
+    items = [b for b in boxes_with_text or () if len(b) >= 5 and b[4]]
+    if not items:
+        return ""
+    # EasyOCR отдаёт боксы в нестабильном порядке — раскладываем сверху вниз,
+    # слева направо. Иначе подпись прыгала бы на одинаковых кадрах, а проверка
+    # "текст ещё печатается" (префикс) вообще не имела бы смысла.
+    heights = sorted(int(b[3]) for b in items)
+    line_h = max(1, heights[len(heights) // 2])          # медианная высота строки
+    items.sort(key=lambda b: (int(b[1]) // line_h, int(b[0])))
+
+    txt = " ".join(str(b[4]) for b in items)
+    # Многоточия EasyOCR читает как "_", "~", ":" вперемешку, а "_" переживает
+    # canon_en (в \w подчёркивание входит). Выпалываем этот мусор заранее,
+    # иначе подпись на тексте вида "Hah... hah..." скачет от кадра к кадру.
+    txt = re.sub(r"[_~]+", " ", txt)
+    sig = canon_en(txt)
+    # Осколки длиной в один символ — тоже следы точек, кроме настоящих слов
+    trimmed = " ".join(t for t in sig.split() if len(t) > 1 or t in ("a", "i"))
+    # ВАЖНО: пустая подпись означает "текста на экране нет" и гасит перевод.
+    # Поэтому если после чистки не осталось ничего, а буквы всё же были —
+    # отдаём неочищенный вариант. Лучше нестабильная подпись, чем потерянная реплика.
+    return trimmed or sig
+
+
+# Подсказки интерфейса короткие: 'wasd move' (9), 's down key' (10), 'key' (3).
+# А вот повествовательная строка вида '(Melanie shakes her head.)' — это 23 символа,
+# и при пороге 28 она попадала под критерий, хотя стоит ровно там же, где диалог.
+UI_MAX_CHARS  = 14   # до какой длины бокс может считаться подсказкой
+UI_MIN_GENS   = 2    # сколько СМЕН РЕПЛИКИ он должен пережить, чтобы им стать
+
+
+UI_TEXT_RATIO = 0.80   # насколько похож текст, чтобы счесть бокс тем же самым
+# Забываем по ВРЕМЕНИ, а не по кадрам: кадр стоит 200 мс на быстрой машине и
+# 2.2 с на слабой, и в кадрах эта память жила от 6 секунд до минуты с лишним.
+UI_FORGET_SEC = 15.0   # через сколько секунд без показа забываем бокс
+
+
+def _boxes_to_text(boxes) -> str:
+    """
+    Склеиваем боксы EasyOCR обратно в текст с переносами строк: сверху вниз,
+    внутри строки слева направо. Нужно, чтобы сплиттер увидел вертикальный
+    формат "Имя \n Реплика" — он на него и рассчитан.
+    """
+    items = [b for b in boxes or () if len(b) >= 5 and str(b[4]).strip()]
+    if not items:
+        return ""
+    heights = sorted(int(b[3]) for b in items)
+    line_h = max(1, heights[len(heights) // 2])
+    items.sort(key=lambda b: (int(b[1]) // line_h, int(b[0])))
+
+    rows, cur, cur_row = [], [], None
+    for b in items:
+        row = int(b[1]) // line_h
+        if cur_row is None or row == cur_row:
+            cur.append(str(b[4]).strip())
+        else:
+            rows.append(" ".join(cur)); cur = [str(b[4]).strip()]
+        cur_row = row
+    if cur:
+        rows.append(" ".join(cur))
+    return "\n".join(rows)
+
+
+def _build_solo_context(boxes, cfg, lang: str = "en") -> str:
+    """
+    Черновик EasyOCR -> текст со строками -> блок контекста для SOLO.
+    Вся смысловая работа (лор, пол, история) живёт в dual-адаптере, рядом с
+    данными; здесь только склейка боксов и защита от отсутствия импорта.
+    """
+    if build_solo_context is None:
+        return ""
+    try:
+        return build_solo_context(_boxes_to_text(boxes), cfg, lang)
+    except Exception as e:
+        print("[SOLO-CTX] error:", e)
+        return ""
+
+
+def _is_known_speaker(region, text) -> bool:
+    """
+    Этот текст уже опознавался сплиттером как имя говорящего? Тогда это не подсказка.
+    Нужно для имён, которых нет в лоре (протагонист, эпизодические персонажи):
+    они такие же короткие и так же стоят на месте, и фильтр их съедал.
+    """
+    names = getattr(region, "known_names", None)
+    if not names or not text:
+        return False
+    c = canon_en(str(text))
+    if not c:
+        return False
+    if c in names:
+        return True
+    return any(SequenceMatcher(None, c, n).ratio() > 0.85 for n in names)
+
+
+def _is_lore_character(text) -> bool:
+    """Есть ли такой персонаж в базе лора (имена + пол)."""
+    if not text or _get_char_info_from_name is None:
+        return False
+    try:
+        return _get_char_info_from_name(str(text)) is not None
+    except Exception:
+        return False
+
+
+def _track_static_ui(region, boxes) -> set:
+    """
+    Помечаем боксы, ведущие себя как элемент интерфейса: короткий текст, который
+    не меняется на протяжении нескольких смен реплики. На позицию как таковую не
+    смотрим — подсказка бывает и справа на строке, и отдельным блоком выше.
+    Диалог так себя не ведёт: он меняется вместе с поколением, подсказка переживает
+    их все.
+
+    Сопоставление идёт по БЛИЗОСТИ, а не по точному ключу: бокс дрожит на пиксель,
+    EasyOCR читает 'S,Down' то так, то эдак — при жёстком ключе стаж обнулялся и
+    подсказка просачивалась в VLM. И решение липкое: признанный интерфейсом бокс
+    таковым и остаётся, пока не исчезнет с экрана насовсем.
+    Возвращает множество индексов боксов-подсказок.
+    """
+    gen = region.dialog_gen
+    now = time.perf_counter()
+
+    # Левый край блока реплики. Имя говорящего выровнено с телом по этой вертикали
+    # (см. любой скриншот: "Mother" / Krolik / Alva стоят ровно над строкой), а
+    # подсказка интерфейса — в стороне. Поэтому если в кадре есть длинная строка,
+    # всё, что начинается на той же вертикали, считаем контентом.
+    # Это работает без лора и без сплиттера — а они оба промахиваются на именах
+    # в кавычках, где VLM читает имя как '"' и учить оказывается нечему.
+    body_x = None
+    for _b in boxes:
+        if len(canon_en(str(_b[4]))) > UI_MAX_CHARS:
+            _bx = int(_b[0])
+            body_x = _bx if body_x is None else min(body_x, _bx)
+    known = [e for e in (region.ui_boxes if isinstance(region.ui_boxes, list) else [])
+             if "seen" in e]
+    used, ui = set(), set()
+
+    for i, b in enumerate(boxes):
+        # Имя персонажа из лора — НИКОГДА не подсказка. Оно ведёт себя точно так
+        # же (коротко, на месте, переживает реплики, пока говорит один и тот же
+        # персонаж), и без этой брони фильтр его съедал: VLM переставал видеть имя,
+        # сплиттер выдумывал имя из первого слова реплики, а фильтр боксов выкидывал
+        # саму реплику. Проверка идёт до всего остального, чтобы такой бокс даже
+        # не накапливал стаж.
+        if _is_lore_character(b[4]) or _is_known_speaker(region, b[4]):
+            continue
+        # Выровнен по левому краю с телом реплики -> это часть диалога
+        if body_x is not None and abs(int(b[0]) - body_x) <= max(40, int(b[3])):
+            continue
+
+        txt = canon_en(str(b[4]))[:40]
+        cx, cy = b[0] + b[2] / 2.0, b[1] + b[3] / 2.0
+        tol = max(40.0, float(b[3]))          # допуск по позиции — с высоту строки
+
+        match, match_j, best_d = None, -1, None
+        for j, e in enumerate(known):
+            if j in used:
+                continue
+            d = abs(cx - e["cx"]) + abs(cy - e["cy"])
+            if d > tol:
+                continue
+            # На коротких строках 0.80 — это разница в один символ, и соседние
+            # короткие реплики ('line 2' / 'line 3') слипаются в один «постоянный»
+            # бокс. Поэтому до 8 символов требуем точное совпадение.
+            if len(txt) <= 8 or len(e["txt"]) <= 8:
+                if txt != e["txt"]:
+                    continue
+            elif SequenceMatcher(None, txt, e["txt"]).ratio() < UI_TEXT_RATIO:
+                continue
+            if best_d is None or d < best_d:
+                match, match_j, best_d = e, j, d
+
+        if match is None:
+            known.append({"txt": txt, "cx": cx, "cy": cy, "gen": gen, "seen": now, "ui": False})
+            continue
+
+        used.add(match_j)
+        match["cx"], match["cy"], match["seen"] = cx, cy, now
+        if len(txt) <= UI_MAX_CHARS and (gen - match["gen"]) >= UI_MIN_GENS:
+            match["ui"] = True
+        if match["ui"]:
+            ui.add(i)
+
+    region.ui_boxes = [e for e in known if (now - e["seen"]) <= UI_FORGET_SEC]
+    return ui
+
+
+def _paint_out_boxes(frame, boxes, pad: int = 3):
+    """
+    Замазываем боксы цветом окружающего фона, чтобы VLM их вообще не увидел.
+    Фильтрации боксов мало: в VLM уходит КАРТИНКА региона целиком, и подсказку
+    он прочитает вместе с репликой, как бы мы боксы ни отбирали.
+    """
+    if not boxes:
+        return frame
+    out = frame.copy()
+    h, w = out.shape[:2]
+    for (bx, by, bw, bh) in boxes:
+        x0, y0 = max(0, int(bx) - pad), max(0, int(by) - pad)
+        x1, y1 = min(w, int(bx + bw) + pad), min(h, int(by + bh) + pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        ring = []
+        if y0 - 4 >= 0:  ring.append(out[y0 - 4:y0, x0:x1].reshape(-1, 3))
+        if y1 + 4 <= h:  ring.append(out[y1:y1 + 4, x0:x1].reshape(-1, 3))
+        col = np.median(np.vstack(ring), axis=0) if ring else np.zeros(3)
+        out[y0:y1, x0:x1] = col.astype(np.uint8)
+    return out
+
+
+BLOCK_GAP_LINES = 1.2   # разрыв (в высотах строки), после которого начинается новый блок
+
+
+def _cluster_boxes(boxes, gap_lines: float = BLOCK_GAP_LINES) -> list:
+    """
+    Разбиваем боксы на блоки по вертикали.
+
+    Допуск берётся от МЕДИАННОЙ высоты бокса, а не от максимума пары, как в
+    старой построчной склейке (`max(h, last_h) * 0.5`). Разница принципиальная:
+    один аномально высокий бокс с фона раздувал допуск и затягивал в одну
+    группу имя вместе с репликой — после чего эвристика «неймплейт стоит один
+    в строке» не срабатывала, имя выживало и перевод уезжал на него.
+    Медиана к одиночному выбросу нечувствительна.
+    """
+    items = [b for b in (boxes or ()) if len(b) >= 4]
+    if len(items) <= 1:
+        return [list(items)] if items else []
+
+    heights = sorted(int(b[3]) for b in items)
+    line_h = max(1, heights[len(heights) // 2])
+
+    # Ужимаем каждый бокс до ПОЛОСКИ высотой в медианную строку вокруг его центра.
+    # Без этого высокий бокс своим нижним краем дотягивается до следующего блока
+    # и перекидывает мостик через разрыв — склеивая имя с репликой или фоновый
+    # глиф с текстом. Настоящая геометрия при этом не меняется: полоски нужны
+    # только чтобы решить, кто с кем в одной группе.
+    def _strip(b):
+        cy = int(b[1]) + int(b[3]) / 2.0
+        return cy - line_h / 2.0, cy + line_h / 2.0
+
+    items.sort(key=lambda b: _strip(b)[0])
+    blocks = [[items[0]]]
+    bottom = _strip(items[0])[1]
+    for b in items[1:]:
+        top, bot = _strip(b)
+        if top - bottom <= line_h * gap_lines:
+            blocks[-1].append(b)
+            bottom = max(bottom, bot)
+        else:
+            blocks.append([b])
+            bottom = bot
+    return blocks
+
+
+def _block_weight(block) -> int:
+    """Вес блока — сколько в нём букв и цифр. Диалог тяжелее любого фонового мусора."""
+    n = 0
+    for b in block:
+        if len(b) >= 5:
+            n += len(re.sub(r"[^\w]", "", str(b[4])))
+    if n:
+        return n
+    # После фильтра остаются голые координаты без текста — тогда меряем площадью.
+    return sum(max(0, int(b[2])) * max(0, int(b[3])) for b in block)
+
+
+def _dominant_block(boxes) -> list:
+    """
+    Блок с наибольшим объёмом текста. Это и есть диалог: фоновые глифы и
+    декорации дают короткие обрывки, реплика — длинную связную массу.
+    """
+    blocks = _cluster_boxes(boxes)
+    if not blocks:
+        return []
+    if len(blocks) == 1:
+        return blocks[0]
+    return max(blocks, key=_block_weight)
+
+
+def _sig_overlap(a: str, b: str) -> float:
+    """Доля общих слов — только для показа в логе."""
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+
+def _sig_same(a: str, b: str) -> bool:
+    """
+    Одна и та же реплика на экране?
+
+    Сравниваем по МНОЖЕСТВАМ СЛОВ, а не по строке целиком. Причина: на
+    анимированном фоне (светящиеся глифы, узоры) EasyOCR подмешивает в подпись
+    мусорные слова, и они каждый кадр разные. Строковое сравнение такой мусор
+    сдвигает сильно — на реальном кадре соседние кадры ОДНОЙ реплики давали
+    0.88-0.90 при пороге 0.94, то есть подпись не стабилизировалась никогда и
+    перевод не появлялся вовсе. По словам те же кадры дают 0.77-0.82, а разные
+    реплики — 0.00. Запас между «то же» и «другое» получается огромный.
+
+    Короткие подписи сравниваем по-старому: там пара слов разницы это уже
+    другая реплика ('да' против 'да нет'), и множества слишком грубы.
+    """
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return a == b
+    if max(len(ta), len(tb)) < SIG_TOKEN_MIN:
+        return SequenceMatcher(None, a, b).ratio() > SIG_SAME_RATIO
+    return len(ta & tb) / max(len(ta), len(tb)) >= SIG_TOKEN_RATIO
+
+
+def _sig_is_growing(prev_sig: str, sig: str) -> bool:
+    """
+    Текст ещё печатается: к прежним словам добавились новые, а прежние никуда
+    не делись. Проверка «новая подпись начинается со старой» тут не годится —
+    мусор с фона сидит в начале строки и ломает префикс, а на длинной реплике
+    нестрогое сравнение головы давало ложный «рост» просто потому, что основная
+    масса текста совпадает.
+    """
+    tp, ts = set(prev_sig.split()), set(sig.split())
+    if not tp or len(ts) <= len(tp):
+        return False
+    kept = len(tp & ts) / len(tp)
+    # Требуем, чтобы уцелели ПОЧТИ ВСЕ прежние слова: при дописывании так и есть,
+    # а при мусорном шуме часть слов пропадает и рост не засчитывается.
+    return kept >= SIG_GROW_KEPT and len(ts - tp) >= 1
+
 
 # Regex для определения строк, которые выглядят как номера комнат, таймеры и т.п.
 # Используется для защиты от ошибочного принятия за имена.
@@ -570,11 +1110,22 @@ def _filter_boxes_by_llm_text(
                     continue
                 fallback_boxes.append((box[0], box[1], box[2], box[3]))
         
-        if not fallback_boxes and name_skipped_count > 0:
-            return []
-        if not fallback_boxes and name_line and len(boxes_with_text) > 1:
-                return [(int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in boxes_with_text[1:]]
-        return fallback_boxes if fallback_boxes else [(b[0], b[1], b[2], b[3]) for b in boxes_with_text]
+        if fallback_boxes:
+            return fallback_boxes
+
+        # Раньше тут возвращался пустой список — и оригинал оставался НЕ ЗАКРЫТ.
+        # Это худший из исходов: под переводом просвечивает английский текст.
+        # Случается, когда сплиттер ошибочно принял всю реплику за имя
+        # ("Hm? Ah. Sure..." -> имя "Hm?") и фильтр выкинул единственный бокс.
+        # Лучше закрыть лишнее, чем не закрыть нужное. Исключаем только боксы,
+        # ЦЕЛИКОМ совпавшие с именем — это одинокая табличка с именем персонажа,
+        # её закрывать незачем.
+        rescued = [(int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                   for b in boxes_with_text
+                   if not (name_c and _norm(str(b[4])) == name_c)]
+        print(f"[BOXES-FIX] Fallback: возвращаю все боксы "
+              f"({len(rescued)} / {len(boxes_with_text)})")
+        return rescued
 
     return good_boxes
 
@@ -1313,7 +1864,23 @@ class RegionModel:
     is_frozen: bool = False
     
     last_en_canon: str = ""
-    
+
+    # --- стражи "текст не изменился" ---
+    last_edges_img: object = field(default=None, repr=False)   # карта краёв прошлого кадра
+    last_boxes_px: list = field(default_factory=list, repr=False)  # рамки текста (пиксели кадра)
+    ocr_sig_seen: str = ""   # подпись EasyOCR прошлого кадра
+    ocr_sig_hits: int = 0    # кадров подряд с неизменной подписью
+    # На "дотных" текстах EasyOCR выдаёт несколько разных подписей для ОДНОЙ и той
+    # же картинки (то теряет слово, то дорисовывает мусор). Поэтому храним не одну
+    # отработанную подпись, а список псевдонимов текущего текста на экране.
+    ocr_sigs_done: list = field(default_factory=list, repr=False)
+    ocr_sig_en: str = ""     # какому en-тексту соответствуют эти псевдонимы
+    ocr_sig_fails: int = 0   # подряд неудачных чтений VLM для текущей подписи
+    # Отсев статичных элементов интерфейса (подсказки WASD и т.п.)
+    ui_boxes: list = field(default_factory=list, repr=False)  # запомненные боксы интерфейса
+    dialog_gen: int = 0      # счётчик смен реплики
+    known_names: list = field(default_factory=list, repr=False)  # имена, опознанные сплиттером
+
     text_boxes: list[tuple[float, float, float, float]] = field(default_factory=list, repr=False)
 
     panel: RegionPanel | None = field(default=None, repr=False)
@@ -1329,11 +1896,30 @@ class CaptureWorker(QThread):
         self.interval_ms = interval_ms
         self._stop = False
         self._rr = 0
+        self._last_box_ms = 0.0   # стоимость последнего прохода EasyOCR
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Поднимаем и прогреваем EasyOCR ДО цикла. Иначе разовая инициализация
+        # (~1.5 с) плюс прогрев уезжают внутрь первого detect_text_boxes и
+        # выглядят в логе как двухсекундные тормоза распознавания.
+        # История переживает перезапуск: иначе каждая проверка правок
+        # начиналась с пустого контекста и была несопоставима с прошлым прогоном.
+        try:
+            if load_dialog_history is not None:
+                load_dialog_history()
+        except Exception as e:
+            print("[CTX] history preload error:", e)
+
+        try:
+            _t = time.perf_counter()
+            get_easyocr_reader(getattr(self.overlay, "source_lang", "en"))
+            print(f"[OCR-BOXES] ридер готов до старта цикла за {(time.perf_counter()-_t)*1000:.0f} мс")
+        except Exception as e:
+            print("[OCR-BOXES] preload error:", e)
+
         while not self._stop:
             try:
                 if REQUIRE_BOUND_WINDOW:
@@ -1393,41 +1979,72 @@ class CaptureWorker(QThread):
                 # Оптимизация: уменьшаем картинку для Canny, если она большая
                 # Это ускоряет проверку стабильности на 4K экранах
                 h_g, w_g = gray.shape
+                edge_scale = 1.0
                 if w_g > 800:
                     sc = 800.0 / w_g
+                    edge_scale = sc
                     gray_small = cv2.resize(gray, (800, int(h_g * sc)), interpolation=cv2.INTER_LINEAR)
                     edges = cv2.Canny(gray_small, 50, 150)
                 else:
                     edges = cv2.Canny(gray, 50, 150)
                 # ----------------------------------------------
 
-                # --- НОВАЯ ВСТАВКА: Сравнение по ГРАНИЦАМ (игнорирует фон) ---
-                # Используем детектор краев Canny. Он видит буквы, но игнорирует мягкие тени и облака.
+                # --- СТРАЖ L0: сравнение по ГРАНИЦАМ внутри рамок с текстом ---
+                # Canny видит буквы и игнорирует мягкие тени. Маска по рамкам с прошлого
+                # кадра дополнительно вырезает анимированный фон ЗА пределами текста.
                 last_img = getattr(r, "last_edges_img", None)
-                
+
                 # Теперь edges существует, и ошибка исчезнет
                 if last_img is not None and last_img.shape == edges.shape:
-                    diff = cv2.absdiff(edges, last_img)
-                    changed_pixels = cv2.countNonZero(diff)
-                    
-                    # Динамический порог: 0.2% от площади картинки, но не меньше 30 пикселей
-                    # (2500 было слишком много для коротких фраз)
-                    total_px = edges.shape[0] * edges.shape[1]
-                    STABILITY_THRESHOLD = max(30, int(total_px * 0.002))
-                    
-                    if changed_pixels < STABILITY_THRESHOLD:
+                    edge_mask = _mask_from_boxes(edges.shape, r.last_boxes_px, edge_scale)
+                    ref_mask  = _mask_tight_from_boxes(edges.shape, r.last_boxes_px, edge_scale)
+                    changed_pixels, ref_edges = _edges_changed(edges, last_img, edge_mask, ref_mask)
+
+                    if edge_mask is not None:
+                        # Изменения ищем в полосе (иначе не увидим дописывание строки),
+                        # а порог нормируем по краям САМОГО ТЕКСТА. Иначе на насыщенном
+                        # фоне полоса набирает тысячи краёв от декораций, планка взлетает,
+                        # и смена реплики её не перешагивает — текст залипает на экране.
+                        # Ложный пропуск стоит одного вызова EasyOCR (~66 мс) и дальше
+                        # отсеивается стражем L1; ложный СТОП стоит потерянного перевода.
+                        STABILITY_THRESHOLD = max(20, int(ref_edges * L0_CHANGE_FRAC))
+                    else:
+                        # рамок ещё нет — старое поведение по всей площади
+                        total_px = edges.shape[0] * edges.shape[1]
+                        STABILITY_THRESHOLD = max(30, int(total_px * 0.002))
+
+                    # L0 отвечает на вопрос "изменилось ли с прошлого кадра", а глушить
+                    # можно только если "текст на экране уже прочитан". Это разные вещи:
+                    # после ожидания дописывания (L1-РОСТ) пиксели замирают, и без этой
+                    # проверки L0 затыкает кадр навсегда, а дописанная строка так и не
+                    # доходит до VLM. Поэтому: есть незакрытый долг — кадр пропускаем.
+                    _sig_pending = bool(r.ocr_sig_seen) and not any(
+                        _sig_same(r.ocr_sig_seen, s) for s in r.ocr_sigs_done)
+                    if _sig_pending and changed_pixels < STABILITY_THRESHOLD:
+                        if GATE_DEBUG:
+                            print(f"[GATE] r{idx} L0-стоп ОТМЕНЁН: подпись ещё не прочитана "
+                                  f"({r.ocr_sig_seen[:40]!r})")
+
+                    if changed_pixels < STABILITY_THRESHOLD and not _sig_pending:
                         # ... (дальше ваши условия сна для DUAL/SOLO) ...
                         if (mode_idx == 1 or mode_idx == 2):
                              threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
                              if r.pending_hits >= threshold:
+                                 if GATE_DEBUG:
+                                     print(f"[GATE] r{idx} L0-СТОП ch={changed_pixels}/{STABILITY_THRESHOLD} "
+                                           f"ref={ref_edges} маска={'полоса' if edge_mask is not None else 'ВЕСЬ КАДР'} "
+                                           f"боксов={len(r.last_boxes_px)} hits={r.pending_hits}/{threshold}")
                                  self.msleep(self.interval_ms)
                                  continue
-                        
+
                         if mode_idx == 0 and r.last_sent_ru_raw:
                              threshold = int(getattr(self.overlay, "en_canon_hits", 0) or 0)
                              if r.pending_hits == 0 or r.pending_hits >= threshold:
                                  self.msleep(self.interval_ms)
                                  continue
+                    elif GATE_DEBUG and changed_pixels >= STABILITY_THRESHOLD:
+                        print(f"[GATE] r{idx} L0-пропустил ch={changed_pixels}/{STABILITY_THRESHOLD} "
+                              f"ref={ref_edges} маска={'полоса' if edge_mask is not None else 'ВЕСЬ КАДР'}")
                 else:
                     # Если размеры разные (например, вы поменяли размер окна) — считаем, что картинка новая.
                     pass
@@ -1446,14 +2063,55 @@ class CaptureWorker(QThread):
                 try:
                     # 1. Берем язык, который выбрал пользователь в UI
                     cur_lang = getattr(self.overlay, "source_lang", "en")
-                    
+
                     # 2. Передаем его в детектор
+                    _t_box = time.perf_counter()
                     boxes_with_text = detect_text_boxes(frame, cur_lang)
+                    _box_ms = (time.perf_counter() - _t_box) * 1000.0
+                    self._last_box_ms = _box_ms
+                    if _box_ms > 250.0:
+                        _dev = "GPU" if _current_ocr_gpu else "CPU"
+                        print(f"[OCR-BOXES] region {idx}: readtext {_box_ms:.0f} мс на {_dev} | "
+                              f"кадр {frame.shape[1]}x{frame.shape[0]} | боксов {len(boxes_with_text)}")
                 except Exception as e:
                     print("[OCR-BOXES] Error:", e)
 
-                # ПРОВЕРКА: Если боксов нет -> Чистим экран и спим
-                if not boxes_with_text:
+                # --- ОТСЕВ ПОДСКАЗОК ИНТЕРФЕЙСА ---
+                # Короткие боксы, пережившие несколько смен реплики, — это UI игры
+                # (WASD, "Press E"), а не диалог. Их не должно быть ни в подписи,
+                # ни в маске L0, ни в картинке для VLM.
+                _ui_idx = _track_static_ui(r, boxes_with_text)
+                if _ui_idx:
+                    _ui_boxes = [boxes_with_text[i][:4] for i in sorted(_ui_idx)]
+                    if GATE_DEBUG:
+                        print(f"[GATE] r{idx} подсказка UI отсеяна: "
+                              f"{[boxes_with_text[i][4] for i in sorted(_ui_idx)]}")
+                    boxes_with_text = [b for i, b in enumerate(boxes_with_text)
+                                       if i not in _ui_idx]
+                    # Замазываем их в кадре, иначе VLM прочитает подсказку вместе с репликой
+                    frame = _paint_out_boxes(frame, _ui_boxes)
+
+                # Подпись считаем ДО проверки "есть ли текст". В регионе может висеть
+                # UI-мишура (рамки, маркеры, "..."), которую EasyOCR исправно отдаёт
+                # боксами. Раньше проверка смотрела только на НАЛИЧИЕ боксов — и в
+                # такой области перевод не гас никогда, а VLM звался каждый кадр,
+                # чтобы каждый раз ответить NO_TEXT_FOUND.
+                # Подпись строим только по БЛОКУ ДИАЛОГА: фоновые глифы и декорации
+                # живут отдельным блоком и в неё больше не попадают.
+                _dialog_block = _dominant_block(boxes_with_text)
+                sig = _boxes_signature(_dialog_block)
+
+                # ПРОВЕРКА: нет боксов ИЛИ в них нет ни одного слова -> чистим и спим
+                if not sig:
+                    if GATE_DEBUG and boxes_with_text:
+                        print(f"[GATE] r{idx} боксов {len(boxes_with_text)}, но слов в них нет "
+                              f"-> считаем, что текст пропал")
+                    r.last_boxes_px = []
+                    r.ocr_sig_seen = ""
+                    r.ocr_sigs_done = []
+                    r.ocr_sig_en = ""
+                    r.ocr_sig_hits = 0
+                    r.ocr_sig_fails = 0
                     # Если на экране еще висит старый текст — убираем его
                     if r.last_sent_ru_raw:
                          print(f"[CLEAR] region {idx}: No text boxes -> Clear screen")
@@ -1481,6 +2139,56 @@ class CaptureWorker(QThread):
                 # Если дошли сюда — значит, EasyOCR нашел текст. Работаем дальше.
                 # -----------------------------------------------------------
 
+                # Рамки нужны стражу L0 на следующем кадре (маска по тексту)
+                r.last_boxes_px = [(b[0], b[1], b[2], b[3]) for b in boxes_with_text]
+
+                # --- СТРАЖ L1: подпись EasyOCR ---
+                # readtext уже отработал, строка есть — грех не использовать её как
+                # отпечаток вместо того, чтобы узнавать то же самое у VLM за 750 мс.
+                # sig посчитан выше и здесь заведомо непустой.
+                if GATE_DEBUG:
+                    print(f"[GATE] r{idx} L1 sig={sig!r}")
+                    print(f"[GATE] r{idx}    seen={r.ocr_sig_seen!r} done={r.ocr_sigs_done}")
+                if sig:
+                    prev_seen = r.ocr_sig_seen or ""
+
+                    if _sig_same(sig, prev_seen):
+                        r.ocr_sig_hits += 1
+                    else:
+                        growing = _sig_is_growing(prev_seen, sig)
+                        r.ocr_sig_seen = sig
+                        r.ocr_sig_hits = 1
+                        if growing:
+                            # Текст ещё печатается — не жжём VLM на огрызке фразы
+                            if GATE_DEBUG:
+                                print(f"[GATE] r{idx} L1-РОСТ, ждём дописывания")
+                            self.msleep(self.interval_ms)
+                            continue
+
+                    # Этот текст VLM уже читал — второй раз незачем.
+                    # Сверяемся со ВСЕМИ псевдонимами: на дотных строках EasyOCR
+                    # выдаёт 2-3 разных варианта для одной и той же картинки.
+                    _hit = max((_sig_overlap(sig, s) for s in r.ocr_sigs_done), default=0.0)
+                    if any(_sig_same(sig, s) for s in r.ocr_sigs_done):
+                        if GATE_DEBUG:
+                            print(f"[GATE] r{idx} L1-УЖЕ-ЧИТАЛИ ratio={_hit:.3f}")
+                        self.msleep(self.interval_ms)
+                        continue
+
+                    # Подпись новая, но ещё не устоялась.
+                    # Ждать второй кадр имеет смысл, только когда кадры дешёвые.
+                    # Если EasyOCR стоит секунды (слабый CPU), между кадрами машинка
+                    # заведомо уже отработала, а рост подписи всё равно ловится
+                    # отдельной проверкой — и ожидание превращается в чистые -3 сек.
+                    _min_hits = 1 if getattr(self, "_last_box_ms", 0.0) > 1000.0 else SIG_MIN_HITS
+                    if r.ocr_sig_hits < _min_hits:
+                        if GATE_DEBUG:
+                            print(f"[GATE] r{idx} L1-ЖДЁМ hits={r.ocr_sig_hits}/{_min_hits}")
+                        self.msleep(self.interval_ms)
+                        continue
+                    if GATE_DEBUG:
+                        print(f"[GATE] r{idx} ==> ВЫЗОВ VLM (лучший ratio к псевдонимам {_hit:.3f})")
+
                 # LLM: одна картинка (регион) → перевод
                 # В обычном режиме увеличиваем разрешение до 1536 для четкости
                 # В режиме Wiki ставим максимум для очень мелкого текста
@@ -1500,8 +2208,55 @@ class CaptureWorker(QThread):
                     if getattr(self.overlay, "dual_mode", False) and LLMConfigDual:
                         en = extract_en_from_image(reg_b64, self.overlay.ocr_cfg_dual)
                 else:
-                    # В режиме SOLO нейросеть делает всё сразу
-                    en, ru = vision_translate_from_images(reg_b64, None, self.overlay.llm_cfg)
+                    # В режиме SOLO нейросеть делает всё сразу. Но говорящего и его пол
+                    # мы уже знаем из боксов EasyOCR — подкладываем их модели, вместо
+                    # того чтобы она гадала по картинке (где может быть видно только
+                    # текст и ноги персонажа).
+                    _solo_ctx = _build_solo_context(
+                        boxes_with_text, self.overlay.llm_cfg,
+                        getattr(self.overlay, "source_lang", "en"))
+                    if _solo_ctx and GATE_DEBUG:
+                        print(f"[SOLO-CTX] r{idx}: {_solo_ctx.splitlines()[1] if len(_solo_ctx.splitlines())>1 else _solo_ctx}")
+                    en, ru = vision_translate_from_images(
+                        reg_b64, None, self.overlay.llm_cfg, extra_context=_solo_ctx)
+
+                # Копим псевдонимы ТОЛЬКО при удачном чтении — иначе пустой ответ
+                # VLM намертво заблокировал бы повтор для этого кадра.
+                if en and sig:
+                    _en_c = canon_en(en)
+                    if _en_c != r.ocr_sig_en:
+                        # На экране действительно новый текст — старые псевдонимы не нужны
+                        r.ocr_sigs_done = []
+                        r.ocr_sig_en = _en_c
+                        # Новое поколение диалога: по нему отличаем подсказки от реплик
+                        r.dialog_gen += 1
+                    if not any(_sig_same(sig, s) for s in r.ocr_sigs_done):
+                        r.ocr_sigs_done.append(sig)
+                        del r.ocr_sigs_done[:-4]   # держим не больше 4 вариантов
+                    r.ocr_sig_fails = 0
+                    # Запоминаем говорящего: фильтр подсказок не должен съедать имя
+                    try:
+                        _nm, _ = safe_split_name_and_body(
+                            en, getattr(self.overlay, "source_lang", "en"))
+                        _nm = canon_en(_nm) if _nm else ""
+                        if _nm and _nm not in r.known_names:
+                            r.known_names.append(_nm)
+                            del r.known_names[:-20]      # помним последние 20 имён
+                            if GATE_DEBUG:
+                                print(f"[GATE] r{idx} запомнил говорящего: {_nm!r}")
+                    except Exception:
+                        pass
+                elif sig:
+                    # VLM ничего не прочитал. Долг остаётся незакрытым, а значит L0
+                    # больше не глушит кадры — без предохранителя цикл крутился бы на
+                    # полной скорости. Три промаха — считаем кадр безнадёжным.
+                    r.ocr_sig_fails += 1
+                    if r.ocr_sig_fails >= SIG_MAX_FAILS:
+                        r.ocr_sigs_done.append(sig)
+                        del r.ocr_sigs_done[:-4]
+                        r.ocr_sig_fails = 0
+                        print(f"[GATE] r{idx} VLM трижды не прочитал кадр — подпись помечена "
+                              f"отработанной, чтобы не крутить цикл")
 
                 # 2. УМНАЯ ПРОВЕРКА (Страж №2): Нужно ли переводить?
                 need_translate = True
@@ -1575,6 +2330,25 @@ class CaptureWorker(QThread):
                                 f"{len(boxes_with_text)} -> {len(boxes_px)}"
                             )
 
+                        # Оверлей рисуется по ОБЪЕДИНЕНИЮ боксов, поэтому один
+                        # далёкий выживший бокс утаскивает перевод вверх или вбок.
+                        # Оставляем только те, что входят в блок диалога.
+                        #
+                        # ВАЖНО: блок берём готовый — тот, что выбран выше ПО ТЕКСТУ.
+                        # Пересчитывать его здесь нельзя: после фильтра у боксов
+                        # остаются голые координаты, вес считается по площади, и на
+                        # короткой реплике ("Groza!") куча фоновых глифов перевешивает
+                        # её по площади — перевод уезжал к ним.
+                        _allowed = {(int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                                    for b in (_dialog_block or ())}
+                        if _allowed:
+                            _kept = [b for b in boxes_px
+                                     if (int(b[0]), int(b[1]), int(b[2]), int(b[3])) in _allowed]
+                            if _kept:
+                                if len(_kept) != len(boxes_px):
+                                    print(f"[BOXES-FIX] region {idx}: вне блока диалога отброшено "
+                                          f"{len(boxes_px) - len(_kept)} боксов")
+                                boxes_px = _kept
                         h, w = gray.shape[:2]
                         r.text_boxes = [
                             (x / float(w), y / float(h), bw / float(w), bh / float(h))
@@ -1692,7 +2466,7 @@ class CaptureWorker(QThread):
                                     f"-> Show RU"
                                 )
 
-                                if mode_idx == 1 and commit_history_manually:
+                                if mode_idx in (0, 1) and commit_history_manually:
                                     try:
                                         # en - это сырой английский текст из текущего кадра (он стабилен)
                                         # r.pending_ru_raw - это готовый перевод
@@ -1730,6 +2504,123 @@ class CaptureWorker(QThread):
 
 WM_HOTKEY, MOD_ALT, MOD_CONTROL = 0x0312, 0x0001, 0x0002
 VK_Q, VK_F1, VK_F2, VK_N, VK_B, VK_D, VK_TAB, VK_UP, VK_DOWN, VK_OEM_4, VK_OEM_6 = 0x51,0x70,0x71,0x4E,0x42,0x44,0x09,0x26,0x28,0xDB,0xDD
+# Alt+- / Alt+= / Alt+\ (рядом друг с другом), Alt+G вместо Alt+Tab (тот занят Windows),
+# Pause голым — его не биндит ни одна игра, а глобальный перехват никому не мешает.
+VK_OEM_MINUS, VK_OEM_PLUS, VK_OEM_5, VK_PAUSE, VK_G = 0xBD, 0xBB, 0xDC, 0x13, 0x47
+
+# ======================= Настраиваемые хоткеи ==========================
+# Сочетания хранятся строкой в формате Qt ("Alt+-", "Pause", "Alt+Up"), потому
+# что её умеет и показывать, и разбирать сам QKeySequence — не надо изобретать
+# свой формат для UI. В коды Windows переводим только в момент регистрации.
+#
+# Про Ctrl: в новеллах на нём висит скип диалога, а RegisterHotKey проглатывает
+# только ПОЛНУЮ комбинацию — само нажатие Ctrl игра получает сразу и успевает
+# пролистать текст. Поэтому в умолчаниях его нет, но запретить не можем: вдруг
+# у человека игра, где Ctrl свободен.
+HOTKEY_ACTIONS = [
+    (1,  "toggle_overlay",  "Показать / скрыть оверлей",   "Alt+-"),
+    (2,  "toggle_edit",     "Режим редактирования",        "Alt+="),
+    (3,  "add_region",      "Добавить область",            "Alt+\\"),
+    (4,  "bind_window",     "Привязать окно под курсором", "Alt+B"),
+    (5,  "toggle_split",    "Сплит выбранной области",     "Alt+D"),
+    (6,  "switch_target",   "Сменить цель редактирования", "Alt+G"),
+    (7,  "speed_up",        "Скорость печати +",           "Alt+Up"),
+    (8,  "speed_down",      "Скорость печати -",           "Alt+Down"),
+    (9,  "lag_up",          "Лаг превью +",                "Alt+]"),
+    (10, "lag_down",        "Лаг превью -",                "Alt+["),
+    (11, "quit_to_config",  "Выход в настройки",           "Pause"),
+]
+
+HOTKEYS = {key: default for _hid, key, _label, default in HOTKEY_ACTIONS}
+
+# Qt отдаёт свои коды клавиш, RegisterHotKey ждёт виртуальные коды Windows.
+# Буквы и цифры совпадают один в один, остальное — таблицей.
+_QT_TO_VK = {
+    0x01000000: 0x1B,  # Escape
+    0x01000001: 0x09,  # Tab
+    0x01000004: 0x0D,  # Return
+    0x01000005: 0x0D,  # Enter
+    0x01000006: 0x2D,  # Insert
+    0x01000007: 0x2E,  # Delete
+    0x01000008: 0x13,  # Pause
+    0x01000009: 0x2C,  # Print
+    0x01000010: 0x24,  # Home
+    0x01000011: 0x23,  # End
+    0x01000012: 0x25,  # Left
+    0x01000013: 0x26,  # Up
+    0x01000014: 0x27,  # Right
+    0x01000015: 0x28,  # Down
+    0x01000016: 0x21,  # PageUp
+    0x01000017: 0x22,  # PageDown
+    0x01000025: 0x91,  # ScrollLock
+    0x01000026: 0x90,  # NumLock
+    0x20: 0x20,        # Space
+    0x2D: 0xBD,        # -
+    0x3D: 0xBB,        # =
+    0x5B: 0xDB,        # [
+    0x5D: 0xDD,        # ]
+    0x5C: 0xDC,        # \
+    0x3B: 0xBA,        # ;
+    0x27: 0xDE,        # '
+    0x2C: 0xBC,        # ,
+    0x2E: 0xBE,        # .
+    0x2F: 0xBF,        # /
+    0x60: 0xC0,        # `
+}
+MOD_SHIFT, MOD_WIN = 0x0004, 0x0008
+
+
+def parse_hotkey(seq_text: str):
+    """'Alt+-' -> (модификаторы, виртуальный код) либо None, если не разобрали."""
+    from PySide6.QtGui import QKeySequence
+    if not seq_text:
+        return None
+    seq = QKeySequence.fromString(seq_text, QKeySequence.PortableText)
+    if seq.isEmpty():
+        return None
+    try:
+        comb = seq[0]
+        raw = int(comb.toCombined()) if hasattr(comb, "toCombined") else int(comb)
+    except Exception:
+        return None
+
+    # Числами, а не через Qt.*: в PySide6 это члены перечисления, и int() их
+    # не принимает, а побитовые операции с сырым кодом клавиши нужны именно целые.
+    QT_MASK, QT_SHIFT, QT_CTRL, QT_ALT, QT_META = (
+        0xFE000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000)
+    mods_qt = raw & QT_MASK
+    key = raw & ~QT_MASK
+
+    mods = 0
+    if mods_qt & QT_ALT:   mods |= MOD_ALT
+    if mods_qt & QT_CTRL:  mods |= MOD_CONTROL
+    if mods_qt & QT_SHIFT: mods |= MOD_SHIFT
+    if mods_qt & QT_META:  mods |= MOD_WIN
+
+    if 0x41 <= key <= 0x5A or 0x30 <= key <= 0x39:      # A-Z, 0-9
+        vk = key
+    elif 0x01000030 <= key <= 0x01000047:               # F1..F24
+        vk = 0x70 + (key - 0x01000030)
+    else:
+        vk = _QT_TO_VK.get(key)
+    if not vk:
+        return None
+    return mods, vk
+
+
+def hotkey_conflicts(mapping: dict) -> list:
+    """Пары действий, которым назначено одно и то же сочетание."""
+    seen, bad = {}, []
+    for _hid, key, label, _d in HOTKEY_ACTIONS:
+        parsed = parse_hotkey(mapping.get(key, ""))
+        if not parsed:
+            continue
+        if parsed in seen:
+            bad.append((seen[parsed], label))
+        else:
+            seen[parsed] = label
+    return bad
+
 
 class HotkeyFilter(QAbstractNativeEventFilter):
     def __init__(self, overlay:'Overlay', on_quit=None):
@@ -1935,7 +2826,7 @@ class Overlay(QWidget):
             p.setPen(QColor(255,255,255)); p.setFont(QFont("Segoe UI",10))
             m = "[CAPTURE]" if (self.edit_target=='capture' and r.split_mode) else "[DISPLAY]"
             p.drawText(tip, Qt.AlignLeft|Qt.AlignVCenter,
-                       f"{m}  Скорость: {r.typing_speed_cps} | (+/-/↑/↓, [ ]) | Ctrl+Alt+D — split | Tab — переключить | Ctrl+Alt+Q — выход в настройки")
+                       f"{m}  Скорость: {r.typing_speed_cps} | (Alt+↑/↓, Alt+[ ]) | Alt+D — split | Alt+G — переключить | Pause — выход в настройки")
 
     def _active_rect(self, r):
         return r.capture_rect if (self.edit_target == 'capture' and r.split_mode) else r.display_rect
@@ -2092,17 +2983,19 @@ class Overlay(QWidget):
         try:
             ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
         except Exception: pass
-        ctypes.windll.user32.RegisterHotKey(hwnd,1,0x0002|0x0001,0x70) # Ctrl+Alt+F1
-        ctypes.windll.user32.RegisterHotKey(hwnd,2,0x0002|0x0001,0x71) # Ctrl+Alt+F2
-        ctypes.windll.user32.RegisterHotKey(hwnd,3,0x0002|0x0001,0x4E) # Ctrl+Alt+N
-        ctypes.windll.user32.RegisterHotKey(hwnd,4,0x0002|0x0001,0x42) # Ctrl+Alt+B
-        ctypes.windll.user32.RegisterHotKey(hwnd,5,0x0002|0x0001,0x44) # Ctrl+Alt+D
-        ctypes.windll.user32.RegisterHotKey(hwnd,6,0x0002|0x0001,0x09) # Ctrl+Alt+Tab
-        ctypes.windll.user32.RegisterHotKey(hwnd,7,0x0002|0x0001,0x26) # Ctrl+Alt+Up
-        ctypes.windll.user32.RegisterHotKey(hwnd,8,0x0002|0x0001,0x28) # Ctrl+Alt+Down
-        ctypes.windll.user32.RegisterHotKey(hwnd,9,0x0002|0x0001,0xDD) # Ctrl+Alt+]
-        ctypes.windll.user32.RegisterHotKey(hwnd,10,0x0002|0x0001,0xDB)# Ctrl+Alt+[
-        ctypes.windll.user32.RegisterHotKey(hwnd,11,0x0002|0x0001,0x51)# Ctrl+Alt+Q
+        # Сочетания берём из настроек (вкладка «Кастомизация»), а не из констант:
+        # на коротких клавиатурах может не быть Pause, на других раскладках —
+        # своих занятых клавиш. Умолчания живут в HOTKEY_ACTIONS.
+        for hid, key, label, default in HOTKEY_ACTIONS:
+            seq = HOTKEYS.get(key) or default
+            parsed = parse_hotkey(seq)
+            if not parsed:
+                print(f"[HOTKEY] не разобрал сочетание {seq!r} для «{label}» — пропускаю")
+                continue
+            mods, vk = parsed
+            if not ctypes.windll.user32.RegisterHotKey(hwnd, hid, mods, vk):
+                print(f"[HOTKEY] НЕ удалось зарегистрировать {seq} — «{label}» "
+                      f"(занята другим приложением?)")
         for r in self.regions:
             if r.panel is None:
                 r.panel = RegionPanel(self); r.panel.show(); r.panel.apply_acrylic()
@@ -2262,8 +3155,57 @@ def scan_gguf(roots: list[Path]) -> tuple[list[str], list[str]]:
     models.sort(); projs.sort()
     return models, projs
 
-def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, parallel, ngl, use_fa=False, cache_type="q8_0"):
+_RE_LLAMA_DEV = re.compile(
+    r"^\s*((?:CUDA|Vulkan|ROCm|HIP|SYCL|Metal|OpenCL|CPU|RPC)\d*)\s*:\s*(.+?)\s*$")
+_DEV_CACHE: dict[str, list] = {}
+
+
+def list_llama_devices(exe: str, force: bool = False) -> list[tuple[str, str]]:
+    """
+    Спрашиваем у llama-server, какие устройства он видит: [("Vulkan0", "AMD Radeon RX 7800 XT (...)"), ...]
+
+    Зачем: CUDA-сборка перечисляет только карты NVIDIA, а Vulkan-сборка — ВСЁ,
+    что умеет Vulkan, включая встроенную графику процессора. llama.cpp по
+    умолчанию раскидывает слои по всем найденным устройствам, и на связке
+    "дискретка + встройка" падает с нарушением доступа прямо на подгонке
+    параметров под память. Поэтому пользователю нужен явный выбор.
+    Опрос стоит ~200 мс, результат кэшируется на путь к exe.
+    """
+    exe = str(exe or "")
+    if not exe:
+        return []
+    if not force and exe in _DEV_CACHE:
+        return _DEV_CACHE[exe]
+    devs: list[tuple[str, str]] = []
+    try:
+        r = subprocess.run([exe, "--list-devices"], capture_output=True, text=True,
+                           timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        grab = False
+        for line in (r.stdout or "").splitlines():
+            if "Available devices" in line:
+                grab = True
+                continue
+            if not grab:
+                continue
+            m = _RE_LLAMA_DEV.match(line)
+            if m:
+                devs.append((m.group(1), m.group(2)))
+            elif line.strip():
+                break
+    except Exception as e:
+        print("[LLM] не удалось опросить устройства:", e)
+    _DEV_CACHE[exe] = devs
+    if devs:
+        print("[LLM] устройства llama.cpp: " + ", ".join(f"{k} ({v})" for k, v in devs))
+    return devs
+
+
+def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, parallel, ngl, use_fa=False, cache_type="q8_0", device=""):
     cmd = [exe, "-m", model]
+    # Явный выбор устройства. Пусто = поведение llama.cpp по умолчанию (все сразу),
+    # что ломается на машинах с дискреткой + встройкой.
+    if device:
+        cmd += ["--device", str(device)]
     if mmproj:
         cmd += ["--mmproj", mmproj]
 
@@ -2278,6 +3220,13 @@ def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, pa
         cmd += ["-fa", "on"]
     # ===================
 
+    # Думающие модели (Gemma 4 и подобные) по умолчанию тратят сотни токенов на
+    # размышления, а при reasoning-format=deepseek кладут их в reasoning_content —
+    # в message.content остаётся ПУСТО, и перевод не появляется вовсе. В логе это
+    # выглядит как "n_gen = 620" на сервере и пустой ответ у клиента.
+    # Переводчику размышления не нужны: задача механическая, а цена — секунды.
+    cmd += ["--reasoning-budget", "0", "--reasoning-format", "none"]
+
     cmd += [
         "-ngl", str(int(ngl)),
         "--ctx-size", str(int(ctx)),
@@ -2291,17 +3240,57 @@ def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, pa
 
 
 def _ping_llama(url: str, timeout: float = 0.5) -> bool:
+    import requests
+    base = url.rstrip("/")
     try:
-        import requests
-        r = requests.get(url.rstrip("/") + "/health", timeout=timeout)
-        return r.status_code < 500
+        r = requests.get(base + "/health", timeout=timeout)
     except Exception:
-        try:
-            import requests
-            r = requests.get(url.rstrip("/") + "/v1/models", timeout=timeout)
-            return r.status_code < 500
-        except Exception:
-            return False
+        # До сервера не достучались вообще — второй эндпоинт на том же адресе
+        # не поможет, а стоить будет ещё один полный таймаут.
+        return False
+    if r.status_code < 500:
+        return True
+    # Сервер ответил, но /health отдал 5xx: у llama.cpp это бывает, пока грузится
+    # модель. Пробуем другой эндпоинт — вдруг сборка старая и /health в ней нет.
+    try:
+        return requests.get(base + "/v1/models", timeout=timeout).status_code < 500
+    except Exception:
+        return False
+
+def _wait_for_llama(server_url, attempts: int = 3, delay: float = 0.5,
+                    timeout: float = 2.0) -> bool:
+    """
+    Несколько попыток достучаться до уже запущенного сервера.
+    Одной мало: удалённый сервер за VPN отвечает не мгновенно (RTT + хендшейк),
+    и единственный промах на старте раньше приводил к попытке поднять свой.
+    Когда сервера нет локально, отказ приходит мгновенно — лишнего ожидания не будет.
+    """
+    for i in range(1, attempts + 1):
+        if _ping_llama(server_url, timeout=timeout):
+            if i > 1:
+                print(f"[LLM] сервер @ {server_url} ответил с попытки {i}/{attempts}")
+            return True
+        if i < attempts:
+            time.sleep(delay)
+    return False
+
+
+def _model_arg(cmd_list) -> str:
+    """Путь к модели из команды запуска. Пусто = локальной модели не задано."""
+    try:
+        parts = [str(x) for x in cmd_list]
+        i = parts.index("-m")
+        return parts[i + 1].strip() if i + 1 < len(parts) else ""
+    except ValueError:
+        return ""
+
+
+def _no_local_model_msg(server_url, tag=""):
+    print(f"[LLM]{tag} Сервер {server_url} не отвечает, а локальной модели не задано "
+          f"(-m пустой). Поднимать нечего — это штатный режим для клиентской машины, "
+          f"когда модель крутится на другом ПК. Проверьте: сервер там запущен, "
+          f"слушает нужный интерфейс (--host 0.0.0.0), порт совпадает и доступен.")
+
 
 _LLAMA_PROC = None
 _LLAMA_PROC2 = None
@@ -2324,8 +3313,11 @@ def _toggle_console(hide: bool):
 
 def _ensure_llama_server(cmd_list, server_url):
     global _LLAMA_PROC
-    if _ping_llama(server_url):
+    if _wait_for_llama(server_url):
         print(f"[LLM] server ok @ {server_url}")
+        return
+    if not _model_arg(cmd_list):
+        _no_local_model_msg(server_url)
         return
     print("[LLM] spawn:", cmd_list)
     _LLAMA_PROC = _spawn(cmd_list)
@@ -2351,8 +3343,11 @@ def _stop_llama_server():
 
 def _ensure_llama_server2(cmd_list, server_url):
     global _LLAMA_PROC2
-    if _ping_llama(server_url):
+    if _wait_for_llama(server_url):
         print(f"[LLM] server2 ok @ {server_url}")
+        return
+    if not _model_arg(cmd_list):
+        _no_local_model_msg(server_url, tag="[2]")
         return
     print("[LLM] spawn#2:", cmd_list)
     _LLAMA_PROC2 = _spawn(cmd_list)
@@ -2720,6 +3715,32 @@ class ConfigWindow(QWidget):
         fk.addRow("Интенсивность под строками:", self.spBoxBgAlpha)
         formCust.addWidget(gbK)
 
+        # Горячие клавиши
+        gbHk = QGroupBox("Горячие клавиши")
+        fhk = QFormLayout(gbHk)
+        _hint = QLabel(
+            "Нажмите на поле и введите сочетание. Пустое поле — действие отключено. "
+            "Ctrl лучше не использовать: в новеллах на нём висит скип диалога, и текст "
+            "пролистывается ещё до того, как сработает комбинация."
+        )
+        _hint.setWordWrap(True)
+        _hint.setStyleSheet("color: #888;")
+        fhk.addRow(_hint)
+
+        self.hkEdits = {}
+        for _hid, _key, _label, _default in HOTKEY_ACTIONS:
+            ed = QKeySequenceEdit()
+            ed.setKeySequence(QKeySequence.fromString(HOTKEYS.get(_key, _default),
+                                                      QKeySequence.PortableText))
+            ed.setMaximumSequenceLength(1)      # одна комбинация, не аккорд
+            self.hkEdits[_key] = ed
+            fhk.addRow(_label + ":", ed)
+
+        self.btnHkDefaults = QPushButton("Вернуть умолчания")
+        self.btnHkDefaults.clicked.connect(self._reset_hotkeys)
+        fhk.addRow("", self.btnHkDefaults)
+        formCust.addWidget(gbHk)
+
         formCust.addStretch()
         scrollCust.setWidget(innerCust)
         layCust.addWidget(scrollCust)
@@ -2779,6 +3800,16 @@ class ConfigWindow(QWidget):
             "f16: Без сжатия. Самое точное, но занимает много памяти."
         )
         fgo.addRow("Сжатие кэша (KV):", self.cbCacheType)
+
+        self.cbDevice = QComboBox()
+        self.cbDevice.setToolTip(
+            "Какую видеокарту отдать модели.\n"
+            "«Автоматически» — llama.cpp сам решает и при двух GPU пытается задействовать обе.\n"
+            "На связке дискретная + встроенная это приводит к падению сервера при старте —\n"
+            "в таком случае выберите дискретную карту явно."
+        )
+        self._reload_devices()
+        fgo.addRow("Видеокарта:", self.cbDevice)
         # -------------------------------------
 
         formModel.addWidget(self.gbGlobalOpt)
@@ -3011,7 +4042,7 @@ class ConfigWindow(QWidget):
         infoLabel.setOpenExternalLinks(True)
         infoLabel.setWordWrap(True)
         infoLabel.setText("АИ переводчик by IgoRexa. <br>"
-                            "Версия 1.0.2 <br>"
+                            f"Версия {APP_VERSION} <br>"
                             "GitHub: "
                             "<a href='https://github.com/igorexa225/AIGameTranslater'>"
                             "https://github.com/igorexa225/AIGameTranslater"
@@ -3043,6 +4074,48 @@ class ConfigWindow(QWidget):
         self._load_prefs_into_ui()
         self._reflow_mode_ui()
     
+    def _reset_hotkeys(self):
+        """Вернуть сочетания по умолчанию."""
+        for _hid, key, _label, default in HOTKEY_ACTIONS:
+            ed = self.hkEdits.get(key)
+            if ed is not None:
+                ed.setKeySequence(QKeySequence.fromString(default, QKeySequence.PortableText))
+
+    def _collect_hotkeys(self) -> dict:
+        """Снять сочетания из полей и предупредить о дублях."""
+        out = {}
+        for _hid, key, _label, default in HOTKEY_ACTIONS:
+            ed = self.hkEdits.get(key)
+            out[key] = ed.keySequence().toString(QKeySequence.PortableText) if ed else default
+        bad = hotkey_conflicts(out)
+        if bad:
+            pairs = "; ".join(f"«{a}» и «{b}»" for a, b in bad)
+            QMessageBox.warning(self, "Одинаковые сочетания",
+                                "Одно и то же сочетание назначено: " + pairs +
+                                ". Сработает только одно из этих действий.")
+        return out
+
+    def _reload_devices(self, force: bool = False):
+        """Перезаполняем список видеокарт по ответу llama-server --list-devices."""
+        keep = self.cbDevice.currentData() if self.cbDevice.count() else None
+        self.cbDevice.blockSignals(True)
+        self.cbDevice.clear()
+        self.cbDevice.addItem("Автоматически (все устройства)", "")
+        try:
+            for dev_id, desc in list_llama_devices(SERVER_EXE, force=force):
+                self.cbDevice.addItem(f"{dev_id}: {desc}", dev_id)
+        except Exception as e:
+            print("[UI] device list error:", e)
+        if keep:
+            i = self.cbDevice.findData(keep)
+            if i >= 0:
+                self.cbDevice.setCurrentIndex(i)
+            else:
+                # Карта пропала (сменили сборку llama.cpp) — не молчим
+                self.cbDevice.addItem(f"{keep} (не найдена сейчас)", keep)
+                self.cbDevice.setCurrentIndex(self.cbDevice.count() - 1)
+        self.cbDevice.blockSignals(False)
+
     def _open_model_hub(self):
         # пытаемся угадать папку моделей
         base = ""
@@ -3261,12 +4334,34 @@ class ConfigWindow(QWidget):
         self.spSlot.setValue(int(p.get("slot_id", 0)))
         self.cbCache.setChecked(bool(p.get("use_prompt_cache", True)))
 
+        # Где крутить EasyOCR (страж кадров). "auto" | true | false
+        global EASYOCR_GPU
+        EASYOCR_GPU = p.get("easyocr_gpu", "auto")
+
+        # Горячие клавиши: в HOTKEYS их читает регистрация в showEvent,
+        # в поля — чтобы пользователь видел текущие.
+        saved_hk = p.get("hotkeys") or {}
+        for _hid, _k, _lbl, _default in HOTKEY_ACTIONS:
+            HOTKEYS[_k] = saved_hk.get(_k, _default)
+            _ed = getattr(self, "hkEdits", {}).get(_k)
+            if _ed is not None:
+                _ed.setKeySequence(QKeySequence.fromString(HOTKEYS[_k],
+                                                           QKeySequence.PortableText))
+
         self.spCtx.setValue(int(p.get("ctx", 4096)))
         self.spBatch.setValue(int(p.get("batch", 256)))
         self.spUBatch.setValue(int(p.get("ubatch", 64)))
         self.spPar.setValue(int(p.get("parallel", 1)))
         self.spNGL.setValue(int(p.get("ngl", 999)))
         self.cbFlashAttn.setChecked(bool(p.get("use_flash_attn", False)))
+        dev = p.get("gpu_device", "")
+        if dev:
+            i = self.cbDevice.findData(dev)
+            if i < 0:
+                self.cbDevice.addItem(f"{dev} (не найдена сейчас)", dev)
+                i = self.cbDevice.count() - 1
+            self.cbDevice.setCurrentIndex(i)
+
         ctype = p.get("cache_type_k", "q4_0") # q4_0 по умолчанию для легкого пресета
         idx = self.cbCacheType.findData(ctype)
         if idx >= 0:
@@ -3453,6 +4548,10 @@ class ConfigWindow(QWidget):
             print("[UI] apply box-bg settings error:", e)
             
     def _collect_prefs(self) -> dict:
+        # Снимаем сочетания до сборки словаря: заодно предупредит о дублях
+        hk_now = self._collect_hotkeys()
+        HOTKEYS.update(hk_now)
+
         prefs = {
             "font_family": self.fontFamily.currentFont().family(),
             "source_lang": self.cbSourceLang.currentData(),
@@ -3488,6 +4587,7 @@ class ConfigWindow(QWidget):
             "seed": int(self.spSeed.value()),
             "slot_id": int(self.spSlot.value()),
             "use_prompt_cache": bool(self.cbCache.isChecked()),
+            "easyocr_gpu": EASYOCR_GPU,
             "ctx": int(self.spCtx.value()),
             "batch": int(self.spBatch.value()),
             "ubatch": int(self.spUBatch.value()),
@@ -3495,6 +4595,8 @@ class ConfigWindow(QWidget):
             "ngl": int(self.spNGL.value()),
             "use_flash_attn": self.cbFlashAttn.isChecked(),
             "cache_type_k": self.cbCacheType.currentData(),
+            "gpu_device": self.cbDevice.currentData() or "",
+            "hotkeys": hk_now,
             "host": self.edHost.text().strip(),
             "port": int(self.spPort.value()),
         }
@@ -3550,7 +4652,7 @@ class ConfigWindow(QWidget):
         except Exception as e:
             print("[UI] save on back error:", e)
 
-        # Вызывается по Ctrl+Alt+Q из оверлея
+        # Вызывается по Pause из оверлея
         try:
             stop_all_llama_servers()
         except Exception as e:
@@ -3721,6 +4823,7 @@ class ConfigWindow(QWidget):
         llm_cfg.seed           = int(self.spSeed.value())
         llm_cfg.slot_id        = int(self.spSlot.value())
         llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        llm_cfg.n_ctx          = int(self.spCtx.value())
         llm_cfg.source_lang    = self.cbSourceLang.currentData()
         self.overlay.source_lang = self.cbSourceLang.currentData()
         llm_cfg.mode = "wiki" if self.cbTextType.currentIndex() == 1 else "game"
@@ -3777,6 +4880,7 @@ class ConfigWindow(QWidget):
             return
 
         sel_cache = self.cbCacheType.currentData() or "q8_0"
+        sel_dev = self.cbDevice.currentData() or ""
         
         use_fa = getattr(self, "cbFlashAttn", None) and self.cbFlashAttn.isChecked()
         
@@ -3791,7 +4895,7 @@ class ConfigWindow(QWidget):
             parallel=int(self.spPar.value()),
             ngl=int(self.spNGL.value()),
             use_fa=use_fa,
-            cache_type=sel_cache
+            cache_type=sel_cache, device=sel_dev
         )
         print("[LLM] server exe:", SERVER_EXE)
 
@@ -3816,7 +4920,7 @@ class ConfigWindow(QWidget):
                 parallel=int(self.spPar.value()),
                 ngl=int(self.spNGL.value()),
                 use_fa=use_fa,
-                cache_type=sel_cache
+                cache_type=sel_cache, device=sel_dev
             )
 
             print("[LLM] model:", model_path)
@@ -3854,7 +4958,7 @@ class ConfigWindow(QWidget):
                 parallel=int(self.spPar1.value()),
                 ngl=int(self.spNGL1.value()),
                 use_fa=use_fa,
-                cache_type=sel_cache
+                cache_type=sel_cache, device=sel_dev
             )
             cmd2 = rebuild_server_cmd(
                 SERVER_EXE, tr_model, "",          # <- переводчик БЕЗ mmproj
@@ -3865,7 +4969,7 @@ class ConfigWindow(QWidget):
                 parallel=int(self.spPar2.value()),
                 ngl=int(self.spNGL2.value()),
                 use_fa=use_fa,
-                cache_type=sel_cache
+                cache_type=sel_cache, device=sel_dev
             )
 
             print("[LLM] spawn OCR:", cmd1)
@@ -3897,6 +5001,7 @@ class ConfigWindow(QWidget):
                 phrasebook_path=llm_cfg.phrasebook_path,
                 source_lang=self.overlay.source_lang,
                 use_prompt_cache=bool(self.cbCache.isChecked()),
+                n_ctx=int(self.spCtx2.value()),
                 mode=llm_cfg.mode,
             )
             
@@ -3927,7 +5032,7 @@ class ConfigWindow(QWidget):
                 ubatch=int(self.spUB1.value()),
                 parallel=int(self.spPar1.value()),
                 ngl=int(self.spNGL1.value()),
-                cache_type=sel_cache
+                cache_type=sel_cache, device=sel_dev
             )
             print("[LLM] spawn OCR (Online mode):", cmd1)
             _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
@@ -4040,6 +5145,7 @@ class ConfigWindow(QWidget):
         llm_cfg.seed           = int(self.spSeed.value())
         llm_cfg.slot_id        = int(self.spSlot.value())
         llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        llm_cfg.n_ctx          = int(self.spCtx.value())
         llm_cfg.source_lang    = self.cbSourceLang.currentData()
         llm_cfg.mode = "wiki" if self.cbTextType.currentIndex() == 1 else "game"
         # Отключаем разделение имен, если галочка снята (для UI это критично)
@@ -4075,6 +5181,7 @@ class ConfigWindow(QWidget):
             return
 
         sel_cache = self.cbCacheType.currentData() or "q8_0"
+        sel_dev = self.cbDevice.currentData() or ""
         use_fa = getattr(self, "cbFlashAttn", None) and self.cbFlashAttn.isChecked()
         
         _stop_llama_server()
@@ -4110,7 +5217,7 @@ class ConfigWindow(QWidget):
             mmproj_path = self.cbMmproj.currentText().strip()
             cmd = rebuild_server_cmd(SERVER_EXE, model_path, mmproj_path, host=host, port=port,
                 ctx=int(self.spCtx.value()), batch=int(self.spBatch.value()), ubatch=int(self.spUBatch.value()),
-                parallel=int(self.spPar.value()), ngl=int(self.spNGL.value()), use_fa=use_fa, cache_type=sel_cache)
+                parallel=int(self.spPar.value()), ngl=int(self.spNGL.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
             _ensure_llama_server(cmd, llm_cfg.server)
             try: preload_prompt_cache(llm_cfg)
             except: pass
@@ -4123,10 +5230,10 @@ class ConfigWindow(QWidget):
 
             cmd1 = rebuild_server_cmd(SERVER_EXE, ocr_model, ocr_mmproj, host=host1, port=port1,
                 ctx=int(self.spCtx1.value()), batch=int(self.spBatch1.value()), ubatch=int(self.spUB1.value()),
-                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), use_fa=use_fa, cache_type=sel_cache)
+                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
             cmd2 = rebuild_server_cmd(SERVER_EXE, tr_model, "", host=host2, port=port2,
                 ctx=int(self.spCtx2.value()), batch=int(self.spBatch2.value()), ubatch=int(self.spUB2.value()),
-                parallel=int(self.spPar2.value()), ngl=int(self.spNGL2.value()), use_fa=use_fa, cache_type=sel_cache)
+                parallel=int(self.spPar2.value()), ngl=int(self.spNGL2.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
             
             _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
             _ensure_llama_server2(cmd2, f"http://{host2}:{port2}")
@@ -4139,6 +5246,7 @@ class ConfigWindow(QWidget):
                 timeout_s=float(self.spTO2.value()), max_tokens=int(self.spMaxTok2.value()), slot_id=int(self.spSlot2.value()),
                 temp=float(self.spTemp2.value()), top_p=float(self.spTopP2.value()), system_override=(getattr(self,"_tr_prompt_override","") or None),
                 lore_path=llm_cfg.lore_path, phrasebook_path=llm_cfg.phrasebook_path, source_lang=self.fs_overlay.source_lang, mode=llm_cfg.mode,
+                n_ctx=int(self.spCtx2.value()),
                 disable_name_split=llm_cfg.disable_name_split)
 
         elif mode_idx == 2: # ONLINE
@@ -4147,7 +5255,7 @@ class ConfigWindow(QWidget):
             
             cmd1 = rebuild_server_cmd(SERVER_EXE, ocr_model, ocr_mmproj, host=host1, port=port1,
                 ctx=int(self.spCtx1.value()), batch=int(self.spBatch1.value()), ubatch=int(self.spUB1.value()),
-                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), cache_type=sel_cache)
+                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), cache_type=sel_cache, device=sel_dev)
             _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
 
             self.fs_overlay.ocr_cfg_dual = LLMConfigDual(server=f"http://{host1}:{port1}", model=ocr_model,
@@ -4156,7 +5264,7 @@ class ConfigWindow(QWidget):
                 disable_name_split=llm_cfg.disable_name_split)
             self.fs_overlay.tr_cfg_dual = None
 
-        # 1. Сначала скрываем обычный оверлей, чтобы он ОСВОБОДИЛ хоткеи (Ctrl+Alt+Q)
+        # 1. Сначала скрываем обычный оверлей, чтобы он ОСВОБОДИЛ хоткеи (Pause)
         if self.overlay:
             self.overlay.close()
 
@@ -4182,6 +5290,16 @@ def main():
     # --------------------------------------------------------------------------
 
     _setup_logging()
+    print(f"[START] GameTranslator {APP_VERSION}")
+
+    # Статус EasyOCR печатаем ЗДЕСЬ, а не в месте импорта: импорт идёт на
+    # уровне модуля, до настройки логирования, и при --noconsole его вывод
+    # не попадает никуда. Из-за этого причина сбоя была не видна вовсе.
+    if _EASYOCR_AVAILABLE:
+        print('[OCR-BOXES] easyocr готов, версия', getattr(easyocr, '__version__', '?'))
+    else:
+        print('[OCR-BOXES] easyocr НЕ импортировался:',
+              _EASYOCR_IMPORT_ERROR or 'причина не сохранена')
 
     app = QApplication(sys.argv)
     w = ConfigWindow()

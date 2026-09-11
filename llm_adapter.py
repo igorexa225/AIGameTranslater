@@ -44,6 +44,7 @@ class LLMConfig:
     lore_path: str = "assets/game_bible_exilium.txt"
     phrasebook_path: str | None = None
     max_ctx_chars: int = 30000
+    n_ctx: int = 4096          # --ctx-size сервера: по нему считается бюджет истории
 
     # прогрев
     use_prompt_cache: bool = True
@@ -233,23 +234,29 @@ def preload_prompt_cache(cfg: LLMConfig) -> bool:
 def vision_translate_from_images(region_png_b64: str,
                                 full_png_b64: str | None,
                                 cfg: LLMConfig,
-                                tgt_lang: str = "ru") -> str:
+                                tgt_lang: str = "ru",
+                                extra_context: str = "") -> str:
     """
     Принимает: base64 PNG обрезанной области (region_png_b64),
     опционально полный кадр окна (full_png_b64 — сейчас не используется).
+    extra_context — динамический блок (говорящий, его пол, история диалога),
+    собранный снаружи по тексту от EasyOCR. Дописывается ПОСЛЕ статичного
+    системного промпта, чтобы не ломать общий префикс для prompt-cache.
     Возвращает строку перевода на русский.
     """
     if not (cfg.enabled and cfg.server and region_png_b64):
-        return ""
+        return "", ""      # функция отдаёт пару (en, ru), одиночная "" ломала распаковку
 
     prev_en = _solo_get_last_en()
-    
+
     init_lore_once(cfg)
     system = _SYSTEM_PROMPT
 
     # В режиме Wiki ставим простой системный промпт, чтобы инструкции "для игр" не сбивали модель
     if getattr(cfg, "mode", "game") == "wiki":
         system = "You are a professional translator. Translate the text from the image to Russian."
+    elif extra_context:
+        system = system + "\n\n" + extra_context.strip()
 
     url = cfg.server.rstrip("/") + "/v1/chat/completions"
 
@@ -419,3 +426,71 @@ def vision_translate_from_images(region_png_b64: str,
             print(f"[LLM] vision error kind={kind}:", e)
 
     return "", ""
+
+
+def _parse_numbered_list(text: str, count: int) -> list:
+    """Парсит '[1] ...\n[2] ...' в список строк длиной count."""
+    result = [""] * count
+    for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]|\Z)', text, re.DOTALL):
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < count:
+            result[idx] = m.group(2).strip()
+    return result
+
+
+def vision_translate_batch(b64_images: list, cfg: "LLMConfig") -> list:
+    """Переводит список картинок ОДНИМ запросом (Qwen-VL и совместимые). Возвращает список RU-переводов."""
+    if not b64_images:
+        return []
+    if len(b64_images) == 1:
+        _, ru = vision_translate_from_images(b64_images[0], None, cfg)
+        return [ru]
+
+    init_lore_once(cfg)
+    lang_map = {"en": "English", "ja": "Japanese", "ch_sim": "Chinese", "ko": "Korean"}
+    src_lang = lang_map.get(getattr(cfg, "source_lang", "en"), "English")
+    n = len(b64_images)
+
+    content = []
+    for i, b64 in enumerate(b64_images):
+        content.append({"type": "text", "text": f"[{i+1}]"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}})
+    content.append({"type": "text", "text": (
+        f"These are {n} cropped {src_lang} text boxes from a game screen, numbered [1]–[{n}].\n"
+        "For each box read the text and translate it to Russian.\n"
+        "Reply ONLY with:\n[1] перевод\n[2] перевод\n..."
+    )})
+
+    url = cfg.server.rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT or "You are a professional game translator."},
+            {"role": "user",   "content": content},
+        ],
+        "temperature": cfg.temp,
+        "top_p": cfg.top_p,
+        "max_tokens": min(4096, n * 80),
+        "add_generation_prompt": True,
+        "slot_id": cfg.slot_id,
+        "seed": int(getattr(cfg, "seed", 0)),
+        "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
+    }
+
+    try:
+        import requests as _req
+        t0 = time.perf_counter()
+        r = _req.post(url, json=payload, timeout=float(cfg.timeout_s) * 2)
+        dt = (time.perf_counter() - t0) * 1000.0
+    except Exception as e:
+        print(f"[LLM][BATCH] connection error: {e}")
+        return [""] * n
+
+    if r.status_code != 200:
+        print(f"[LLM][BATCH] http {r.status_code} in {dt:.0f}ms")
+        return [""] * n
+
+    out = (r.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    out = re.sub(r"(?:<\|.*?\|>|&lt;\|.*?\|?&gt;|<s>|</s>|&lt;/s&gt;|<end_of_turn>|<start_of_turn>)", "", out, flags=re.IGNORECASE).strip()
+    print(f"[LLM][BATCH] {n} images → {len(out)} chars in {dt:.0f}ms")
+    return _parse_numbered_list(out, n)

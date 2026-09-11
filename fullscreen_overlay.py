@@ -15,15 +15,16 @@ from PySide6.QtWidgets import (QWidget, QApplication)
 import win32gui, win32ui, win32con, win32api
 import ctypes.wintypes as wt
 
-DEBUG_MODE = True  # Включаем сохранение отладочных картинок
+DEBUG_MODE = False  # Сохранение отладочных картинок (для отладки)
 
 # --- Импорты адаптеров (для доступа к нейросетям) ---
 import online_adapter
-from llm_adapter import vision_translate_from_images
+from llm_adapter import vision_translate_from_images, vision_translate_batch
 try:
     from llm_adapter_dual import (
         extract_en_from_image,
         translate_en_to_ru_text,
+        translate_batch_to_ru,
     )
 except Exception:
     pass
@@ -265,55 +266,100 @@ class TextPanel(QWidget):
             
             current_y += line_rect.height() + 4 # Учитываем отступ при отрисовке
 
-# ====================== Async Translation Task ======================
+# ====================== Async Batch Translation Task ======================
 
-class TranslationSignals(QObject):
-    result = Signal(int, str, int) # rid, text, generation
+def _parse_numbered_list(text: str, count: int) -> list:
+    """Парсит '[1] ...\n[2] ...' в список строк длиной count."""
+    result = [""] * count
+    for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]|\Z)', text, re.DOTALL):
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < count:
+            result[idx] = m.group(2).strip()
+    return result
 
-class TranslationTask(QRunnable):
-    def __init__(self, rid, crop_bgr, overlay, ocr_text, generation):
+
+class BatchTranslationSignals(QObject):
+    result = Signal(int, str, int)  # rid, text, generation
+
+
+class BatchTranslationTask(QRunnable):
+    """Переводит весь список боксов одним LLM-вызовом вместо N отдельных."""
+
+    def __init__(self, items, crops, overlay):
         super().__init__()
-        self.rid = rid
-        self.crop_bgr = crop_bgr
+        # items: list of {rid, rect, text, gen}
+        # crops: list of ndarray|None, same order
+        self.items = items
+        self.crops = crops
         self.overlay = overlay
-        self.ocr_text = ocr_text
-        self.generation = generation
-        self.signals = TranslationSignals()
+        self.signals = BatchTranslationSignals()
 
     def run(self):
+        if not self.items:
+            return
+        mode = self.overlay.work_mode_idx  # 0=SOLO, 1=DUAL, 2=ONLINE
+        results = {}  # rid -> (ru_text, gen)
+
         try:
-            b64 = _bgr_to_png_b64(self.crop_bgr)
-            mode = self.overlay.work_mode_idx # 0=SOLO, 1=DUAL, 2=ONLINE
-            ru_text = ""
-            
-            if mode == 0: # SOLO
-                # Принудительно ограничиваем токены для стабильности
-                cfg = self.overlay.llm_cfg
-                old_tok = cfg.max_tokens
-                cfg.max_tokens = 1024 
-                _, ru_text = vision_translate_from_images(b64, None, cfg)
-                cfg.max_tokens = old_tok
-                
-            elif mode == 1: # DUAL
-                # OCR
-                en = extract_en_from_image(b64, self.overlay.ocr_cfg_dual)
-                if en:
-                    # TR
-                    cfg = self.overlay.tr_cfg_dual
+            if mode == 2:  # ONLINE — батч текста через Google Translate
+                texts = [item['text'] for item in self.items]
+                numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(texts))
+                translated = online_adapter.translate_text(numbered)
+                parsed = _parse_numbered_list(translated, len(texts))
+                for item, ru in zip(self.items, parsed):
+                    if ru:
+                        results[item['rid']] = (ru, item['gen'])
+
+            elif mode == 1:  # DUAL — параллельный OCR + один батч-перевод
+                from concurrent.futures import ThreadPoolExecutor
+                valid = [(item, crop) for item, crop in zip(self.items, self.crops)
+                         if crop is not None and crop.size > 0]
+
+                def _ocr_one(pair):
+                    item, crop = pair
+                    try:
+                        b64 = _bgr_to_png_b64(crop)
+                        en = extract_en_from_image(b64, self.overlay.ocr_cfg_dual)
+                        return item['rid'], en or item['text'], item['gen']
+                    except Exception as e:
+                        print(f"[BATCH][OCR] rid={item['rid']}: {e}")
+                        return item['rid'], item['text'], item['gen']
+
+                ocr_map = {}  # rid -> (en_text, gen)
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    for rid, en, gen in ex.map(_ocr_one, valid):
+                        ocr_map[rid] = (en, gen)
+
+                ordered = [(item['rid'], ocr_map[item['rid']]) for item in self.items if item['rid'] in ocr_map]
+                if ordered:
+                    rids  = [r for r, _ in ordered]
+                    texts = [v[0] for _, v in ordered]
+                    gens  = [v[1] for _, v in ordered]
+                    ru_list = translate_batch_to_ru(texts, self.overlay.tr_cfg_dual)
+                    for rid, gen, ru in zip(rids, gens, ru_list):
+                        if ru:
+                            results[rid] = (ru, gen)
+
+            elif mode == 0:  # SOLO — несколько картинок в одном запросе
+                valid = [(item, crop) for item, crop in zip(self.items, self.crops)
+                         if crop is not None and crop.size > 0]
+                if valid:
+                    b64_list    = [_bgr_to_png_b64(crop) for _, crop in valid]
+                    valid_items = [item for item, _ in valid]
+                    cfg = self.overlay.llm_cfg
                     old_tok = cfg.max_tokens
-                    cfg.max_tokens = 1024
-                    ru_text = translate_en_to_ru_text(en, cfg)
+                    cfg.max_tokens = min(4096, len(valid) * 80)
+                    ru_list = vision_translate_batch(b64_list, cfg)
                     cfg.max_tokens = old_tok
-                    
-            elif mode == 2: # ONLINE
-                # Просто переводим текст от EasyOCR (быстро и дешево)
-                ru_text = online_adapter.translate_text(self.ocr_text)
-            
-            if ru_text:
-                self.signals.result.emit(self.rid, ru_text, self.generation)
-                
+                    for item, ru in zip(valid_items, ru_list):
+                        if ru:
+                            results[item['rid']] = (ru, item['gen'])
+
         except Exception as e:
-            print(f"[FULLSCREEN] Task error: {e}")
+            print(f"[BATCH] Error in mode={mode}: {e}")
+
+        for rid, (text, gen) in results.items():
+            self.signals.result.emit(rid, text, gen)
 
 # ====================== Hotkeys ======================
 
@@ -327,8 +373,8 @@ class FullscreenHotkeyFilter(QAbstractNativeEventFilter):
         msg = wt.MSG.from_address(int(msgptr))
         if msg.message == 0x0312: # WM_HOTKEY
             hid = msg.wParam
-            if hid == 101: self.overlay.quit_app()     # Ctrl+Alt+Q
-            elif hid == 102: self.overlay.toggle_pause() # Ctrl+Alt+F1
+            if hid == 101: self.overlay.quit_app()     # Pause
+            elif hid == 102: self.overlay.toggle_pause() # Alt+-
             return True, 0
         return False, 0
 
@@ -354,7 +400,7 @@ class FullscreenCaptureWorker(QThread):
     def stop(self):
         self._stop = True
 
-    def run(self):
+    def run(self):  # noqa: C901
         print("[FULLSCREEN] Worker started")
         while not self._stop:
             # Пауза
@@ -415,110 +461,89 @@ class FullscreenCaptureWorker(QThread):
             filtered_candidates = self._filter_overlapping_boxes(candidates)
 
             current_frame_ids = set()
-            
+            pending_batch = []  # боксы, готовые к переводу в этом кадре
+
             for item in filtered_candidates:
                 x, y, bw, bh = item['x'], item['y'], item['w'], item['h']
                 text = item['text']
-                
-                # Ищем совпадение с существующими регионами
+
                 matched_id = -1
                 for rid, rdata in self.active_regions.items():
                     rx, ry, rw, rh = rdata['rect']
-                    # Центры
                     cx1, cy1 = x + bw/2, y + bh/2
                     cx2, cy2 = rx + rw/2, ry + rh/2
-                    dist = ((cx1-cx2)**2 + (cy1-cy2)**2)**0.5
-                    
-                    if dist < 20: # Уменьшил с 50 до 20, чтобы боксы не прыгали на соседние слова
+                    if ((cx1-cx2)**2 + (cy1-cy2)**2)**0.5 < 20:
                         matched_id = rid
                         break
-                
+
                 if matched_id != -1:
-                    # Обновляем существующий
                     rdata = self.active_regions[matched_id]
                     current_frame_ids.add(matched_id)
-                    
-                    # Обновляем позицию
                     rdata['rect'] = (x, y, bw, bh)
                     self.update_panel_pos.emit(matched_id, x, y, bw, bh)
-                    
-                    # --- ПРОВЕРКА 1: Изменилась ли картинка? (Image Hash) ---
-                    # Это предотвращает дерганье перевода, если OCR "скачет", а картинка статична
+
                     x1, y1 = max(0, x), max(0, y)
                     x2, y2 = min(img.shape[1], x+bw), min(img.shape[0], y+bh)
                     crop = img[y1:y2, x1:x2]
-                    
+
                     if crop.size > 0:
-                        # Считаем хэш (уменьшенная копия)
                         small = cv2.resize(crop, (32, 32), interpolation=cv2.INTER_LINEAR)
                         small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                        
                         last_hash = rdata.get('last_hash')
                         is_same_image = False
-                        
                         if last_hash is not None:
-                            # MSE (Mean Squared Error)
                             err = np.sum((small_gray.astype("float") - last_hash.astype("float")) ** 2)
                             err /= float(small_gray.shape[0] * small_gray.shape[1])
-                            if err < 50: # Порог схожести
+                            if err < 50:
                                 is_same_image = True
-                        
                         rdata['last_hash'] = small_gray
-                        
-                        if is_same_image:
-                            # Картинка не изменилась -> считаем текст стабильным
-                            rdata['stability'] = rdata.get('stability', 0) + 1
-                            if rdata['stability'] == 1: # Переводим только когда стабилизировалось (1 кадр выдержки)
-                                print(f"[FULLSCREEN] Image stable, translating: {rdata['text'][:30]}...")
-                                self._queue_translation(matched_id, img, (x,y,bw,bh), rdata['text'], rdata.get('generation', 0))
-                            continue 
 
-                    # --- ПРОВЕРКА 2: Изменился ли текст? ---
+                        if is_same_image:
+                            rdata['stability'] = rdata.get('stability', 0) + 1
+                            if rdata['stability'] == 1:
+                                print(f"[FULLSCREEN] Image stable → batch: {rdata['text'][:30]}…")
+                                pending_batch.append({
+                                    'rid': matched_id, 'rect': (x, y, bw, bh),
+                                    'text': rdata['text'], 'gen': rdata.get('generation', 0)
+                                })
+                            continue
+
                     sim = SequenceMatcher(None, text, rdata['text']).ratio()
-                    if sim < 0.85: # Текст изменился
-                        print(f"[FULLSCREEN] Content changed: {rdata['text']} -> {text}")
+                    if sim < 0.85:
+                        print(f"[FULLSCREEN] Content changed: {rdata['text']} → {text}")
                         rdata['text'] = text
-                        rdata['stability'] = 0 # Сброс стабильности (не переводим пока не устоится)
+                        rdata['stability'] = 0
                         rdata['generation'] = rdata.get('generation', 0) + 1
                         self.update_panel_gen.emit(matched_id, rdata['generation'])
                     else:
-                        # Текст тот же -> повышаем стабильность
                         rdata['stability'] = rdata.get('stability', 0) + 1
-                        if rdata['stability'] == 1: # 1 кадр подтверждения
-                            print(f"[FULLSCREEN] Text stable, translating: {text[:30]}...")
-                            self._queue_translation(matched_id, img, (x,y,bw,bh), text, rdata.get('generation', 0))
+                        if rdata['stability'] == 1:
+                            print(f"[FULLSCREEN] Text stable → batch: {text[:30]}…")
+                            pending_batch.append({
+                                'rid': matched_id, 'rect': (x, y, bw, bh),
+                                'text': text, 'gen': rdata.get('generation', 0)
+                            })
                 else:
-                    # Новый регион
                     new_id = self.next_id
                     self.next_id += 1
-                    
                     self.active_regions[new_id] = {
-                        'rect': (x, y, bw, bh),
-                        'text': text,
-                        'trans': "",
-                        'last_hash': None,
-                        'stability': 0, # Новый регион всегда нестабилен
-                        'generation': 0
+                        'rect': (x, y, bw, bh), 'text': text,
+                        'trans': "", 'last_hash': None, 'stability': 0, 'generation': 0
                     }
                     current_frame_ids.add(new_id)
-                    
-                    # Инициализируем хэш для нового региона
                     x1, y1 = max(0, x), max(0, y)
                     x2, y2 = min(img.shape[1], x+bw), min(img.shape[0], y+bh)
                     if x2 > x1 and y2 > y1:
                         small = cv2.resize(img[y1:y2, x1:x2], (32, 32), interpolation=cv2.INTER_LINEAR)
                         self.active_regions[new_id]['last_hash'] = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
-                    # Создаем панель
                     self.create_panel.emit(new_id, x, y, bw, bh)
-                    # self._queue_translation(...) # УБРАНО: Не переводим сразу, ждем стабильности!
-            
+
+            # Один батч-запрос на все стабилизировавшиеся боксы этого кадра
+            if pending_batch:
+                self._queue_batch(img.copy(), pending_batch)
+
             # 4. Удаление старых
-            to_delete = []
-            for rid in self.active_regions:
-                if rid not in current_frame_ids:
-                    to_delete.append(rid)
-            
+            to_delete = [rid for rid in self.active_regions if rid not in current_frame_ids]
             for rid in to_delete:
                 self.delete_panel.emit(rid)
                 del self.active_regions[rid]
@@ -555,31 +580,27 @@ class FullscreenCaptureWorker(QThread):
                 keep.append(b)
         return keep
 
-    def _queue_translation(self, rid, full_img, rect, ocr_text, generation):
-        """Добавляет задачу на перевод в пул потоков."""
-        x, y, w, h = rect
-        # Crop with margin
+    def _queue_batch(self, full_img, items):
+        """Вырезает кропы для всех items и запускает один BatchTranslationTask."""
         h_img, w_img = full_img.shape[:2]
-        # Уменьшаем отступы, чтобы не захватывать соседние строки!
-        x1 = max(0, x - 2)
-        y1 = max(0, y)     # Убираем вертикальный отступ полностью (0px)
-        x2 = min(w_img, x + w + 2)
-        y2 = min(h_img, y + h) # Убираем вертикальный отступ полностью (0px)
-        
-        crop = full_img[y1:y2, x1:x2]
-        if crop.size == 0: return
-        
-        # --- DEBUG: Сохраняем то, что уходит на перевод ---
-        if DEBUG_MODE:
-            try:
-                d_dir = BASE_DIR / "debug_crops"
-                d_dir.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(d_dir / f"crop_{rid}_{int(time.time()*100)}.png"), crop)
-            except Exception: pass
+        crops = []
+        for item in items:
+            x, y, w, h = item['rect']
+            x1 = max(0, x - 2); y1 = max(0, y)
+            x2 = min(w_img, x + w + 2); y2 = min(h_img, y + h)
+            crop = full_img[y1:y2, x1:x2]
+            crops.append(crop.copy() if crop.size > 0 else None)
 
-        # Создаем задачу
-        task = TranslationTask(rid, crop.copy(), self.overlay, ocr_text, generation)
-        task.signals.result.connect(self.update_panel_text) # Через сигнал воркера
+            if DEBUG_MODE:
+                try:
+                    d_dir = BASE_DIR / "debug_crops"
+                    d_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(d_dir / f"crop_{item['rid']}_{int(time.time()*100)}.png"), crop)
+                except Exception:
+                    pass
+
+        task = BatchTranslationTask(items, crops, self.overlay)
+        task.signals.result.connect(self.update_panel_text)
         self.pool.start(task)
 
 # ====================== Main Overlay Class ======================
@@ -649,10 +670,13 @@ class FullscreenOverlay(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         hwnd = int(self.winId())
-        # 101 = Ctrl+Alt+Q (Quit)
-        RegisterHotKey(hwnd, 101, 0x0002 | 0x0001, 0x51) 
-        # 102 = Ctrl+Alt+F1 (Toggle Pause)
-        RegisterHotKey(hwnd, 102, 0x0002 | 0x0001, 0x70)
+        # Без Ctrl: его нажатие долетает до игры раньше, чем срабатывает комбинация,
+        # и новелла успевает заскипать диалог. Alt текст не скипает.
+        # 101 = Pause (Quit), 102 = Alt+- (Toggle Pause) — как в оконном режиме
+        if not RegisterHotKey(hwnd, 101, 0x0000, 0x13):
+            print("[HOTKEY] НЕ удалось зарегистрировать Pause (занята другим приложением?)")
+        if not RegisterHotKey(hwnd, 102, 0x0001, 0xBD):
+            print("[HOTKEY] НЕ удалось зарегистрировать Alt+- (занята другим приложением?)")
 
     def closeEvent(self, e):
         hwnd = int(self.winId())

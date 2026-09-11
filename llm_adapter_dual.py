@@ -34,13 +34,23 @@ def _load_bad_phrases():
 _load_bad_phrases()
 
 # ============== Мини-история диалога (EN) для MT-модели ================
+# ВАЖНО про prompt-cache llama.cpp: сервер переиспользует KV только для ОБЩЕГО
+# ПРЕФИКСА промпта. Поэтому история работает по принципу "только дописываем":
+# пока строки просто добавляются в конец, модель считает 1-2 новые реплики,
+# а не весь блок заново. Когда упираемся в лимит — режем ОДИН раз до
+# _HISTORY_KEEP_LINES (один дорогой пересчёт вместо пересчёта каждый кадр).
 _HISTORY_LOCK = threading.Lock()
-_HISTORY_MAX = 10  # Уменьшаем до 10 для стабильности (было 25)
+_HISTORY_MAX_LINES = 40        # верхняя планка по строкам (потом откат)
+_HISTORY_KEEP_LINES = 8        # сколько реплик остаётся после отката
+_HISTORY_LINE_MAX_CHARS = 300  # обрезаем гигантские OCR-простыни в истории
+_HISTORY_CTX_FRACTION = 0.60   # доля n_ctx, которую разрешено занимать промпту
 _HISTORY_EN: list[str] = []
 _HISTORY_LOG_PATH = os.path.join(os.path.dirname(__file__), "dialog_history.txt")
 _MEMORY_ENABLED = True
 _LAST_EN_TEXT = ""
 _LAST_RU_TEXT = ""
+_LAST_PROMPT_TOKENS = 0        # сколько токенов реально занял прошлый промпт (из usage)
+_HISTORY_ROLLOVERS = 0         # счётчик откатов (для диагностики)
 
 # ============== РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ ================
 _RE_MYSTERY = re.compile(r"[?？]+")
@@ -50,6 +60,11 @@ _RE_PAREN_CJK = re.compile(r"（.*?）")
 _RE_NON_WORD = re.compile(r"[^\w\s]+", flags=re.UNICODE)
 _RE_NUMERIC_LIKE = re.compile(r"^(?:Room|Level|Floor|Timer|Stage|Chapter|Part)\s*[\d\s\:\-\.]+$|^[\d\s\:\-\.]+$", re.IGNORECASE)
 _RE_SPECIAL_TOKENS = re.compile(r"(?:<\|.*?\|>|&lt;\|.*?\|?&gt;|<s>|</s>|&lt;/s&gt;|<end_of_turn>|<start_of_turn>)", flags=re.IGNORECASE)
+# Строчное латинское слово от трёх букв посреди русского текста — признак того,
+# что модель переключилась на английский на полуслове ("Фигурка hastily отпрянула").
+# Заглавные не ловим: это имена собственные, они в переводе остаются законно.
+_RE_LATIN_LOWER_WORD = re.compile(r"(?<![A-Za-z])[a-z]{3,}(?![A-Za-z])")
+_RE_THREE_EN_WORDS = re.compile(r"[a-zA-Z]{2,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}")
 
 # ============== LORE DB (персонажи/имена) ================
 _LORE_DB_LOCK = threading.Lock()
@@ -83,6 +98,11 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
         if ru_clean:
             line += f"  >>>  {ru_clean}"
 
+    # Ограничиваем длину ОДНОЙ строки: одна простыня из OCR не должна
+    # съедать весь бюджет истории (обрезка на записи — префикс остаётся стабильным).
+    if len(line) > _HISTORY_LINE_MAX_CHARS:
+        line = line[:_HISTORY_LINE_MAX_CHARS].rstrip() + "…"
+
     with _HISTORY_LOCK:
         # 1. Проверка на идентичность последней строки
         if _HISTORY_EN and _HISTORY_EN[-1] == line:
@@ -99,32 +119,107 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
                 _HISTORY_EN[-1] = line
                 return
 
+        # Только дописываем в конец — не двигаем окно! Иначе ломается общий
+        # префикс промпта и llama.cpp пересчитывает всю историю каждый кадр.
         _HISTORY_EN.append(line)
-        if len(_HISTORY_EN) > _HISTORY_MAX:
-            del _HISTORY_EN[0 : len(_HISTORY_EN) - _HISTORY_MAX]
-            
+
+        _write_history_file_locked()
+
+
+_HISTORY_FILE_MTIME = 0.0
+
+
+def _write_history_file_locked() -> None:
+    """Сброс истории на диск. Запоминаем mtime, чтобы отличить свою запись от чужой правки."""
+    global _HISTORY_FILE_MTIME
+    try:
+        with open(_HISTORY_LOG_PATH, "w", encoding="utf-8") as f:
+            for ln in _HISTORY_EN:
+                f.write(ln + "\n")
+        _HISTORY_FILE_MTIME = os.path.getmtime(_HISTORY_LOG_PATH)
+    except Exception as e:
+        print("[CTX] history log write error:", e)
+
+
+def load_dialog_history() -> int:
+    """
+    Поднимаем историю с диска. Перезапуск программы больше её не теряет —
+    без этого любая проверка правок начиналась с пустого контекста и была
+    несопоставима с предыдущим прогоном.
+    """
+    global _HISTORY_FILE_MTIME
+    try:
+        with open(_HISTORY_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        print("[CTX] history load error:", e)
+        return 0
+    with _HISTORY_LOCK:
+        _HISTORY_EN[:] = lines[-_HISTORY_MAX_LINES:]
         try:
-            with open(_HISTORY_LOG_PATH, "w", encoding="utf-8") as f:
-                for ln in _HISTORY_EN:
-                    f.write(ln + "\n")
-        except Exception as e:
-            print("[CTX] history log write error:", e)
+            _HISTORY_FILE_MTIME = os.path.getmtime(_HISTORY_LOG_PATH)
+        except Exception:
+            pass
+        n = len(_HISTORY_EN)
+    print(f"[CTX] история поднята с диска: {n} строк")
+    return n
 
 
-def _build_dialog_context_block(max_chars: int = 4000) -> str:
-    """Формируем текстовый блок с последними репликами для промпта."""
+def _reload_history_if_edited() -> None:
+    """Файл правили руками во время работы — подхватываем на лету."""
+    try:
+        m = os.path.getmtime(_HISTORY_LOG_PATH)
+    except Exception:
+        return
+    if _HISTORY_FILE_MTIME and abs(m - _HISTORY_FILE_MTIME) > 0.001:
+        print("[CTX] dialog_history.txt изменён снаружи — перечитываю")
+        load_dialog_history()
+
+
+def _rollover_history_locked(reason: str) -> None:
+    """Одноразовый откат истории до хвоста. Вызывать под _HISTORY_LOCK."""
+    global _HISTORY_ROLLOVERS
+    n = len(_HISTORY_EN)
+    if n <= _HISTORY_KEEP_LINES:
+        return
+    del _HISTORY_EN[0 : n - _HISTORY_KEEP_LINES]
+    _HISTORY_ROLLOVERS += 1
+    print(f"[CTX] history rollover #{_HISTORY_ROLLOVERS} ({reason}): {n} -> "
+          f"{len(_HISTORY_EN)} строк, промпт пересчитается один раз")
+    _write_history_file_locked()
+
+
+def _maybe_rollover_history(cfg: "LLMConfig") -> None:
+    """
+    Проверяем перед сборкой промпта, не пора ли обнулить историю.
+    Триггеры: слишком много строк ИЛИ прошлый промпт занял больше
+    _HISTORY_CTX_FRACTION от контекста (меряем по факту, из usage сервера).
+    """
+    _reload_history_if_edited()
+    n_ctx = int(getattr(cfg, "n_ctx", 0) or 4096)
+    limit_tokens = max(512, int(n_ctx * _HISTORY_CTX_FRACTION))
+    with _HISTORY_LOCK:
+        if len(_HISTORY_EN) <= _HISTORY_KEEP_LINES:
+            return
+        if len(_HISTORY_EN) > _HISTORY_MAX_LINES:
+            _rollover_history_locked(f"строк > {_HISTORY_MAX_LINES}")
+        elif _LAST_PROMPT_TOKENS > limit_tokens:
+            _rollover_history_locked(
+                f"промпт {_LAST_PROMPT_TOKENS} ток. > {limit_tokens} (n_ctx={n_ctx})")
+
+
+def _build_dialog_context_block(max_chars: int = 0) -> str:
+    """
+    Формируем текстовый блок с репликами для промпта.
+    Отдаём историю ЦЕЛИКОМ (бюджет уже соблюдён на записи/откате) — так блок
+    растёт только с конца и попадает в prompt-cache.
+    """
     with _HISTORY_LOCK:
         if not _HISTORY_EN:
             return ""
-        collected: list[str] = []
-        total = 0
-        for ln in reversed(_HISTORY_EN):
-            extra = len(ln) + 2
-            if collected and total + extra > max_chars:
-                break
-            collected.append(ln)
-            total += extra
-        collected.reverse()
+        collected = list(_HISTORY_EN)
 
     # Используем формат чата без нумерации, чтобы не провоцировать списки
     history_text = "\n".join(collected)
@@ -236,6 +331,115 @@ def _get_char_info_from_name(name_line: str | None) -> dict | None:
         return None
     with _LORE_DB_LOCK:
         return _CHAR_DB.get(cname)
+
+
+def find_char_fuzzy(raw_name: str | None, min_ratio: float = 0.80,
+                    margin: float = 0.10) -> dict | None:
+    """
+    Поиск персонажа по ГРЯЗНОМУ имени (из EasyOCR: 'Konia1', 'KoniaI', 'Konial:').
+    В отличие от _get_char_info_from_name допускает опечатки, но осторожно:
+    пол модель проверить по картинке не может, она просто выполнит директиву,
+    поэтому промах персонажем хуже, чем отсутствие подсказки. Если два кандидата
+    идут рядом (разрыв меньше margin) — возвращаем None, пусть решает модель.
+    """
+    cn = _canon_name(raw_name or "")
+    if not cn:
+        return None
+
+    with _LORE_DB_LOCK:
+        exact = _CHAR_DB.get(cn)
+        items = list(_CHAR_DB.items())
+    if exact:
+        return exact
+    if len(cn) < 3 or not items:
+        return None      # на 1-2 символах нечёткий поиск бессмысленен
+
+    scored = sorted(((SequenceMatcher(None, cn, k).ratio(), k) for k, _ in items),
+                    key=lambda x: x[0], reverse=True)
+    best_ratio, best_key = scored[0]
+    if best_ratio < min_ratio:
+        return None
+    if len(scored) > 1 and (best_ratio - scored[1][0]) < margin:
+        print(f"[DUAL][LORE] '{raw_name}' похоже сразу на '{best_key}' ({best_ratio:.2f}) "
+              f"и '{scored[1][1]}' ({scored[1][0]:.2f}) — не угадываем")
+        return None
+    with _LORE_DB_LOCK:
+        info = _CHAR_DB.get(best_key)
+    if info:
+        print(f"[DUAL][LORE] '{raw_name}' -> '{info['en']}' (совпадение {best_ratio:.2f})")
+    return info
+
+
+def build_solo_context(easy_text: str, cfg, lang: str = "en") -> str:
+    """
+    Динамический блок для SOLO-режима: история диалога, говорящий, его пол и пол
+    собеседника. Всё то, что модель НЕ может вывести из картинки, хотя имя и текст
+    она там видит сама.
+
+    easy_text — черновик от EasyOCR (грязный), нужен только как ключ поиска по лору.
+    Порядок блоков важен для prompt-cache: сначала история (она только дописывается
+    и потому попадает в общий префикс), потом волатильное — говорящий и инструкции.
+    """
+    parts: list[str] = []
+
+    # 1. История — самая стабильная часть, идёт первой
+    if _MEMORY_ENABLED:
+        _maybe_rollover_history(cfg)
+        ctx_block = _build_dialog_context_block()
+        if ctx_block:
+            parts.append(ctx_block.strip())
+
+    # 2. Говорящий и его пол (имя грязное — ищем нечётко)
+    info = None
+    if easy_text:
+        try:
+            name_line, _body = _split_name_and_body(easy_text, lang)
+        except Exception:
+            name_line = None
+        if name_line:
+            info = find_char_fuzzy(name_line)
+
+    special = ""
+    if info:
+        g = info.get("gender")
+        tag = f"[{g}] " if g in ("F", "M") else ""
+        parts.append(f"<speaker>\n{tag}{info['en']}\n</speaker>")
+        if g == "F":
+            special += ("SPEAKER is FEMALE. Use feminine grammatical gender for 'I' "
+                        "(e.g., 'я поняла', 'я сама').\n")
+        elif g == "M":
+            special += ("SPEAKER is MALE. Use masculine grammatical gender for 'I' "
+                        "(e.g., 'я понял', 'я сам').\n")
+
+    # 3. Собеседник — предыдущий говорящий из истории. Имена там чистые
+    #    (пишутся по выводу модели), поэтому ищем точно, без нечёткого поиска.
+    if _MEMORY_ENABLED:
+        with _HISTORY_LOCK:
+            last_line = _HISTORY_EN[-1] if _HISTORY_EN else ""
+        m = re.match(r"^(.*?):\s", last_line)
+        if m:
+            last_speaker = m.group(1).strip()
+            same_person = bool(info) and _canon_name(last_speaker) == _canon_name(info["en"])
+            if last_speaker and not same_person:
+                a_info = _get_char_info_from_name(last_speaker)
+                ag = a_info.get("gender") if a_info else None
+                if ag == "F":
+                    special += ("ADDRESSEE (the person being spoken to) is FEMALE. Use feminine "
+                                "grammatical gender for 'you' (e.g., 'ты пришла', 'ты была'). AND for "
+                                "any noun or epithet addressed to them (insults included): pick the "
+                                "FEMININE form of the noun, never the masculine one.\n")
+                elif ag == "M":
+                    special += ("ADDRESSEE (the person being spoken to) is MALE. Use masculine "
+                                "grammatical gender for 'you' (e.g., 'ты пришёл', 'ты был'). AND for "
+                                "any noun or epithet addressed to them (insults included): pick the "
+                                "MASCULINE form of the noun, never the feminine one.\n")
+                else:
+                    special += f"The speaker is talking to {last_speaker}. Ensure grammatical agreement.\n"
+
+    if special:
+        parts.append(f"<instructions>\n{special.strip()}\n</instructions>")
+
+    return "\n\n".join(parts)
 
 
 def _build_lore_snippet_for_text(
@@ -354,6 +558,7 @@ class LLMConfig:
     max_ctx_chars: int = 30000
     # prompt-cache:
     use_prompt_cache: bool = True
+    n_ctx: int = 4096          # --ctx-size сервера: по нему считаем бюджет истории
     disable_name_split: bool = False
 
 # ======= OCR: минимальный system для считывания текста =====
@@ -416,9 +621,24 @@ def _build_tr_system(lore_text: str, phrasebook_text: str, lang_code: str = "en"
         "TRANSLATION GUIDELINES:\n"
         "1. Output ONLY the Russian translation. Do not add notes, comments, or XML tags.\n"
         "2. The 'Dialogue History' is provided ONLY for context. Translate ONLY the final User message.\n"
-        "3. Match the exact intensity of the original text, including slang, humor, and profanity.\n"
+        "3. REGISTER: Match the exact intensity of the original text, including slang, humor and profanity.\n"
+        "   - Translation must be neither softer NOR harsher than the source.\n"
+        "   - If the source is explicit (f-word and the like), the Russian must be equally explicit, "
+        "up to and including obscene register (мат). Published localisations habitually tone such "
+        "lines down — do NOT follow that habit.\n"
+        "   - Specifically: do NOT downgrade explicit profanity to mild fillers "
+        "('чёрт', 'блин', 'проклятье', 'дьявол').\n"
+        "   - Never censor, never mask letters with asterisks, never use euphemisms.\n"
+        "   - If the source is mild or neutral, keep it mild — do not add profanity that is not there.\n"
+        "   - KEEP THE CONSTRUCTION: an intensifying adjective + noun (\"you fucking bastard\") must "
+        "stay adjective + noun in Russian, agreeing in gender with the addressee. Do NOT split it "
+        "into two separate insults joined by commas.\n"
         "4. INCOMPLETE SENTENCES: If a sentence is cut off (e.g., ends with '-' or '...'), translate it exactly as is. Do NOT attempt to finish the thought or predict the next words.\n"
-        "5. If there is no text to translate, return the original punctuation or the word '(затуп)'.\n\n"
+        "5. ALREADY-RUSSIAN FRAGMENTS: If part of the source is already written in Cyrillic "
+        "(e.g., \"Блин! Did the suit break down?\"), copy that part CHARACTER FOR CHARACTER into "
+        "your output. Game writers insert such words on purpose to colour a character's speech. "
+        "Do NOT re-translate, normalise or replace them with synonyms.\n"
+        "6. If there is no text to translate, return the original punctuation or the word '(затуп)'.\n\n"
         
         f"{style_block}\n\n"
         
@@ -466,10 +686,15 @@ def _ensure_tr_system(cfg: LLMConfig) -> str:
         return sys_txt
 
 def reset_tr_system_cache():
-    global _LORE_INIT, _TR_SYSTEM_CACHED
+    global _LORE_INIT, _TR_SYSTEM_CACHED, _LORE_DB_INIT
     with _LORE_LOCK:
         _LORE_INIT = False
         _TR_SYSTEM_CACHED = ""
+        # Базу персонажей (имена + пол) тоже надо считать заново. Без этого
+        # _load_lore_db_from_text молча выходит по своему флагу, файл перечитывается
+        # впустую, и правка "пол: Женский" применялась только после перезапуска
+        # программы. Сбрасывается только при СМЕНЕ ПУТИ — а путь при правке тот же.
+        _LORE_DB_INIT = False
 
 def reset_translation_cache():
     """Сброс кэша последнего перевода (анти-эхо)."""
@@ -697,7 +922,16 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
                 "good", "well", "just", "only", "not", "then", "there", "here", "now", "very", "too", "also", "up",
                 # contractions
                 "i'm", "i've", "i'll", "i'd", "you're", "you've", "he's", "she's", "it's", "we're", "they're",
-                "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't", "can't", "won't", "wouldn't"
+                "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't", "can't", "won't", "wouldn't",
+                # междометия и отклики — их тут не хватало, и реплики вида
+                # "Hm? Ah. Sure. You can..." эвристика принимала за "Имя: текст",
+                # потому что первые два слова с заглавной. Первое слово срезалось
+                # как имя, и перевод начинался с середины фразы.
+                "hm", "hmm", "hmph", "ah", "ahh", "aha", "oh", "ooh", "eh", "uh", "um", "er", "erm",
+                "mm", "mmm", "hey", "huh", "wow", "whoa", "woah", "ha", "hah", "haha", "heh", "kya",
+                "yes", "yeah", "yep", "yup", "no", "nope", "nah", "ok", "okay", "alright", "right",
+                "sure", "fine", "please", "sorry", "thanks", "wait", "look", "listen", "stop",
+                "hello", "hi", "bye", "damn", "god", "geez", "ugh", "tch", "phew", "oops", "ouch",
             )
             if name_candidate.lower() in common_starters:
                 pass # Это обычное слово, пропускаем эвристику
@@ -944,11 +1178,13 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             "Output ONLY the Russian translation.\n"
             "Do NOT add notes, explanations, or advice."
         )
-        # Используем базовые настройки, но без сложной логики
-        # (код отправки запроса ниже общий, просто подменили system/user_content)
-        # Но нужно пропустить логику split_name_and_body
         name_line = None
         target_ru_name_for_cleaning = None
+        body = en_text  # нужно для echo-проверки и estimated_max
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_content},
+        ]
     else:
         # === GAME MODE: Стандартная логика ===
         system = _ensure_tr_system(cfg)
@@ -1002,7 +1238,8 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
 
         # 3. Собираем контекст и определяем собеседника
         if _MEMORY_ENABLED:
-            ctx_block = _build_dialog_context_block(max_chars=min(2048, cfg.max_ctx_chars))
+            _maybe_rollover_history(cfg)
+            ctx_block = _build_dialog_context_block()
         else:
             ctx_block = ""
 
@@ -1045,9 +1282,9 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
 
         # ПРИНУДИТЕЛЬНОЕ УКАЗАНИЕ ПОЛА СОБЕСЕДНИКА (Для обращений на 'Ты')
         if addressee_gender == "F":
-            special_instruction += f"ADDRESSEE (the person being spoken to) is FEMALE. Use feminine grammatical gender for 'you/thou' (e.g., 'ты пришла', 'ты была').\n"
+            special_instruction += f"ADDRESSEE (the person being spoken to) is FEMALE. Use feminine grammatical gender for 'you/thou' (e.g., 'ты пришла', 'ты была'). AND for any noun or epithet addressed to them (insults included): pick the FEMININE form of the noun, never the masculine one.\n"
         elif addressee_gender == "M":
-            special_instruction += f"ADDRESSEE (the person being spoken to) is MALE. Use masculine grammatical gender for 'you/thou' (e.g., 'ты пришел', 'ты был').\n"
+            special_instruction += f"ADDRESSEE (the person being spoken to) is MALE. Use masculine grammatical gender for 'you/thou' (e.g., 'ты пришел', 'ты был'). AND for any noun or epithet addressed to them (insults included): pick the MASCULINE form of the noun, never the feminine one.\n"
         elif addressee_name:
              # Если пол не знаем, но знаем имя - просто намекаем
              special_instruction += f"The speaker is talking to {addressee_name}. Ensure grammatical agreement.\n"
@@ -1134,7 +1371,26 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         out = (js.get("choices", [{}])[0]
                   .get("message", {})
                   .get("content") or "").strip()
-                  
+
+        # --- Замер промпта и попадания в кэш (по факту, а не на глазок) ---
+        global _LAST_PROMPT_TOKENS
+        try:
+            usage = js.get("usage") or {}
+            p_tok = int(usage.get("prompt_tokens") or 0)
+            if p_tok:
+                _LAST_PROMPT_TOKENS = p_tok
+                tm = js.get("timings") or {}
+                # prompt_n — сколько токенов сервер реально посчитал (мимо кэша)
+                evaluated = int(tm.get("prompt_n") or 0)
+                if evaluated:
+                    hit = 100.0 * max(0, p_tok - evaluated) / max(1, p_tok)
+                    print(f"[DUAL][TR-CTX] prompt={p_tok} ток., пересчитано={evaluated} "
+                          f"(кэш {hit:.0f}%), история={len(_HISTORY_EN)} строк")
+                else:
+                    print(f"[DUAL][TR-CTX] prompt={p_tok} ток., история={len(_HISTORY_EN)} строк")
+        except Exception:
+            pass
+
         print(f"[DUAL][TR-RAW] Attempt {attempt} output: {repr(out)}")
 
         # Clean special tokens (like <|im_end|>, </s>, etc.)
@@ -1270,9 +1526,16 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
                  return ""
         
         # FIX: Улучшенный анти-эхо фильтр: Фильтр "Полу-перевода"
-        # Если есть кириллица, но также есть 3+ английских слова подряд (признак смешанного языка)
-        if re.search(r'[а-яА-Я]', out) and re.search(r'[a-zA-Z]{2,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}', out):
+        # Смешанный язык ловим двумя правилами:
+        #   1) три английских слова подряд — кусок оригинала протёк в перевод;
+        #   2) ОДНО строчное латинское слово — модель переключилась на английский
+        #      посреди фразы. Старого правила на это не хватало: строка
+        #      "Фигурка hastily отпрянула..." проходила фильтр целиком.
+        if re.search(r'[а-яА-Я]', out) and (
+                _RE_THREE_EN_WORDS.search(out) or _RE_LATIN_LOWER_WORD.search(out)):
              if attempt < max_retries:
+                 _bad = _RE_LATIN_LOWER_WORD.findall(out)[:3]
+                 print(f"[DUAL][TR] Смешанный язык (英/рус): {_bad or 'три слова подряд'} — ретрай")
                  current_temp = min(0.7, current_temp + 0.1)
                  current_seed += 999
                  continue
@@ -1299,7 +1562,22 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         global _LAST_EN_TEXT, _LAST_RU_TEXT
 
         # === ЖЕСТКИЙ АНТИ-ЭХО ФИЛЬТР ===
-        if out and out == _LAST_RU_TEXT and en_text.strip().lower() != _LAST_EN_TEXT:
+        # Сравниваем ТЕЛО (без имени). Считаем эхом только если содержание реально изменилось —
+        # т.е. предыдущее тело НЕ является подстрокой нового и схожесть < 60%.
+        # Это защищает от ложных срабатываний когда:
+        #   - OCR дублирует текст ("sentence\nName: sentence" = 296 chars vs 143)
+        #   - OCR то читает имя, то нет (IgoRexa: / lgoRexa: / без имени)
+        _body_key = body.strip().lower() if body else en_text.strip().lower()
+        if _LAST_EN_TEXT:
+            _body_same = (
+                _LAST_EN_TEXT in _body_key
+                or _body_key in _LAST_EN_TEXT
+                or SequenceMatcher(None, _body_key, _LAST_EN_TEXT).ratio() > 0.6
+            )
+        else:
+            _body_same = True
+
+        if out and out == _LAST_RU_TEXT and not _body_same:
             print(f"[DUAL][TR-WARN] LLM Echo detected! English changed but RU is identical: '{out}'")
             if attempt < max_retries:
                 current_temp = min(0.8, current_temp + 0.15)
@@ -1315,8 +1593,9 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             
         if not is_leak:
             print(f"[DUAL][TR] {len(out)} chars in {dt:.0f} ms, text = {repr(out[:200])}")
-            # Сохраняем успешный перевод в память для проверки следующей фразы
-            _LAST_EN_TEXT = en_text.strip().lower()
+            # Сохраняем тело (без имени) — чтобы при следующем кадре
+            # не триггерить ложное эхо если имя в OCR читается по-разному
+            _LAST_EN_TEXT = _body_key
             _LAST_RU_TEXT = out
             return out
         
@@ -1325,21 +1604,79 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             current_seed += 123456
             continue
             
+    # Все попытки провалены. Раньше тут вычищалась ВСЯ история (и вместе с ней
+    # весь prompt-cache) из-за одной кривой строки — теперь оставляем хвост.
     with _HISTORY_LOCK:
-        _HISTORY_EN.clear()
-    try:
-        with open(_HISTORY_LOG_PATH, "w", encoding="utf-8") as f: f.write("")
-    except: pass
+        _rollover_history_locked("перевод не удался")
     return ""
 
 def commit_history_manually(en_text: str, ru_text: str = ""):
     """Вручную добавляем фразу в историю (вызывается из оверлея ПОСЛЕ стабилизации)."""
-    # Если память выключена или текст пустой — выходим
     if not _MEMORY_ENABLED or not en_text:
         return
-    
-    # Используем ту же логику разделения (Имя: Текст), что и при переводе
     name, body = _split_name_and_body(en_text)
-    
-    # Пишем в лог
     _add_dialog_history(name, body, ru_text)
+
+
+def _parse_numbered_list(text: str, count: int) -> list:
+    """Парсит '[1] ...\n[2] ...' в список строк длиной count."""
+    result = [""] * count
+    for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]|\Z)', text, re.DOTALL):
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < count:
+            result[idx] = m.group(2).strip()
+    return result
+
+
+def translate_batch_to_ru(texts: list, cfg: "LLMConfig") -> list:
+    """Переводит список текстов ОДНИМ запросом к LLM. Возвращает список той же длины."""
+    if not texts:
+        return []
+    if len(texts) == 1:
+        return [translate_en_to_ru_text(texts[0], cfg)]
+
+    system = _ensure_tr_system(cfg)
+    numbered = "\n".join(f"[{i+1}] {t.strip()}" for i, t in enumerate(texts))
+    user_content = (
+        "Translate each numbered line to Russian. "
+        "Reply ONLY with the same numbered format. Do not add explanations.\n\n"
+        + numbered
+    )
+
+    url = cfg.server.rstrip("/") + "/v1/chat/completions"
+    max_out = min(int(cfg.max_tokens), max(300, sum(len(t) for t in texts) * 5), 4096)
+
+    payload = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_content},
+        ],
+        "temperature": cfg.temp,
+        "top_p": cfg.top_p,
+        "top_k": int(cfg.top_k),
+        "repeat_penalty": float(cfg.repeat_penalty),
+        "max_tokens": max_out,
+        "add_generation_prompt": True,
+        "slot_id": cfg.slot_id,
+        "seed": int(cfg.seed),
+        "cache_prompt": False,
+        "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
+    }
+
+    try:
+        t0 = time.perf_counter()
+        r = _SESSION.post(url, json=payload, timeout=cfg.timeout_s)
+        dt = (time.perf_counter() - t0) * 1000.0
+    except Exception as e:
+        print(f"[DUAL][TR-BATCH] connection error: {e}")
+        return [""] * len(texts)
+
+    if r.status_code != 200:
+        print(f"[DUAL][TR-BATCH] http {r.status_code} in {dt:.0f}ms")
+        return [""] * len(texts)
+
+    out = (r.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    out = _RE_SPECIAL_TOKENS.sub("", out).strip()
+    print(f"[DUAL][TR-BATCH] {len(texts)} texts → {len(out)} chars in {dt:.0f}ms")
+    return _parse_numbered_list(out, len(texts))
