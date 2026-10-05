@@ -44,6 +44,7 @@ _HISTORY_MAX_LINES = 40        # верхняя планка по строкам
 _HISTORY_KEEP_LINES = 8        # сколько реплик остаётся после отката
 _HISTORY_LINE_MAX_CHARS = 300  # обрезаем гигантские OCR-простыни в истории
 _HISTORY_CTX_FRACTION = 0.60   # доля n_ctx, которую разрешено занимать промпту
+_HISTORY_SEP = "  >>>  "       # разделитель "оригинал >>> перевод" в строке истории
 _HISTORY_EN: list[str] = []
 _HISTORY_LOG_PATH = os.path.join(os.path.dirname(__file__), "dialog_history.txt")
 _MEMORY_ENABLED = True
@@ -65,11 +66,25 @@ _RE_SPECIAL_TOKENS = re.compile(r"(?:<\|.*?\|>|&lt;\|.*?\|?&gt;|<s>|</s>|&lt;/s&
 # Заглавные не ловим: это имена собственные, они в переводе остаются законно.
 _RE_LATIN_LOWER_WORD = re.compile(r"(?<![A-Za-z])[a-z]{3,}(?![A-Za-z])")
 _RE_THREE_EN_WORDS = re.compile(r"[a-zA-Z]{2,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}")
+# Блоки, которые мы сами кладём в промпт переводчика; в ответе модели это всегда эхо
+_RE_PROMPT_ECHO_BLOCK = re.compile(r"<(speaker|lore|instructions|context)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_RE_PROMPT_ECHO_TAG = re.compile(r"</?(?:speaker|lore|instructions|context)>", re.IGNORECASE)
 
 # ============== LORE DB (персонажи/имена) ================
 _LORE_DB_LOCK = threading.Lock()
 _LORE_DB_INIT = False
-_CHAR_DB: dict[str, dict] = {}  # canon_en_name -> {en, ru, gender, raw}
+_CHAR_DB: dict[str, dict] = {}  # canon_en_name -> {en, ru, gender, hints, raw}
+_TERM_DB: dict[str, dict] = {}  # то же для терминов/организаций (строки без "пол:")
+
+
+def _fmt_lore_line(info: dict) -> str:
+    """Строка подсказки для модели: '- EN -> RU (female; пояснение; заметка)'."""
+    g = info.get("gender")
+    extra = (["female"] if g == "F" else ["male"] if g == "M" else []) + list(info.get("hints") or [])
+    line = f"- {info['en']} -> {info['ru']}"
+    if extra:
+        line += f" ({'; '.join(extra)})"
+    return line
 
 from difflib import SequenceMatcher
 
@@ -92,16 +107,18 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
         if name:
             line = f"{name}: {body}"
             
-    # Добавляем русский перевод в историю, если есть
-    if ru_body:
-        ru_clean = " ".join((ru_body or "").split())
-        if ru_clean:
-            line += f"  >>>  {ru_clean}"
-
-    # Ограничиваем длину ОДНОЙ строки: одна простыня из OCR не должна
-    # съедать весь бюджет истории (обрезка на записи — префикс остаётся стабильным).
+    # Одна простыня из OCR не должна съедать весь бюджет истории, поэтому слишком длинный
+    # ОРИГИНАЛ обрезаем (на записи — префикс остаётся стабильным). Перевод не обрезаем
+    # никогда: раньше резалась вся строка "оригинал >>> перевод" на 300 символах, почти у
+    # каждого авторского абзаца перевод обрывался на полуслове с "…", и модель, видя десятки
+    # таких примеров (а при повторе реплики — и свой же обрубок), начинала обрывать ответы.
     if len(line) > _HISTORY_LINE_MAX_CHARS:
-        line = line[:_HISTORY_LINE_MAX_CHARS].rstrip() + "…"
+        line = line[:_HISTORY_LINE_MAX_CHARS].rstrip() + "…"      # без перевода вовсе
+    elif ru_body:
+        ru_clean = " ".join((ru_body or "").split())
+        # перевод втрое длиннее оригинала — это не перевод, а сбой; в примеры его не берём
+        if ru_clean and len(ru_clean) <= 3 * len(line) + 60:
+            line += f"{_HISTORY_SEP}{ru_clean}"
 
     with _HISTORY_LOCK:
         # 1. Проверка на идентичность последней строки
@@ -112,8 +129,8 @@ def _add_dialog_history(name: str | None, body: str, ru_body: str = "") -> None:
         if _HISTORY_EN:
             last_line = _HISTORY_EN[-1]
             # Сравниваем только английскую часть (до >>>)
-            last_en = last_line.split("  >>>  ")[0]
-            curr_en = line.split("  >>>  ")[0]
+            last_en = last_line.split(_HISTORY_SEP)[0]
+            curr_en = line.split(_HISTORY_SEP)[0]
             if SequenceMatcher(None, last_en, curr_en).ratio() > 0.85:
                 # Если фразы почти одинаковые (разница в пару символов), обновляем последнюю
                 _HISTORY_EN[-1] = line
@@ -156,6 +173,16 @@ def load_dialog_history() -> int:
     except Exception as e:
         print("[CTX] history load error:", e)
         return 0
+    # Строки, записанные до исправления обрезки: перевод в них оборван на "…". Оставляем
+    # от таких только оригинал, иначе они продолжат учить модель обрывать ответы.
+    fixed = 0
+    for i, ln in enumerate(lines):
+        if (_HISTORY_SEP in ln and ln.endswith("…")
+                and _HISTORY_LINE_MAX_CHARS - 5 <= len(ln) <= _HISTORY_LINE_MAX_CHARS + 1):
+            lines[i] = ln.split(_HISTORY_SEP)[0]
+            fixed += 1
+    if fixed:
+        print(f"[CTX] в истории убрано оборванных переводов: {fixed}")
     with _HISTORY_LOCK:
         _HISTORY_EN[:] = lines[-_HISTORY_MAX_LINES:]
         try:
@@ -271,7 +298,7 @@ def _canon_name(s: str) -> str:
 
 def _load_lore_db_from_text(lore_text: str) -> None:
     """Разбираем game_bible_exilium.txt в маленькую БД персонажей."""
-    global _LORE_DB_INIT, _CHAR_DB
+    global _LORE_DB_INIT, _CHAR_DB, _TERM_DB
     if _LORE_DB_INIT:
         return
 
@@ -280,46 +307,88 @@ def _load_lore_db_from_text(lore_text: str) -> None:
             return
 
         char_db: dict[str, dict] = {}
+        term_db: dict[str, dict] = {}
+        unparsed: list[str] = []
 
         for line in lore_text.splitlines():
             t = line.strip()
             if not t or t.startswith("#") or t.startswith("//") or "===" in t:
                 continue
 
-            # Формат: NameEN -> NameRU | пол: женский/мужской
-            # Поддерживаем разделители: ->, →, - (с пробелами)
-            m = re.match(
-                r"^(?P<en>[^#=→:|]+?)\s*(?:->|→| - )\s*(?P<ru>[^|#]+?)\s*(?:\|\s*пол\s*:\s*(?P<gender>[^|#]+))?\s*$",
-                t,
-                re.IGNORECASE,
-            )
+            # Формат: NameEN -> NameRU (пояснение) | пол: … | тип: … | заметка: …
+            # Разделители имени и перевода: ->, →, - (с пробелами). После первой черты —
+            # любые поля в любом порядке. Раньше понималось только "| пол: …", и строка
+            # с "| тип:" или "| категория:" выбрасывалась ЦЕЛИКОМ и молча — так до модели
+            # не доходил весь глоссарий (URNC, ELID, зоны, организации).
+            m = re.match(r"^(?P<en>[^#=→:|]+?)\s*(?:->|→| - )\s*(?P<rest>[^#]*)$", t)
             if not m:
+                unparsed.append(t)
                 continue
 
             en = m.group("en").strip()
-            ru = m.group("ru").strip()
-            gender_raw = (m.group("gender") or "").strip().lower()
+            parts = [p.strip() for p in m.group("rest").split("|")]
+            ru = parts[0]
+            fields = [p for p in parts[1:] if p]
+
+            # Пояснение в скобках после перевода — не часть перевода:
+            # "Игорекса (ГГ игры)" -> имя "Игорекса", подсказка "ГГ игры"
+            hints: list[str] = []
+            pm = re.match(r"^(?P<name>[^()]+?)\s*\((?P<c>.*)\)\s*$", ru)
+            if pm:
+                ru = pm.group("name").strip()
+                hints.append(pm.group("c").strip())
+            if not ru:
+                unparsed.append(t)
+                continue
 
             gender = None
-            if "жен" in gender_raw:
-                gender = "F"
-            elif "муж" in gender_raw:
-                gender = "M"
+            is_char = not fields      # строка без полей — как и раньше, считается именем
+            for f in fields:
+                fm = re.match(r"^пол\s*:\s*(.*)$", f, re.IGNORECASE)
+                if fm:
+                    is_char = True
+                    g = fm.group(1).lower()
+                    # "мужской. Редко женский" — берём то, что названо первым
+                    i_m, i_f = g.find("муж"), g.find("жен")
+                    if i_m >= 0 and (i_f < 0 or i_m < i_f):
+                        gender = "M"
+                    elif i_f >= 0:
+                        gender = "F"
+                    continue
+                # Остальные поля — подсказки модели. "заметка:" пишем без самого слова.
+                hints.append(re.sub(r"^(?:заметка|note)\s*:\s*", "", f, flags=re.IGNORECASE))
 
             cname = _canon_name(en)
             if not cname:
+                unparsed.append(t)
                 continue
 
-            char_db[cname] = {
+            info = {
                 "en": en,
                 "ru": ru,
                 "gender": gender,
+                "hints": [h for h in hints if h],
                 "raw": t,
             }
+            # Персонажи и термины лежат РАЗДЕЛЬНО. По _CHAR_DB программа опознаёт
+            # говорящего и режет имя из текста — если положить туда "Green Zone",
+            # авторский текст, начинающийся с этих слов, приняли бы за реплику "Green Zone".
+            if is_char:
+                char_db[cname] = info
+            else:
+                # "I.O.P. (Important Operations Prototype)" ищем в тексте по обоим написаниям
+                am = re.match(r"^(?P<a>[^()]+?)\s*\((?P<b>[^()]+)\)\s*$", en)
+                info["match"] = [am.group("a").strip(), am.group("b").strip()] if am else [en]
+                term_db[cname] = info
 
         _CHAR_DB = char_db
+        _TERM_DB = term_db
         _LORE_DB_INIT = True
-        print(f"[DUAL][LORE] char_db size={len(_CHAR_DB)}")
+        print(f"[DUAL][LORE] char_db size={len(_CHAR_DB)}, терминов={len(_TERM_DB)}")
+        if unparsed:
+            print(f"[DUAL][LORE] НЕ разобрано строк: {len(unparsed)} — до модели они не дойдут:")
+            for u in unparsed:
+                print(f"[DUAL][LORE]    {u[:120]}")
 
 
 def _get_char_info_from_name(name_line: str | None) -> dict | None:
@@ -443,7 +512,7 @@ def build_solo_context(easy_text: str, cfg, lang: str = "en") -> str:
 
 
 def _build_lore_snippet_for_text(
-    name_line: str | None, body: str, max_items: int = 5
+    name_line: str | None, body: str, max_items: int = 5, max_terms: int = 5
 ) -> tuple[str, str | None]:
     """
     Для текущей реплики собираем краткий LORE-сниппет.
@@ -460,11 +529,7 @@ def _build_lore_snippet_for_text(
         seen_cnames.add(cname)
         
         g = speaker_info.get("gender")
-        g_desc = "female" if g == "F" else "male" if g == "M" else None
-
-        line = f"- {speaker_info['en']} -> {speaker_info['ru']}"
-        if g_desc: line += f" ({g_desc})"
-        snippet_lines.append(line)
+        snippet_lines.append(_fmt_lore_line(speaker_info))
 
         speaker_gender = g
 
@@ -518,12 +583,28 @@ def _build_lore_snippet_for_text(
 
     # Добавляем найденных в список
     for info in found_infos:
-        g = info.get("gender")
-        g_desc = "female" if g == "F" else "male" if g == "M" else None
-        
-        line = f"- {info['en']} -> {info['ru']}"
-        if g_desc: line += f" ({g_desc})"
-        snippet_lines.append(line)
+        snippet_lines.append(_fmt_lore_line(info))
+
+    # 3) Термины и организации, упомянутые в тексте. Отдельный лимит, чтобы длинный
+    # глоссарий не вытеснял персонажей (от них зависит род глаголов).
+    with _LORE_DB_LOCK:
+        all_terms = sorted(_TERM_DB.values(), key=lambda x: len(x["en"]), reverse=True)
+    n_terms = 0
+    for info in all_terms:
+        if n_terms >= max_terms:
+            break
+        hit = False
+        for key in info.get("match") or [info["en"]]:
+            if re.search(r'[一-鿿぀-ゟ゠-ヿ]', key):
+                hit = key in (body or "")
+            else:
+                # слово целиком, допускаем множественное число: "ELID" найдётся и в "ELIDs"
+                hit = re.search(r"(?<!\w)" + re.escape(key.lower()) + r"(?:e?s)?(?!\w)", body_lower) is not None
+            if hit:
+                break
+        if hit:
+            snippet_lines.append(_fmt_lore_line(info))
+            n_terms += 1
 
     if not snippet_lines:
         return "", speaker_gender
@@ -990,6 +1071,8 @@ def preload_prompt_cache_ocr(cfg: LLMConfig) -> bool:
         "add_generation_prompt": False,
         "max_tokens": 8,
         "slot_id": cfg.slot_id,
+        "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     try:
         r = requests.post(cfg.server.rstrip("/") + "/v1/chat/completions",
@@ -1013,6 +1096,8 @@ def preload_prompt_cache_tr(cfg: LLMConfig) -> bool:
         "add_generation_prompt": False,
         "max_tokens": 8,
         "slot_id": cfg.slot_id,
+        "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     try:
         r = requests.post(cfg.server.rstrip("/") + "/v1/chat/completions",
@@ -1059,6 +1144,8 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
             "slot_id": cfg.slot_id,
             "seed": current_seed,
             "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         
         t0 = time.perf_counter()
@@ -1353,6 +1440,8 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
                 "<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]",
                 "\n<instructions", "\n<context", "\n<lore", "\n<speaker"
             ],
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         
         t0 = time.perf_counter()
@@ -1395,6 +1484,16 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
 
         # Clean special tokens (like <|im_end|>, </s>, etc.)
         out = _RE_SPECIAL_TOKENS.sub("", out).strip()
+
+        # Модель иногда повторяет нашу же служебную разметку из промпта
+        # ("<speaker>\n???\n</speaker>\n<translation>…"). Стоп-слово "\n<speaker" тут не
+        # срабатывает: тег стоит в самом начале ответа, переноса перед ним нет.
+        # Вырезаем такие блоки целиком, вместе с содержимым — в переводе им взяться неоткуда.
+        _echo_free = _RE_PROMPT_ECHO_BLOCK.sub("", out)
+        _echo_free = _RE_PROMPT_ECHO_TAG.sub("", _echo_free).strip()
+        if _echo_free != out:
+            print(f"[DUAL][TR] Эхо служебной разметки вырезано: {repr(out[:60])}")
+            out = _echo_free
 
         out = _strip_leading_gender_tag(out)
         # print(f"[DUAL][TR-CLEANED] After gender tag strip: {repr(out)}")
@@ -1662,6 +1761,8 @@ def translate_batch_to_ru(texts: list, cfg: "LLMConfig") -> list:
         "seed": int(cfg.seed),
         "cache_prompt": False,
         "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
+        "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     try:

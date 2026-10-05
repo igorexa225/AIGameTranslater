@@ -210,6 +210,8 @@ def preload_prompt_cache(cfg: LLMConfig) -> bool:
         "add_generation_prompt": False,
         "max_tokens": 16,
         "slot_id": cfg.slot_id,
+        "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     try:
         import requests, time as _t
@@ -326,6 +328,8 @@ def vision_translate_from_images(region_png_b64: str,
             "add_generation_prompt": True,
             "slot_id": cfg.slot_id,
             "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         t0 = time.perf_counter()
         try:
@@ -475,6 +479,8 @@ def vision_translate_batch(b64_images: list, cfg: "LLMConfig") -> list:
         "slot_id": cfg.slot_id,
         "seed": int(getattr(cfg, "seed", 0)),
         "stop": ["<|im_end|>", "<|im_start|>", "</s>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "[/INST]"],
+        "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     try:

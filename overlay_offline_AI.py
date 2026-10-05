@@ -1,4 +1,4 @@
-import sys, os, time, re, subprocess, base64, difflib, ctypes, json, requests
+import sys, os, time, re, subprocess, base64, difflib, ctypes, json, requests, threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QApplication, QWidget, QMessageBox, QDialog,
     QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit, QSpinBox, QDoubleSpinBox,
     QFontComboBox, QFileDialog, QPlainTextEdit, QHBoxLayout, QVBoxLayout, QFormLayout,
     QGroupBox, QScrollArea, QTreeWidget, QTreeWidgetItem, QProgressBar, QHeaderView,
-    QSlider, QStackedWidget, QToolButton, QFrame, QKeySequenceEdit)
+    QSlider, QStackedWidget, QToolButton, QFrame, QKeySequenceEdit,
+    QProgressDialog, QSystemTrayIcon, QMenu)
 
 import win32con, win32gui, win32ui, win32api, win32process
 import ctypes.wintypes as wt
@@ -189,7 +190,7 @@ def get_easyocr_reader(lang_code="en"):
 # ======================== CONFIG (по умолчанию) =========================
 
 # захват/обновление
-MAX_OCR_FPS       = 1.0        # 0.5–2.0 кадров/сек
+MAX_OCR_FPS       = 5.0        # кадров/сек; на нагрузку почти не влияет — лишние кадры отсекают стражи
 
 # UI/поведение
 RENDER_MODE       = "smooth"   # "smooth" | "instant"
@@ -197,7 +198,7 @@ HANDLE            = 15
 BORDER_WIDTH      = 4
 SPLIT_BORDER_WIDTH = 4
 REQUIRE_BOUND_WINDOW = True
-DRAW_OVER_ORIGINAL = False
+DRAW_OVER_ORIGINAL = True
 PANEL_BG_MODE  = "blur"   # "blur" | "solid" | "none"
 PANEL_BG_ALPHA = 64       # 0–255, для blur = альфа tint'а, для solid = прозрачность чёрного фона
 BOX_BG_MODE  = "solid"    # "panel" | "solid" | "none"
@@ -264,7 +265,7 @@ def _save_prefs(d: dict):
 
 # Версия приложения. Держим ОДНОЙ константой: раньше она была зашита в HTML
 # на странице «Информация», и при выпуске о ней забывали.
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 # llama.cpp server — ищем EXE и в models\lmm\llama.cpp, и в models\llm\llama.cpp
 SERVER_CANDIDATES = [
@@ -316,7 +317,7 @@ llm_cfg = LLMConfig(
     model="Qwen3-VL-2B-Instruct",
     temp=0.2, top_p=0.9, max_tokens=1024, timeout_s=30.0, budget_ms=4000,
     slot_id=0, use_prompt_cache=True,
-    lore_path=str(BASE_DIR / "assets" / "game_bible_exilium.txt"), max_ctx_chars=30000,
+    lore_path="", max_ctx_chars=30000,   # файл имён по умолчанию не задан: у каждой игры свой
 )
 # ====================== Утилиты/канон ====================
 
@@ -1166,21 +1167,233 @@ class DownloadWorker(QThread):
                 with open(tmp, "wb") as f:
                     for ch in r.iter_content(chunk_size=self.chunk):
                         if self._cancel:
-                            self.status.emit("Отменено")
-                            try: os.remove(tmp)
-                            except: pass
-                            self.done.emit(False, "Отменено")
-                            return
+                            break
                         if ch:
                             f.write(ch)
                             got += len(ch)
                             if total:
                                 self.progress.emit(int(got * 100 / total))
+                # Удаляем недокачанное уже ПОСЛЕ закрытия файла: Windows не даёт
+                # удалить открытый файл, и .part раньше оставался лежать в папке.
+                if self._cancel:
+                    self.status.emit("Отменено")
+                    os.remove(tmp)
+                    self.done.emit(False, "Отменено")
+                    return
                 os.replace(tmp, self.dest_path)
             self.progress.emit(100)
             self.done.emit(True, "Готово")
         except Exception as e:
             self.done.emit(False, f"Ошибка: {e}")
+
+#==================== Свои модели: что лежит в папке помимо каталога =========================
+
+_GGUF_NUM = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+_GGUF_CACHE: dict = {}
+
+
+def read_gguf_info(path: str) -> dict:
+    """Читает из GGUF только заголовок: что это за файл, семейство, название, размерность.
+    Веса не трогает. Результат кэшируется по пути, времени правки и размеру."""
+    import struct
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key in _GGUF_CACHE:
+        return _GGUF_CACHE[key]
+
+    info = {"type": "", "arch": "", "name": "", "size_label": "", "emb": 0, "proj": 0, "projector": ""}
+    with open(path, "rb") as f:
+        def num(fmt):
+            return struct.unpack("<" + fmt, f.read(struct.calcsize("<" + fmt)))[0]
+
+        def text():
+            n = num("Q")
+            if n > (1 << 24):
+                raise ValueError("повреждённый заголовок")
+            return f.read(n).decode("utf-8", "replace")
+
+        def value(t):
+            if t in _GGUF_NUM:
+                return num(_GGUF_NUM[t])
+            if t == 8:
+                return text()
+            if t == 9:
+                et = num("I"); n = num("Q")
+                if et in _GGUF_NUM:      # числовой массив пропускаем не читая
+                    f.seek(struct.calcsize("<" + _GGUF_NUM[et]) * n, 1)
+                else:
+                    for _ in range(n):
+                        value(et)
+                return None
+            raise ValueError(f"неизвестный тип поля {t}")
+
+        if f.read(4) != b"GGUF":
+            raise ValueError("это не GGUF")
+        num("I"); num("Q")
+        for _ in range(num("Q")):
+            k = text()
+            # Дальше идёт словарь токенизатора на сотни тысяч строк — нам он не нужен,
+            # а всё интересное в файле записано до него.
+            if k.startswith("tokenizer."):
+                break
+            v = value(num("I"))
+            if k == "general.type": info["type"] = str(v)
+            elif k == "general.architecture": info["arch"] = str(v)
+            elif k == "general.name": info["name"] = str(v)
+            elif k == "general.size_label": info["size_label"] = str(v)
+            elif k.endswith(".embedding_length") and not k.startswith("clip."): info["emb"] = int(v)
+            elif k in ("clip.vision.projection_dim", "clip.projection_dim"): info["proj"] = int(v)
+            elif k in ("clip.projector_type", "clip.vision.projector_type"): info["projector"] = str(v)
+
+    _GGUF_CACHE[key] = info
+    return info
+
+
+_RE_FILE_PARAMS = re.compile(r"(?<![A-Za-z0-9])(E?\d+(?:\.\d+)?B(?:-A\d+B)?)(?![A-Za-z0-9])", re.I)
+# после квантования допускается пометка в скобках: "…-Q4_K_M(MTP).gguf"
+_RE_FILE_QUANT = re.compile(r"[-._]((?:UD-)?I?Q\d[A-Za-z0-9_]*|B?FP?16|F32)\s*(?:\([^)]*\))?\.gguf$", re.I)
+_RE_DRAFT_WORD = re.compile(r"(?<![a-z])(assistant|drafter|draft|mtp)(?![a-z])")
+_DRAFT_MAX_BYTES = int(1.5 * 1024 ** 3)   # драфт — маленький файл; модель с "MTP" в имени сюда не попадёт
+
+
+def _looks_like_draft(path: str) -> bool:
+    """Файл ускорителя: маленький и либо назван как драфт, либо сам говорит, что он assistant."""
+    try:
+        if os.path.getsize(path) >= _DRAFT_MAX_BYTES:
+            return False
+        # "(MTP)" — пометка на модели со встроенным ускорителем, а не признак файла-драфта
+        if _RE_DRAFT_WORD.search(os.path.basename(path).lower().replace("(mtp)", "")):
+            return True
+        return read_gguf_info(path)["arch"].endswith("assistant")
+    except Exception as e:
+        print(f"[ModelHub] {os.path.basename(path)}: не удалось проверить, драфт ли это ({e})")
+        return False
+
+
+def _fmt_file_size(n: int) -> str:
+    gb = n / (1024 ** 3)
+    return f"~{n / (1024 ** 2):.0f} MB" if gb < 1.0 else f"~{gb:.1f} GB"
+
+
+def build_local_presets(folder: str, presets: list) -> list:
+    """Файлы .gguf из папки, которых нет в каталоге, в том же виде, что и строки каталога.
+    Всё, что можно, берётся из самого файла; остальное — из его имени."""
+    if not folder or not os.path.isdir(folder):
+        return []
+
+    catalog = set()
+    for p in presets:
+        for q in (p.get("quants") or {}).values():
+            catalog.add(str(q.get("filename", "")).lower())
+        for k in ("mmproj", "draft"):
+            catalog.add(str((p.get(k) or {}).get("filename", "")).lower())
+
+    files = []
+    for name in sorted(os.listdir(folder)):
+        if not name.lower().endswith(".gguf"):
+            continue
+        path = os.path.join(folder, name)
+        size = os.path.getsize(path)
+        try:
+            info = read_gguf_info(path)
+        except Exception as e:
+            # Битый или недокачанный файл: показываем его как есть, чтобы можно было удалить
+            print(f"[ModelHub] {name}: заголовок не прочитан ({e})")
+            info = {"type": "", "arch": "", "name": "", "size_label": "", "emb": 0, "proj": 0, "projector": ""}
+
+        low = name.lower()
+        arch = info["arch"]
+        # Семейство: у модели — архитектура без цифр ("gemma4" -> "gemma"); у глаз архитектура
+        # всегда "clip", поэтому берём первое слово названия
+        # У глаз названия в файле может не быть вовсе (старые сборки) — тогда берём тип проектора
+        # ("gemma3", "gemma4v", "qwen3vl_merger"). Из имени файла семейство не выводим: по
+        # "mmproj-model-f16.gguf" получалось семейство "model", и глаза не подходили ни к чему.
+        src = arch if arch and arch != "clip" else (info["name"] or info["projector"])
+        fam = re.match(r"([A-Za-z]+)[\s\-_]*(\d+(?:\.\d+)?)?", src.strip())
+        family = fam.group(1).lower() if fam else ""
+        # Поколение: "gemma3" / "Gemma 4 E4B It" / "Qwen3.5 9B" -> "3" / "4" / "35".
+        # Без него глаза от Gemma 4 считались подходящими к Gemma 3: ширина у них одинаковая.
+        gen = (fam.group(2) or "").replace(".", "") if fam else ""
+
+        pm = _RE_FILE_PARAMS.search(name)
+        qm = _RE_FILE_QUANT.search(name)
+        if info["type"] == "mmproj" or "mmproj" in low:
+            kind = "mmproj"
+        elif _looks_like_draft(path):
+            kind = "draft"
+        else:
+            kind = "model"
+
+        files.append({
+            "kind": kind, "filename": name, "own": low not in catalog, "family": family, "gen": gen,
+            "params": pm.group(1).upper() if pm else (info["size_label"] or "-"),
+            "quant": qm.group(1).upper() if qm else "-",
+            "size": _fmt_file_size(size), "title": info["name"], "emb": info["emb"], "proj": info["proj"],
+        })
+
+    def entry(fi):
+        return {"size": fi["size"], "url": "", "filename": fi["filename"], "own": fi["own"]}
+
+    def same_family(a, b):
+        # неизвестное (пустое) совпадает с чем угодно: лучше показать лишнее, чем спрятать нужное
+        if a["family"] and b["family"] and a["family"] != b["family"]:
+            return False
+        # поколение сравниваем по началу: у Qwen 3.5 проектор называется "qwen3vl", а модель "qwen35"
+        ga, gb = a["gen"], b["gen"]
+        return not ga or not gb or ga.startswith(gb) or gb.startswith(ga)
+
+    out, attached = [], set()
+    for m in (x for x in files if x["kind"] == "model" and x["own"]):
+        # Глаза подходят, если ширина проектора равна ширине модели (и семейство то же)
+        eyes = [e for e in files if e["kind"] == "mmproj" and e["proj"] and e["proj"] == m["emb"] and same_family(e, m)]
+        # Ускоритель — только по названию: то же семейство и тот же размер ("12B", "26B-A4B")
+        drafts = [d for d in files if d["kind"] == "draft" and m["params"] != "-"
+                  and d["params"] == m["params"] and same_family(d, m)]
+        own_eyes = next((e for e in eyes if e["own"]), None)
+        own_draft = next((d for d in drafts if d["own"]), None)
+        attached.update(x["filename"] for x in (own_eyes, own_draft) if x)
+        out.append({
+            "name": m["filename"][:-5], "creator": m["family"].capitalize() or "-", "params": m["params"],
+            "type": "LLM / Text/ OCR/ VLM" if eyes else "LLM / Text", "note": "", "local": True,
+            "title": m["title"],
+            # "(MTP)" в имени файла — пометка владельца: ускоритель встроен в саму модель
+            "mtp": "(mtp)" in m["filename"].lower(),
+            "draft_files": [d["filename"] for d in drafts],
+            "quants": {m["quant"]: entry(m)},
+            "mmproj": entry(own_eyes) if own_eyes else None,
+            "draft": entry(own_draft) if own_draft else None,
+            "mmproj_text": ", ".join(f"{e['filename']} ({e['size']})" for e in eyes) or "подходящих в папке нет",
+            "draft_text": ", ".join(f"{d['filename']} ({d['size']})" for d in drafts) or "подходящего в папке нет",
+        })
+
+    # Свои глаза и драфты, не привязанные ни к одной своей модели, — отдельными строками,
+    # иначе их было бы не удалить
+    for x in files:
+        if x["own"] and x["kind"] != "model" and x["filename"] not in attached:
+            out.append({
+                "name": x["filename"][:-5], "creator": x["family"].capitalize() or "-", "params": x["params"],
+                "type": "Глаза (mmproj)" if x["kind"] == "mmproj" else "Ускоритель (драфт)", "note": "",
+                "local": True, "title": x["title"], "quants": {x["quant"]: entry(x)},
+                "mmproj": None, "draft": None, "mmproj_text": "—", "draft_text": "—",
+            })
+    return out
+
+
+_HUB_GROUP_ROLE = Qt.UserRole + 1    # 0/None — каталог, 1 — заголовок раздела, 2 — свои файлы
+
+
+class _HubItem(QTreeWidgetItem):
+    """Строка списка моделей. Свои файлы всегда остаются ниже каталога, как бы ни сортировали."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+        ga = self.data(0, _HUB_GROUP_ROLE) or 0
+        gb = other.data(0, _HUB_GROUP_ROLE) or 0
+        if ga != gb:
+            asc = tree is None or tree.header().sortIndicatorOrder() == Qt.AscendingOrder
+            return ga < gb if asc else ga > gb
+        return self.text(col).lower() < other.text(col).lower()
 
 #==================== Окно загрузчика =========================
 
@@ -1309,7 +1522,7 @@ class ModelHubDialog(QDialog):
                     max_s = valid_sizes[-1][1]
                     display_size = f"{min_s} – {max_s}" if min_s != max_s else min_s
             
-            it = QTreeWidgetItem([p["name"], display_size])
+            it = _HubItem([p["name"], display_size])
             it.setData(0, Qt.UserRole, p)
             it.setData(1, Qt.UserRole, p.get("creator", "-"))
             it.setData(2, Qt.UserRole, p.get("params", "-"))
@@ -1342,9 +1555,21 @@ class ModelHubDialog(QDialog):
 
         # Кнопки действий
         row2 = QHBoxLayout()
-        self.btnDl   = QPushButton("Скачать")
+        self.btnDl   = QPushButton("Скачать модель")
         self.btnClose= QPushButton("Закрыть")
+        # Доп. файлы выбранной модели: глаза (mmproj) и ускоритель (драфт).
+        # Квантование у них подобрано заранее (tools/update_models.py), выбирать нечего.
+        self.btnMmproj = QPushButton()
+        self.btnDraft  = QPushButton()
+        self._extra = {"mmproj": None, "draft": None}
+        self.btnMmproj.setVisible(False)
+        self.btnDraft.setVisible(False)
+        row2.addWidget(self.btnMmproj)
+        row2.addWidget(self.btnDraft)
         row2.addStretch(1)
+        self.btnCancel = QPushButton("Отменить загрузки")
+        self.btnCancel.setVisible(False)
+        row2.addWidget(self.btnCancel)
         row2.addWidget(self.btnDl)
         row2.addWidget(self.btnClose)
         lay.addLayout(row2)
@@ -1360,11 +1585,73 @@ class ModelHubDialog(QDialog):
         # Сигналы
         self.btnBrowse.clicked.connect(self._choose_dir)
         self.btnDl.clicked.connect(self._start_download)
+        self.btnMmproj.clicked.connect(lambda: self._download_extra("mmproj"))
+        self.btnDraft.clicked.connect(lambda: self._download_extra("draft"))
+        # имя файла правят руками (свой URL) — кнопка модели должна это видеть
+        self.edFilename.textChanged.connect(lambda _t: self._refresh_extra_buttons())
         self.btnClose.clicked.connect(self.reject)
+        self.btnCancel.clicked.connect(self._cancel_downloads)
         # Автоподстановка URL при выборе пресета
         self.tree.itemSelectionChanged.connect(self._fill_from_selected)
 
         self._worker: DownloadWorker|None = None
+        # Очередь загрузок: качаем по одному файлу, остальное ждёт своей очереди.
+        # Параллельно не качаем нарочно — канал один, а недокачанных файлов было бы несколько.
+        self._queue: list[tuple[str, str]] = []   # (url, полный путь назначения)
+        self._cur_dest = ""                       # что качается прямо сейчас
+        self._failed: list[str] = []              # что не скачалось за эту очередь
+
+        self._rebuild_local_rows()
+
+    def _rebuild_local_rows(self):
+        """Перечитывает раздел «свои файлы»: всё, что лежит в папке моделей помимо каталога."""
+        cur = self.tree.currentItem()
+        keep = cur.text(0) if cur is not None else ""
+        self.tree.blockSignals(True)
+        for i in reversed(range(self.tree.topLevelItemCount())):
+            if self.tree.topLevelItem(i).data(0, _HUB_GROUP_ROLE):
+                self.tree.takeTopLevelItem(i)
+
+        folder = (self.edPath.text() or "").strip() or self.default_dir
+        rows = build_local_presets(folder, self._presets)
+        if rows:
+            head = _HubItem(["— Свои файлы в папке моделей —", ""])
+            head.setFlags(Qt.NoItemFlags)
+            head.setData(0, _HUB_GROUP_ROLE, 1)
+            self.tree.addTopLevelItem(head)
+        for p in rows:
+            q_dict = p["quants"]
+            it = _HubItem([p["name"], next(iter(q_dict.values()))["size"]])
+            it.setData(0, Qt.UserRole, p)
+            it.setData(0, _HUB_GROUP_ROLE, 2)
+            it.setData(1, Qt.UserRole, p["creator"])
+            it.setData(2, Qt.UserRole, p["params"])
+            it.setData(3, Qt.UserRole, list(q_dict.keys()))
+            it.setData(4, Qt.UserRole, p["type"])
+            self.tree.addTopLevelItem(it)
+            for cb, val in ((self.cbFilterCreator, p["creator"]), (self.cbFilterParams, p["params"]),
+                            (self.cbFilterQuant, next(iter(q_dict))), (self.cbFilterType, p["type"])):
+                if val and val != "-" and cb.findText(val) < 0:
+                    cb.blockSignals(True); cb.addItem(val); cb.blockSignals(False)
+
+        # возвращаем выбор на ту же строку, если она пережила перечитывание
+        found = None
+        for i in range(self.tree.topLevelItemCount()):
+            if keep and self.tree.topLevelItem(i).text(0) == keep:
+                found = self.tree.topLevelItem(i)
+        self.tree.setCurrentItem(found)
+        self.tree.blockSignals(False)
+        self._apply_filters()
+        if found is not None:
+            self._fill_from_selected()
+        elif keep:
+            # выбранный файл удалён — прячем его данные
+            self.edUrl.clear(); self.edFilename.clear()
+            self._extra = {"mmproj": None, "draft": None}
+            self.cbItemQuant.setVisible(False)
+            self.quantLay.itemAt(0).widget().setVisible(False)
+            self.descPanel.setHtml("<h3 style='text-align:center;'><br><br>Выберите модель для просмотра описания</h3>")
+            self._refresh_extra_buttons()
 
     def _populate_combo(self, cb: QComboBox, items: set):
         cb.blockSignals(True)
@@ -1386,8 +1673,12 @@ class ModelHubDialog(QDialog):
         f_quant = self.cbFilterQuant.currentText()
         f_type = self.cbFilterType.currentText()
 
+        head, any_local = None, False
         for i in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(i)
+            if item.data(0, _HUB_GROUP_ROLE) == 1:
+                head = item
+                continue
             c = item.data(1, Qt.UserRole)
             p = item.data(2, Qt.UserRole)
             q_list = item.data(3, Qt.UserRole)
@@ -1399,6 +1690,10 @@ class ModelHubDialog(QDialog):
             if f_quant != "Все" and f_quant not in q_list: match = False
             if f_type != "Все" and t != f_type: match = False
             item.setHidden(not match)
+            if match and item.data(0, _HUB_GROUP_ROLE) == 2:
+                any_local = True
+        if head is not None:
+            head.setHidden(not any_local)
         
     def _autosize_columns(self):
         h = self.tree.header()
@@ -1411,11 +1706,12 @@ class ModelHubDialog(QDialog):
         d = QFileDialog.getExistingDirectory(self, "Куда сохранить", self.edPath.text() or self.default_dir)
         if d:
             self.edPath.setText(d)
+            self._rebuild_local_rows()
+            self._refresh_extra_buttons()
 
     def _fill_from_selected(self):
         it = self.tree.currentItem()
         if not it:
-            QMessageBox.information(self, "Модели", "Выберите пресет в списке.")
             return
         p = it.data(0, Qt.UserRole) or {}
         # Наполняем выпадающий список квантований
@@ -1473,51 +1769,193 @@ class ModelHubDialog(QDialog):
                 <tr><td><b>Выбранный формат:</b></td><td>{q_name if q_name != "-" else p.get('fmt', '-')}</td></tr>
                 <tr><td><b>Размер файла:</b></td><td>{size_str}</td></tr>
                 <tr><td><b>Тип:</b></td><td>{p.get('type', '-')}</td></tr>
+                <tr><td><b>Глаза (mmproj):</b></td><td>{p.get('mmproj_text') or self._extra_text(p.get('mmproj'))}</td></tr>
+                <tr><td><b>Ускоритель:</b></td><td>{('встроен в модель — пометка (MTP) в имени файла' if p.get('local') else 'встроен в модель (MTP), качать не нужно') if p.get('mtp') else p.get('draft_text') or self._extra_text(p.get('draft'))}</td></tr>
+                {('<tr><td><b>Название в файле:</b></td><td>' + (p.get('title') or '-') + '</td></tr>') if p.get('local') else ''}
             </table>
             <hr>
             <p style="font-size: 14px;">{p.get('note', '')}</p>
         </div>
         """
         self.descPanel.setHtml(html)
+        self._extra = {"mmproj": p.get("mmproj"), "draft": p.get("draft")}
+        self._refresh_extra_buttons()
+
+    @staticmethod
+    def _extra_text(entry) -> str:
+        if not entry or not entry.get("url"):
+            return "нет"
+        return f"{entry.get('filename', '-')} ({entry.get('size', '-')})"
+
+    def _refresh_extra_buttons(self):
+        """Три кнопки файлов выбранной модели: модель, глаза, ускоритель. Каждая — «Скачать»,
+        если файла в папке нет, и «Удалить», если он там лежит. Глаза и ускоритель спрятаны,
+        когда их у модели нет."""
+        folder = (self.edPath.text() or "").strip() or self.default_dir
+
+        fname = (self.edFilename.text() or "").strip()
+        state = self._dest_state(os.path.join(folder, fname)) if fname else ""
+        self.btnDl.setEnabled(state in ("", "уже скачано"))
+        self.btnDl.setText("Удалить модель" if state == "уже скачано"
+                           else f"Модель — {state}" if state else "Скачать модель")
+
+        for key, btn, title in (("mmproj", self.btnMmproj, "глаза (mmproj)"),
+                                ("draft",  self.btnDraft,  "ускоритель (драфт)")):
+            entry = self._extra.get(key)
+            if not entry or not (entry.get("url") or entry.get("own")):
+                btn.setVisible(False)
+                continue
+            state = self._dest_state(os.path.join(folder, entry.get("filename", "")))
+            btn.setVisible(True)
+            btn.setEnabled(state in ("", "уже скачано"))
+            btn.setText(f"Удалить {title}" if state == "уже скачано"
+                        else f"{title.capitalize()} — {state}" if state
+                        else f"Скачать {title}, {entry.get('size', '-')}")
+
+    def _dest_state(self, dest: str) -> str:
+        """'' — файла нет и он не заказан; иначе что с ним сейчас."""
+        if dest == self._cur_dest:
+            return "качается"
+        if any(d == dest for _, d in self._queue):
+            return "в очереди"
+        if os.path.exists(dest):
+            return "уже скачано"
+        return ""
+
+    def _download_extra(self, key: str):
+        entry = self._extra.get(key) or {}
+        self._download_or_delete(entry.get("url", ""), entry.get("filename", ""))
 
     def _start_download(self):
         url = (self.edUrl.text() or "").strip()
-        if not url:
+        fname = (self.edFilename.text() or "").strip()
+        if not url and not fname:
             QMessageBox.warning(self, "Модели", "Введите URL модели или выберите пресет.")
             return
+        self._download_or_delete(url, fname)
+
+    def _download_or_delete(self, url: str, fname: str):
+        """Одна кнопка на файл: лежит в папке — удаляем, нет — качаем."""
+        folder = (self.edPath.text() or "").strip() or self.default_dir
+        dest = os.path.join(folder, fname) if fname else ""
+        if dest and self._dest_state(dest) == "уже скачано":
+            self._delete_file(dest)
+        elif not url:
+            QMessageBox.warning(self, "Модели", "Введите URL модели или выберите пресет.")
+        else:
+            self._download(url, fname)
+
+    def _delete_file(self, dest: str):
+        name = os.path.basename(dest)
+        size_gb = os.path.getsize(dest) / (1024 ** 3)
+        if QMessageBox.question(
+                self, "Модели",
+                f"Удалить {name} ({size_gb:.1f} ГБ)?\n\nФайл удаляется сразу и насовсем, мимо корзины.") != QMessageBox.Yes:
+            return
+        try:
+            os.remove(dest)
+        except OSError as e:
+            # Windows не даёт удалить файл, который держит запущенный llama-server
+            QMessageBox.critical(
+                self, "Модели",
+                f"Не удалось удалить {name}:\n{e}\n\nЕсли модель сейчас загружена — сначала остановите перевод.")
+            return
+        print(f"[ModelHub] удалён {dest}")
+        self.lab.setText(f"Удалено: {name}")
+        self._rebuild_local_rows()
+        self._refresh_extra_buttons()
+        self._rescan_owner()
+
+    def _rescan_owner(self):
+        """Обновляет списки моделей в окне настроек. Менеджер встроен во вкладку, поэтому его
+        parent() — страница вкладки, а не окно настроек: поднимаемся по родителям, пока не
+        найдём того, кто умеет рескан."""
+        owner = self.parent()
+        while owner is not None and not hasattr(owner, "_rescan_models"):
+            owner = owner.parent()
+        if owner is not None:
+            owner._rescan_models()
+
+    def _download(self, url: str, fname: str):
+        """Ставит файл в очередь; если сейчас ничего не качается — начинает сразу."""
         folder = (self.edPath.text() or "").strip() or self.default_dir
         os.makedirs(folder, exist_ok=True)
         # имя берём из URL
-        fname = (self.edFilename.text() or "").strip()
         if not fname:
             fname = url.split("/")[-1].split("?")[0] or "model.gguf"
         dest = os.path.join(folder, fname)
 
+        state = self._dest_state(dest)
+        if state in ("качается", "в очереди"):
+            QMessageBox.information(self, "Модели", f"{fname}: {state}.")
+            return
+        if state and QMessageBox.question(
+                self, "Модели", f"{fname} уже есть в папке. Скачать заново?") != QMessageBox.Yes:
+            return
+
+        self._queue.append((url, dest))
+        if self._cur_dest:
+            self._show_queue_status()
+            self._refresh_extra_buttons()
+        else:
+            self._failed = []
+            self._start_next()
+
+    def _start_next(self):
+        url, dest = self._queue.pop(0)
+        self._cur_dest = dest
         self.pb.setValue(0)
-        self.lab.setText("Подключение...")
         self._worker = DownloadWorker(url, dest)
         self._worker.progress.connect(self.pb.setValue)
-        self._worker.status.connect(self.lab.setText)
         self._worker.done.connect(self._on_done)
         self._worker.start()
+        self.btnCancel.setVisible(True)
+        self._show_queue_status()
+        self._refresh_extra_buttons()
+
+    def _show_queue_status(self):
+        text = f"Качается: {os.path.basename(self._cur_dest)}"
+        if self._queue:
+            text += f"   ·   в очереди ещё {len(self._queue)}: " + ", ".join(os.path.basename(d) for _, d in self._queue)
+        self.lab.setText(text)
+
+    def _cancel_downloads(self):
+        self._queue.clear()
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()      # воркер сам удалит недокачанный .part и пришлёт done
 
     def _on_done(self, ok: bool, msg: str):
-        self.lab.setText(msg)
+        name = os.path.basename(self._cur_dest)
+        cancelled = (not ok and msg == "Отменено")
+        self._cur_dest = ""
+        # Сигнал done приходит из ещё живого потока. Если сейчас же заменить self._worker
+        # следующим, старый QThread уничтожится недоработавшим — Qt на это роняет всю
+        # программу без единой строчки в логе. Дожидаемся конца потока (это миллисекунды).
+        if self._worker is not None:
+            self._worker.wait()
         if ok:
-            QMessageBox.information(self, "Модели", "Загрузка завершена.")
+            # После успешной загрузки обновляем списки моделей в окне настроек
+            self._rescan_owner()
+            self._rebuild_local_rows()
+        elif not cancelled:
+            print(f"[ModelHub] {name}: {msg}")
+            self._failed.append(f"{name}: {msg}")
 
-            # после успешной загрузки попробуем обновить список моделей в родительском окне
-            parent = self.parent()
-            if parent is not None:
-                for name in ("_rescan_models", "_scan_models", "_scan_models_ui", "_rebuild_models_list"):
-                    if hasattr(parent, name):
-                        try:
-                            getattr(parent, name)()
-                            break
-                        except Exception as e:
-                            print("[ModelHub] rescan error:", e)
+        if self._queue:
+            # Ошибка одного файла очередь не останавливает — о ней скажем в конце
+            self._start_next()
+            return
+
+        self.btnCancel.setVisible(False)
+        self._refresh_extra_buttons()
+        if cancelled:
+            self.lab.setText("Загрузки отменены.")
+        elif self._failed:
+            self.lab.setText("Не скачалось: " + "; ".join(self._failed))
+            QMessageBox.critical(self, "Модели", "Не скачалось:" + "\n\n" + "\n".join(self._failed))
         else:
-            QMessageBox.critical(self, "Модели", msg)
+            self.lab.setText("Все загрузки завершены.")
+            QMessageBox.information(self, "Модели", "Все загрузки завершены.")
 
 # ================= Windows blur / PrintWindow =============
 
@@ -1882,6 +2320,9 @@ class RegionModel:
     known_names: list = field(default_factory=list, repr=False)  # имена, опознанные сплиттером
 
     text_boxes: list[tuple[float, float, float, float]] = field(default_factory=list, repr=False)
+    # Где в области начинается текст реплики (доли кадра) — по последней реплике, у которой
+    # были рамки. Нужна, когда EasyOCR увидел только табличку с именем.
+    body_anchor: tuple | None = field(default=None, repr=False)
 
     panel: RegionPanel | None = field(default=None, repr=False)
 
@@ -2350,10 +2791,34 @@ class CaptureWorker(QThread):
                                           f"{len(boxes_px) - len(_kept)} боксов")
                                 boxes_px = _kept
                         h, w = gray.shape[:2]
-                        r.text_boxes = [
-                            (x / float(w), y / float(h), bw / float(w), bh / float(h))
-                            for (x, y, bw, bh) in boxes_px
-                        ]
+                        if boxes_px:
+                            r.text_boxes = [
+                                (x / float(w), y / float(h), bw / float(w), bh / float(h))
+                                for (x, y, bw, bh) in boxes_px
+                            ]
+                            # Запоминаем левый верхний угол блока: отрисовка ставит перевод именно туда
+                            _top = min(boxes_px, key=lambda b: b[1])
+                            r.body_anchor = (min(b[0] for b in boxes_px) / float(w), _top[1] / float(h),
+                                             _top[2] / float(w), _top[3] / float(h))
+                        elif en:
+                            # Рамок реплики нет, хотя VLM её прочитал: EasyOCR не замечает слишком
+                            # короткий текст ("...", "Haha...") и отдаёт одну табличку с именем,
+                            # которую фильтр справедливо выбрасывает. С пустым списком перевод
+                            # уезжал в угол области без фона. В диалоговом окне реплики начинаются
+                            # в одной точке — ставим перевод туда, где была прошлая.
+                            if r.body_anchor is not None:
+                                r.text_boxes = [r.body_anchor]
+                                _where = "на место прошлой реплики"
+                            else:
+                                # Прошлой реплики ещё не было — ставим под самой верхней рамкой (именем)
+                                nx, ny, nbw, nbh = min(boxes_with_text, key=lambda b: b[1])[:4]
+                                r.text_boxes = [(nx / float(w), min(0.9, (ny + 1.6 * nbh) / float(h)),
+                                                 nbw / float(w), nbh / float(h))]
+                                _where = "под табличкой с именем"
+                            print(f"[BOXES-FIX] region {idx}: рамки реплики нет (EasyOCR её не увидел) "
+                                  f"— ставлю перевод {_where}")
+                        else:
+                            r.text_boxes = []
                     except Exception as e:
                         print("[OCR-BOXES] error:", e)
                         # НЕ обнуляем r.text_boxes, чтобы оверлей не пропадал из-за временной ошибки
@@ -2760,9 +3225,25 @@ class Overlay(QWidget):
             self.update()
             return
 
+        # Область из настроек могла быть сохранена на другом мониторе или при другом
+        # разрешении (например, настройки достались от чужого ПК). Если она не попадает
+        # на экран — ставим по центру, иначе её не видно и не достать мышью.
+        area = self.rect()
+        def _visible(x, y, w, h) -> bool:
+            if area.width() < 200:      # размер оверлея ещё не задан — судить не по чему
+                return True
+            i = area.intersected(QRect(x, y, w, h))
+            return i.width() >= 60 and i.height() >= 30
+
         for it in lst:
             dx, dy, dw, dh = it.get("display_rect", [0, 0, 900, 220])
             cx, cy, cw, ch = it.get("capture_rect", [dx, dy, dw, dh])
+            if not _visible(dx, dy, dw, dh) or not _visible(cx, cy, cw, ch):
+                print(f"[UI] область из настроек за пределами экрана "
+                      f"(показ {dx},{dy} {dw}x{dh}; захват {cx},{cy} {cw}x{ch}) — ставлю по центру")
+                dw, dh = min(900, area.width()), min(220, area.height())
+                dx, dy = (area.width() - dw) // 2, (area.height() - dh) // 2
+                cx, cy, cw, ch = dx, dy, dw, dh
             split = bool(it.get("split_mode", False))
             spd   = int(it.get("typing_speed_cps", 80))
             rm = RegionModel(QRect(dx, dy, dw, dh), QRect(cx, cy, cw, ch),
@@ -2809,8 +3290,23 @@ class Overlay(QWidget):
 
     # ---- рисуем рамки в режиме правки ----
     def paintEvent(self,_e):
-        if not self.enabled_overlay or not self.edit_mode: return
+        if not self.enabled_overlay: return
+        # Первые секунды после запуска перевода область видна рамкой: пока перевода нет,
+        # на экране иначе нет вообще ничего, и непонятно, запустилась ли программа и куда смотреть.
+        hint = (not self.edit_mode) and time.time() < getattr(self, "hint_until", 0.0)
+        if not self.edit_mode and not hint: return
         p=QPainter(self); p.setRenderHint(QPainter.Antialiasing,True)
+        if hint:
+            for r in self.regions:
+                rect = r.capture_rect if r.split_mode else r.display_rect
+                pen = QPen(QColor(0,200,255,230)); pen.setStyle(Qt.DashLine); pen.setWidth(2)
+                p.setPen(pen); p.setBrush(Qt.NoBrush); p.drawRect(rect)
+                tip = QRect(rect.left(), rect.top()-26, 520, 22)
+                p.fillRect(tip, QColor(0,0,0,170))
+                p.setPen(QColor(255,255,255)); p.setFont(QFont("Segoe UI",10))
+                p.drawText(tip.adjusted(6,0,0,0), Qt.AlignLeft|Qt.AlignVCenter,
+                           "Область перевода: текст игры должен попадать в эту рамку")
+            return
         for r in self.regions:
             pen=QPen(QColor(0,200,255,230) if r.selected else QColor(255,255,255,120))
             pen.setWidth(int(getattr(self, "border_w", BORDER_WIDTH)))
@@ -3140,17 +3636,101 @@ class Overlay(QWidget):
                 pass
 
 
+# ============ Параметры, которые раньше были полями в настройках ============
+# Убраны из интерфейса: для перевода их крутить незачем, а половина ничего не делала.
+GEN_TOP_P = 1.0            # без отсечения по вероятности
+GEN_TOP_K = 0              # выключено
+GEN_REPEAT_PENALTY = 1.0   # без штрафа за повтор
+GEN_SEED = 0
+EN_CANON_HITS = 1          # сколько раз подряд должен совпасть прочитанный текст до перевода
+TR_MAX_TOKENS_FACTOR = 2   # лимит ответа переводчика = лимит OCR × 2 (русский текст длиннее)
+# Значения, которые действуют, пока не включены «Расширенные настройки»
+BASE_BATCH = 512
+BASE_UBATCH = 256
+BASE_TEMP = 0.2
+# Значения при первом запуске (когда файла настроек ещё нет)
+DEF_CTX_OCR = 10000        # DUAL на одной модели: сервер делит это на два слота, по 5000 на запрос
+DEF_CTX_TR = 5000          # отдельный сервер перевода (DUAL на двух моделях)
+DEF_CTX_SOLO = 8192
+DEF_OCR_MAX_TOKENS = 1024
+FS_PARALLEL = 4            # слотов у сервера в полноэкранном режиме (DUAL/ONLINE)
+
 # =================== Автостарт llama-server ===============
 
 def _q(p): return f'"{str(p)}"'
 
+# Ускоритель генерации (speculative decoding в llama.cpp, тип draft-mtp). Бывает двух видов:
+#   "builtin" — MTP-голова зашита в саму модель (Qwen 3.5 MTP), отдельного файла нет;
+#   путь      — отдельный маленький файл-драфт (Gemma 4 "…-it-assistant…gguf").
+# Какой ускоритель подходит какой модели — записано в assets/models.json (поля "mtp" и
+# "draft"), туда это попадает из tools/model_sources.json.
+USE_DRAFT = True
+# Сколько токенов драфт предлагает за раз. Параметр капризный, 3 — проверенная середина;
+# в настройки не выносим нарочно.
+SPEC_DRAFT_N_MAX = 3
+
+
+def _load_model_presets() -> list:
+    json_path = BASE_DIR / "assets" / "models.json"
+    if not json_path.exists():
+        return []
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def draft_filenames() -> set[str]:
+    """Имена файлов-драфтов из списка моделей: в выпадающих списках моделей им не место."""
+    return {str((p.get("draft") or {}).get("filename", "")).lower()
+            for p in _load_model_presets()} - {""}
+
+
+def resolve_draft(model_path) -> str:
+    """Ускоритель для модели: '' (нет), 'builtin' (встроенный MTP) или путь к файлу драфта.
+    Модель из каталога — как записано в каталоге. Своя модель (в каталоге её нет):
+    пометка "(MTP)" в имени файла = ускоритель встроен; иначе ищем в папке подходящий
+    файл драфта (то же семейство и размер, как в окне загрузки)."""
+    if not USE_DRAFT or not model_path:
+        return ""
+    name = Path(str(model_path)).name.lower()
+    for p in _load_model_presets():
+        quants = (p.get("quants") or {}).values()
+        if not any(str(q.get("filename", "")).lower() == name for q in quants):
+            continue
+        if p.get("mtp"):
+            return "builtin"
+        fname = (p.get("draft") or {}).get("filename", "")
+        if not fname:
+            return ""
+        for root in (Path(str(model_path)).parent, BASE_DIR/"models"/"llm", BASE_DIR/"models"/"lmm"):
+            if (root / fname).exists():
+                return str(root / fname)
+        print(f"[LLM] ускоритель для {name} не скачан ({fname}) — запуск без него")
+        return ""
+
+    # --- своя модель ---
+    if "(mtp)" in name:
+        print(f"[LLM] {name}: пометка (MTP) в имени — включаю встроенный ускоритель")
+        return "builtin"
+    folder = str(Path(str(model_path)).parent)
+    for row in build_local_presets(folder, _load_model_presets()):
+        if any(str(q.get("filename", "")).lower() == name for q in row["quants"].values()):
+            if row.get("draft_files"):
+                path = os.path.join(folder, row["draft_files"][0])
+                print(f"[LLM] {name}: в папке найден подходящий ускоритель {row['draft_files'][0]}")
+                return path
+            break
+    return ""
+
+
 def scan_gguf(roots: list[Path]) -> tuple[list[str], list[str]]:
     models=[]; projs=[]
+    drafts = draft_filenames()
     for root in roots:
         if not root.exists(): continue
         for p in root.rglob("*.gguf"):
             name=p.name.lower()
             if "mmproj" in name: projs.append(str(p))
+            elif name in drafts or _looks_like_draft(str(p)): continue
             else: models.append(str(p))
     models.sort(); projs.sort()
     return models, projs
@@ -3227,6 +3807,16 @@ def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, pa
     # Переводчику размышления не нужны: задача механическая, а цена — секунды.
     cmd += ["--reasoning-budget", "0", "--reasoning-format", "none"]
 
+    # Ускоритель (драфт / встроенный MTP), если он положен этой модели
+    draft = resolve_draft(model)
+    if draft:
+        if draft != "builtin":
+            cmd += ["-md", draft]
+            # Старые сборки llama.cpp не тянут драфт на то же устройство сами
+            if device:
+                cmd += ["--device-draft", str(device)]
+        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(SPEC_DRAFT_N_MAX)]
+
     cmd += [
         "-ngl", str(int(ngl)),
         "--ctx-size", str(int(ctx)),
@@ -3295,13 +3885,169 @@ def _no_local_model_msg(server_url, tag=""):
 _LLAMA_PROC = None
 _LLAMA_PROC2 = None
 
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# Коды, с которыми Windows убивает процесс. Обе записи одного числа: как его отдаёт
+# Python (беззнаковое) и как его иногда пишут (со знаком).
+_WIN_CRASH_CODES = {
+    0xC0000005: "нарушение доступа к памяти",
+    0xC000001D: "процессор не поддерживает нужные инструкции",
+    0xC0000135: "не найдена нужная библиотека (DLL)",
+    0xC0000409: "внутренний сбой сервера (переполнение буфера)",
+}
+
+
+def diagnose_llama_failure(returncode, output: str) -> tuple[str, str]:
+    """Почему не запустился llama-server, человеческим языком: (что случилось, что делать).
+    Смотрим сначала на то, что сервер сам написал перед выходом, потом на код завершения."""
+    low = (output or "").lower()
+    code = (returncode or 0) & 0xFFFFFFFF
+
+    if "doesn't contain mtp layers" in low or "failed to create mtp context" in low:
+        return ("Модель не поддерживает ускоритель: в ней нет встроенного MTP, а отдельный файл ускорителя не задан.",
+                "Снимите галочку «Ускоритель (драфт / MTP)» в настройках модели и запустите снова.")
+    if re.search(r"draft model|model-draft|spec-draft", low) and re.search(r"fail|error|incompatible|mismatch", low):
+        return ("Файл ускорителя (драфт) не подошёл к этой модели или повреждён.",
+                "Снимите галочку «Ускоритель (драфт / MTP)» или скачайте ускоритель заново из окна загрузки.")
+    if re.search(r"out of memory|failed to allocate|unable to allocate|cudamalloc|erroroutofdevicememory|"
+                 r"not enough memory|insufficient memory|bad_alloc", low):
+        return ("Не хватило памяти видеокарты (или оперативной), чтобы загрузить модель.",
+                "Возьмите квантование полегче или модель поменьше, уменьшите контекст, закройте игру на время проверки.")
+    if re.search(r"invalid argument|unknown argument|unrecognized (?:option|argument)|error: unknown", low):
+        return ("Сервер не понял один из параметров запуска — похоже, сборка llama.cpp слишком старая.",
+                "Обновите llama.cpp в папке программы; если включён ускоритель, попробуйте без него.")
+    if "unknown model architecture" in low or "unknown architecture" in low:
+        return ("Эта сборка llama.cpp не знает такую модель — она новее, чем сервер в программе.",
+                "Обновите llama.cpp в папке программы или возьмите модель постарше.")
+    if "mmproj" in low and re.search(r"fail|error|mismatch|unsupported", low):
+        return ("Глаза (mmproj) не подошли к этой модели или файл повреждён.",
+                "Выберите глаза от той же модели: в окне загрузки подходящие показаны в её описании.")
+    if re.search(r"couldn't bind|could not bind|address already in use|bind failed|failed to bind", low):
+        return ("Порт занят другой программой.",
+                "Закройте прежний сервер или поменяйте порт в настройках модели.")
+    if re.search(r"invalid magic|not a gguf|failed to read|unexpected end|file is corrupt|tensor .* out of file", low):
+        return ("Файл модели повреждён или скачан не до конца.",
+                "Удалите его в окне загрузки и скачайте заново.")
+    if code == 0xC0000005:
+        return ("Сервер упал с нарушением доступа к памяти (0xC0000005).",
+                "Чаще всего так бывает, когда в компьютере две графики (встроенная и отдельная карта): "
+                "выберите нужную вручную в настройках модели, в списке «Видеокарта».")
+    if code in _WIN_CRASH_CODES:
+        return (f"Сервер упал: {_WIN_CRASH_CODES[code]} (0x{code:08X}).",
+                "Попробуйте другой вариант сборки программы (CPU / CUDA / Vulkan) и обновите драйвер видеокарты.")
+    if re.search(r"failed to load model|error loading model|failed to create llama_context|model loading error", low):
+        return ("Модель не загрузилась.",
+                "Такое бывает с отдельным файлом: та же модель в другом квантовании может работать. "
+                "Попробуйте другое квантование или скачайте файл заново.")
+    return (f"Сервер завершился сразу после запуска (код {returncode}).",
+            "Такое бывает с отдельным файлом: та же модель в другом квантовании может работать.")
+
+
+def _server_log_path(cmd_list) -> Path:
+    parts = [str(x) for x in cmd_list]
+    port = parts[parts.index("--port") + 1] if "--port" in parts else "x"
+    d = BASE_DIR / "logs"
+    d.mkdir(exist_ok=True)
+    return d / f"llama-server-{port}.log"
+
+
+class _JobBasicLimits(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wt.DWORD),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", wt.DWORD), ("SchedulingClass", wt.DWORD)]
+
+
+class _JobExtendedLimits(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _JobBasicLimits), ("IoInfo", ctypes.c_uint64 * 6),
+                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+_KILL_JOB = None
+
+
+def _tie_to_program(proc) -> None:
+    """Привязывает llama-server к программе: Windows сама закроет его вместе с ней, даже
+    если программу сняли через диспетчер задач. Без этого сервер оставался висеть и держал
+    видеопамять и порт. Делается через «задание» Windows с флагом «убить всё при закрытии»:
+    задание держит только наша программа, и когда её не стало — не стало и сервера."""
+    global _KILL_JOB
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wt.HANDLE
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+    k32.SetInformationJobObject.restype = wt.BOOL
+    k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+    k32.AssignProcessToJobObject.restype = wt.BOOL
+    k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+    if _KILL_JOB is None:
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            print(f"[LLM] ВНИМАНИЕ: не удалось создать задание Windows (ошибка {ctypes.get_last_error()}); "
+                  f"если программу снять через диспетчер, llama-server останется работать")
+            return
+        info = _JobExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = 0x2000      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            print(f"[LLM] ВНИМАНИЕ: не удалось настроить задание Windows (ошибка {ctypes.get_last_error()}); "
+                  f"если программу снять через диспетчер, llama-server останется работать")
+            return
+        _KILL_JOB = job
+    if not k32.AssignProcessToJobObject(_KILL_JOB, int(proc._handle)):
+        print(f"[LLM] ВНИМАНИЕ: не удалось привязать llama-server к программе (ошибка {ctypes.get_last_error()}); "
+              f"если программу снять через диспетчер, он останется работать")
+
+
 def _spawn(cmd_list):
-    # не используем shell, даём список аргументов
-    if HIDE_CONSOLE:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    else:
-        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
-    return subprocess.Popen(cmd_list, shell=False, creationflags=flags)
+    """Запускает llama-server и забирает его вывод себе. Отдельного окна у сервера больше
+    нет: его окно закрывалось вместе с упавшим сервером, и причину было не прочитать.
+    Вывод пишется в logs/llama-server-<порт>.log, последние строки держим в памяти для
+    диагностики, а при видимой консоли дублируем туда же, чтобы за сервером можно было следить."""
+    import collections
+    log_path = _server_log_path(cmd_list)
+    proc = subprocess.Popen(
+        cmd_list, shell=False, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    _tie_to_program(proc)
+    tail = collections.deque(maxlen=80)
+
+    def pump():
+        con = getattr(sys, "__stdout__", None)
+        with open(log_path, "w", encoding="utf-8", errors="replace") as lf:
+            for raw in iter(proc.stdout.readline, b""):
+                line = _RE_ANSI.sub("", raw.decode("utf-8", "replace").rstrip("\r\n"))
+                tail.append(line)
+                lf.write(line + "\n")
+                lf.flush()
+                if con is not None and not HIDE_CONSOLE:
+                    try:
+                        con.write(line + "\n")
+                    except Exception:
+                        pass      # консоль в другой кодировке — строка всё равно есть в файле
+
+    t = threading.Thread(target=pump, daemon=True, name="llama-server-log")
+    t.start()
+    proc.gt_tail, proc.gt_log, proc.gt_pump = tail, log_path, t
+    return proc
+
+
+def _explain_server_exit(proc, tag: str = ""):
+    """Сервер умер, не поднявшись: объясняем почему — в лог и окном."""
+    pump = getattr(proc, "gt_pump", None)
+    if pump is not None:
+        pump.join(timeout=2.0)      # дочитать последние строки
+    lines = [ln for ln in getattr(proc, "gt_tail", []) if ln.strip()]
+    reason, advice = diagnose_llama_failure(proc.returncode, "\n".join(lines))
+    print(f"[LLM]{tag} llama-server не запустился (код {proc.returncode}): {reason} {advice}")
+    text = (f"{reason}\n\n{advice}\n\n"
+            "Последние строки сервера:\n" + "\n".join(ln[:160] for ln in lines[-6:]) +
+            f"\n\nПолный вывод: {getattr(proc, 'gt_log', '')}")
+    try:
+        QMessageBox.critical(None, "Сервер модели не запустился", text)
+    except Exception as e:
+        print("[LLM] не удалось показать окно с причиной:", e)
+
 
 def _toggle_console(hide: bool):
     try:
@@ -3311,25 +4057,125 @@ def _toggle_console(hide: bool):
     except Exception:
         pass
 
-def _ensure_llama_server(cmd_list, server_url):
-    global _LLAMA_PROC
-    if _wait_for_llama(server_url):
-        print(f"[LLM] server ok @ {server_url}")
-        return
-    if not _model_arg(cmd_list):
-        _no_local_model_msg(server_url)
-        return
-    print("[LLM] spawn:", cmd_list)
-    _LLAMA_PROC = _spawn(cmd_list)
-    print(f"[LLM] llama-server started (pid={_LLAMA_PROC.pid})")
-    for _ in range(120):
-        time.sleep(0.5)
-        if _ping_llama(server_url):
-            print("[LLM] llama-server поднялся")
-            return
-        if _LLAMA_PROC.poll() is not None:
-            print("[LLM] llama-server exited early code", _LLAMA_PROC.returncode)
-            return
+SERVER_START_TIMEOUT_S = 300   # сколько ждём загрузки модели; ждать можно долго — в окошке есть «Отмена»
+
+
+def _run_waiting(fn, text: str, cancel: "threading.Event | None" = None):
+    """Выполняет fn() в фоновом потоке и возвращает её результат, а окно программы всё это
+    время остаётся живым: показывается окошко «подождите». Раньше ожидание сервера шло прямо
+    в окне настроек, и Windows писала на нём «Не отвечает».
+    cancel — если передан, в окошке есть кнопка «Отмена», она взводит этот флаг."""
+    app = QApplication.instance()
+    if app is None:
+        return fn()
+    box = {}
+
+    def work():
+        try:
+            box["result"] = fn()
+        except BaseException as e:      # ошибку поднимем в основном потоке, не глотаем
+            box["error"] = e
+
+    th = threading.Thread(target=work, daemon=True, name="gt-wait")
+    th.start()
+    dlg, t0 = None, time.perf_counter()
+    while th.is_alive():
+        # окошко показываем не сразу: если сервер уже работает, ответ приходит мгновенно
+        if dlg is None and time.perf_counter() - t0 > 0.4:
+            dlg = QProgressDialog(text, "Отмена", 0, 0, QApplication.activeWindow())
+            dlg.setWindowTitle("GameTranslator")
+            dlg.setWindowModality(Qt.ApplicationModal)
+            dlg.setWindowFlag(Qt.WindowCloseButtonHint, False)
+            dlg.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+            dlg.setAutoClose(False); dlg.setAutoReset(False); dlg.setMinimumDuration(0)
+            dlg.setMinimumWidth(420)
+            if cancel is None:
+                dlg.setCancelButton(None)
+            dlg.show()
+        app.processEvents()
+        time.sleep(0.02)
+        if dlg is not None and cancel is not None and dlg.wasCanceled():
+            cancel.set()
+    if dlg is not None:
+        dlg.close()
+        dlg.deleteLater()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _ensure_server(cmd_list, server_url, second: bool = False) -> str:
+    """Добивается, чтобы сервер модели отвечал по адресу. Возвращает:
+    "ok"       — сервер отвечает (уже работал или поднялся);
+    "no_model" — сервер не отвечает, а локальной модели не выбрано: поднимать нечего;
+    "died"     — сервер запустился и умер (причина уже показана окном);
+    "timeout"  — модель не загрузилась за отведённое время (окно показано, сервер остановлен);
+    "cancel"   — человек нажал «Отмена» (сервер остановлен)."""
+    global _LLAMA_PROC, _LLAMA_PROC2
+    tag = "[2]" if second else ""
+    # Свой компьютер отвечает или отказывает сразу, одной попытки хватает. Три попытки нужны
+    # только удалённому серверу; на своём они давали 7 секунд пустого ожидания при каждом запуске.
+    is_local = bool(re.match(r"https?://(127\.0\.0\.1|localhost|\[::1\])[:/]", server_url + "/"))
+    attempts = 1 if is_local else 3
+    if _run_waiting(lambda: _wait_for_llama(server_url, attempts=attempts), "Проверяю, запущен ли сервер модели…"):
+        print(f"[LLM]{tag} server ok @ {server_url}")
+        return "ok"
+    model = _model_arg(cmd_list)
+    if not model:
+        _no_local_model_msg(server_url, tag=tag)
+        return "no_model"
+    print(f"[LLM]{tag} spawn:", cmd_list)
+    proc = _spawn(cmd_list)
+    if second:
+        _LLAMA_PROC2 = proc
+    else:
+        _LLAMA_PROC = proc
+    print(f"[LLM]{tag} llama-server started (pid={proc.pid})")
+
+    cancel = threading.Event()
+
+    def wait():
+        t_end = time.time() + SERVER_START_TIMEOUT_S
+        while time.time() < t_end:
+            if cancel.is_set():
+                return "cancel"
+            if _ping_llama(server_url):
+                return "ok"
+            if proc.poll() is not None:
+                return "died"
+            time.sleep(0.5)
+        return "timeout"
+
+    status = _run_waiting(
+        wait,
+        f"Загружается модель:\n{Path(model).name}\n\n"
+        "Обычно это занимает до минуты, на медленном диске — дольше.",
+        cancel)
+    # Сервер могли остановить, пока шло ожидание (Pause, выход из программы) — это не падение
+    if status == "died" and (_LLAMA_PROC2 if second else _LLAMA_PROC) is not proc:
+        status = "cancel"
+    if status == "ok":
+        print(f"[LLM]{tag} llama-server поднялся")
+        return status
+    if status == "died":
+        _explain_server_exit(proc, tag=tag)
+        return status
+    (_stop_llama_server2 if second else _stop_llama_server)()
+    if status == "timeout":
+        print(f"[LLM]{tag} llama-server не ответил за {SERVER_START_TIMEOUT_S} с — остановлен")
+        QMessageBox.critical(
+            None, "Модель не загрузилась",
+            f"Сервер модели не ответил за {SERVER_START_TIMEOUT_S // 60} минут.\n\n"
+            "Скорее всего, модель слишком большая для этого компьютера. Попробуйте модель "
+            "поменьше или меньшее квантование.\n\n"
+            f"Полный вывод сервера: {getattr(proc, 'gt_log', '')}")
+    else:
+        print(f"[LLM]{tag} запуск сервера отменён")
+    return status
+
+
+def _ensure_llama_server(cmd_list, server_url) -> str:
+    return _ensure_server(cmd_list, server_url, second=False)
 
 def _stop_llama_server():
     global _LLAMA_PROC
@@ -3341,25 +4187,8 @@ def _stop_llama_server():
         except Exception: pass
     _LLAMA_PROC = None
 
-def _ensure_llama_server2(cmd_list, server_url):
-    global _LLAMA_PROC2
-    if _wait_for_llama(server_url):
-        print(f"[LLM] server2 ok @ {server_url}")
-        return
-    if not _model_arg(cmd_list):
-        _no_local_model_msg(server_url, tag="[2]")
-        return
-    print("[LLM] spawn#2:", cmd_list)
-    _LLAMA_PROC2 = _spawn(cmd_list)
-    print(f"[LLM] llama-server#2 started (pid={_LLAMA_PROC2.pid})")
-    for _ in range(120):
-        time.sleep(0.5)
-        if _ping_llama(server_url):
-            print("[LLM] llama-server#2 поднялся")
-            return
-        if _LLAMA_PROC2.poll() is not None:
-            print("[LLM] llama-server#2 exited early code", _LLAMA_PROC2.returncode)
-            return
+def _ensure_llama_server2(cmd_list, server_url) -> str:
+    return _ensure_server(cmd_list, server_url, second=True)
 
 def _stop_llama_server2():
     global _LLAMA_PROC2
@@ -3383,6 +4212,40 @@ def stop_all_llama_servers():
         print("[LLM] error stopping second server:", e)
 # ====================== Настроечный GUI ===================
 
+START_HINT_SEC = 8     # сколько секунд после запуска видны подсказка и рамка области
+
+
+class StartHint(QWidget):
+    """Подсказка на несколько секунд после запуска перевода. Окно настроек в этот момент
+    прячется, и без подсказки программа выглядит закрывшейся: непонятно, что она работает
+    и как вернуться. Клики проходят сквозь неё, в захват экрана она не попадает."""
+    def __init__(self, text: str, seconds: float = START_HINT_SEC):
+        super().__init__(None)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                            | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        lab = QLabel(text, self)
+        lab.setAlignment(Qt.AlignCenter)
+        lab.setStyleSheet("QLabel{background:rgba(20,20,20,230);color:white;"
+                          "border:1px solid rgba(0,200,255,220);border-radius:8px;"
+                          "padding:10px 18px;font:12pt 'Segoe UI';}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(lab)
+        self.adjustSize()
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(scr.center().x() - self.width() // 2, scr.top() + 40)
+        QTimer.singleShot(int(seconds * 1000), self.hide)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # 0x11 = не показывать окно в захвате экрана: иначе программа прочитает и
+        # «переведёт» собственную подсказку
+        if not ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x11):
+            print("[UI] подсказку о запуске не удалось скрыть от захвата экрана")
+
+
 class ConfigWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -3393,8 +4256,8 @@ class ConfigWindow(QWidget):
         self.btnStart = QPushButton("Начать перевод")
         self.cbMode = QComboBox()
         self.cbMode.addItems([
-            "SOLO (Все в одной модели)",   # index 0
-            "DUAL (Две нейросети)",        # index 1
+            "SOLO (один запрос на всё, упрощённый)",   # index 0
+            "DUAL (распознавание и перевод отдельно)",        # index 1
             "ONLINE (OCR + Google)"        # index 2
         ])
         self.cbMode.setToolTip(
@@ -3427,42 +4290,42 @@ class ConfigWindow(QWidget):
         self.spMaxTok = QSpinBox(); self.spMaxTok.setRange(16, 16000); self.spMaxTok.setValue(int(getattr(llm_cfg,'max_tokens',1024)))
         self.spTO     = QDoubleSpinBox(); self.spTO.setRange(1.0, 120.0); self.spTO.setDecimals(1); self.spTO.setValue(float(getattr(llm_cfg,'timeout_s',30.0)))
         self.spTemp   = QDoubleSpinBox(); self.spTemp.setRange(0.0, 1.5); self.spTemp.setSingleStep(0.05); self.spTemp.setValue(float(getattr(llm_cfg,'temp',0.2)))
-        self.spTopP   = QDoubleSpinBox(); self.spTopP.setRange(0.0, 1.0); self.spTopP.setSingleStep(0.05); self.spTopP.setValue(float(getattr(llm_cfg,'top_p',0.9)))
         
         # доп. параметры генерации
-        self.spTopK  = QSpinBox();      self.spTopK.setRange(0, 10000); self.spTopK.setValue(0)
-        self.spRP    = QDoubleSpinBox(); self.spRP.setRange(0.1, 2.0);  self.spRP.setSingleStep(0.05); self.spRP.setValue(1.0)
-        self.spSeed  = QSpinBox();       self.spSeed.setRange(0, 2_000_000_000); self.spSeed.setValue(0)
-        self.spSlot  = QSpinBox();       self.spSlot.setRange(0, 7);    self.spSlot.setValue(int(getattr(llm_cfg,'slot_id',0)))
-        self.cbCache = QCheckBox("cache_prompt (прогрев)"); self.cbCache.setChecked(bool(getattr(llm_cfg,'use_prompt_cache',True)))
 
         # серверные параметры (llama-server)
-        self.spCtx   = QSpinBox();       self.spCtx.setRange(1024, 65536); self.spCtx.setValue(4096)
-        self.spBatch = QSpinBox();       self.spBatch.setRange(1, 4096);   self.spBatch.setValue(256)
-        self.spUBatch= QSpinBox();       self.spUBatch.setRange(1, 4096);  self.spUBatch.setValue(64)
-        self.spPar   = QSpinBox();       self.spPar.setRange(1, 16);       self.spPar.setValue(1)
+        self.spCtx   = QSpinBox();       self.spCtx.setRange(1024, 65536); self.spCtx.setValue(DEF_CTX_SOLO)
+        self.spBatch = QSpinBox();       self.spBatch.setRange(1, 4096);   self.spBatch.setValue(BASE_BATCH)
+        self.spUBatch= QSpinBox();       self.spUBatch.setRange(1, 4096);  self.spUBatch.setValue(BASE_UBATCH)
         self.spNGL   = QSpinBox();       self.spNGL.setRange(0, 999);      self.spNGL.setValue(999)
         self.cbFlashAttn = QCheckBox("Flash Attention (только RTX 30xx/40xx)")
         self.cbFlashAttn.setChecked(False) 
         self.cbFlashAttn.setToolTip("Включает оптимизацию памяти и скорости.\n"
                             "Включать ТОЛЬКО для видеокарт RTX 30-й и 40-й серий!\n"
                             "На GTX 10xx или старых RTX может вызывать ошибку.")
+        self.cbDraft = QCheckBox("Ускоритель (драфт / MTP), если он есть у модели")
+        self.cbDraft.setChecked(True)
+        self.cbDraft.setToolTip("Ускоряет генерацию.\n"
+                            "Модели из списка загрузок: Gemma 4 — нужен отдельный файл (кнопка «Скачать ускоритель»),\n"
+                            "Qwen 3.5 MTP — ускоритель встроен, качать ничего не надо.\n"
+                            "Свои модели: положите файл ускорителя в ту же папку (в имени — то же семейство и\n"
+                            "размер, например …12B…assistant…) или допишите (MTP) в имя файла модели,\n"
+                            "если ускоритель встроен: Qwen3.5-9B-heretic-Q4_K_M(MTP).gguf\n"
+                            "Если сервер не запускается или перевод портится — выключить.")
         self.edHost  = QLineEdit("127.0.0.1")
         self.spPort  = QSpinBox();       self.spPort.setRange(1, 65535);   self.spPort.setValue(8080)
 
         # константы/поведение
         self.spFps    = QDoubleSpinBox(); self.spFps.setRange(0.1, 5.0); self.spFps.setSingleStep(0.1); self.spFps.setValue(float(MAX_OCR_FPS))
-        self.spCanonHits = QSpinBox(); self.spCanonHits.setRange(0, 10); self.spCanonHits.setValue(2)  # разумное значение по умолчанию
-        self.spRetr = QDoubleSpinBox(); self.spRetr.setRange(0.0, 600.0); self.spRetr.setSingleStep(0.5); self.spRetr.setDecimals(1); self.spRetr.setValue(0.0)
         self.cbSmartNameRemoval = QCheckBox("Умное удаление имен (Game Mode)")
         self.cbSmartNameRemoval.setToolTip("Если включено: программа пытается найти имя персонажа в первой строке и скрыть его.\nВыключите для браузера/книг, чтобы не терять первую строку.")
         self.spBorder = QSpinBox(); self.spBorder.setRange(1, 16); self.spBorder.setValue(BORDER_WIDTH)
-        self.spBorder.valueChanged.connect(lambda v: (setattr(self.overlay, "border_w", int(v)), self.overlay.update()))
-        self.spSplit  = QSpinBox(); self.spSplit.setRange(1, 16); self.spSplit.setValue(SPLIT_BORDER_WIDTH)
-        self.spSplit.valueChanged.connect(lambda v: (setattr(self.overlay, "split_border_w", int(v)), self.overlay.update()))
-        self.cbSmooth = QCheckBox("Плавный вывод (smooth)"); self.cbSmooth.setChecked(RENDER_MODE=="smooth")
+        # Одна ширина и для рамки области, и для разделителя внутри неё
+        self.spBorder.valueChanged.connect(lambda v: (setattr(self.overlay, "border_w", int(v)),
+                                                      setattr(self.overlay, "split_border_w", int(v)),
+                                                      self.overlay.update()))
         self.cbOverlayBoxes = QCheckBox("Подставлять перевод на место оригинального текста")
-        self.cbOverlayBoxes.setChecked(False)
+        self.cbOverlayBoxes.setChecked(True)
         self.cbHideConsole = QCheckBox("Скрыть консоль (Main + Llama)")
         self.cbHideConsole.toggled.connect(lambda v: (globals().__setitem__("HIDE_CONSOLE", v), _toggle_console(v)))
         self.cbMemory = QCheckBox("Память нейросети")
@@ -3500,10 +4363,16 @@ class ConfigWindow(QWidget):
 
         # =========== ЛЕВАЯ КОЛОНКА НАВИГАЦИИ ============
 
-        def _make_nav_button(icon_path: str, tooltip: str) -> QToolButton:
+        def _make_nav_button(icon_name: str, tooltip: str) -> QToolButton:
             btn = QToolButton(self)
-            # иконка
-            btn.setIcon(QIcon(icon_path))
+            # Иконка — от папки программы. Раньше путь был "_internal/icons/…" от текущей
+            # папки: в собранной версии он случайно совпадал, а при запуске из исходников
+            # такой папки нет, и кнопки оставались пустыми.
+            icon_file = BASE_DIR / "icons" / icon_name
+            if icon_file.exists():
+                btn.setIcon(QIcon(str(icon_file)))
+            else:
+                print(f"[UI] нет иконки {icon_file} — кнопка «{tooltip}» будет пустой")
             btn.setIconSize(QSize(32, 32))  # размер самой картинки
             # текст нам не нужен, оставим только подсказку
             btn.setText("")                  # на всякий случай
@@ -3516,13 +4385,12 @@ class ConfigWindow(QWidget):
             btn.setFixedSize(64, 64)
             return btn
 
-        # здесь подставишь свои реальные пути к картинкам
-        self.btnNavHome      = _make_nav_button("_internal/icons/Home.png",      "Дом")
-        self.btnNavCustomize = _make_nav_button("_internal/icons/UI.png",     "Кастомизация")
-        self.btnNavDownload  = _make_nav_button("_internal/icons/Download.png",  "Скачать модели")
-        self.btnNavModel     = _make_nav_button("_internal/icons/Settings.png",       "Настройки моделей")
-        self.btnNavFullscreen= _make_nav_button("_internal/icons/Fullscreen.png", "Полноэкранный режим")
-        self.btnNavInfo      = _make_nav_button("_internal/icons/FAQ.png",      "Информация")
+        self.btnNavHome      = _make_nav_button("Home.png",      "Дом")
+        self.btnNavCustomize = _make_nav_button("UI.png",     "Кастомизация")
+        self.btnNavDownload  = _make_nav_button("Download.png",  "Скачать модели")
+        self.btnNavModel     = _make_nav_button("Settings.png",       "Настройки моделей")
+        self.btnNavFullscreen= _make_nav_button("Fullscreen.png", "Полноэкранный режим")
+        self.btnNavInfo      = _make_nav_button("FAQ.png",      "Информация")
 
         navLayout = QVBoxLayout()
         navLayout.setContentsMargins(0, 0, 0, 0)
@@ -3630,17 +4498,27 @@ class ConfigWindow(QWidget):
         formHome.addWidget(gbModels)
         
         # Лор
-        gbLore = QGroupBox("Лор (game_bible)")
+        # По факту это словарь: в DUAL из файла читаются только строки
+        # "Имя -> Перевод | пол: …", и в запрос идут лишь те, что относятся к реплике.
+        gbLore = QGroupBox("Имена и термины")
+        gbLore.setToolTip("Словарь имён и терминов: одна строка на запись,\n"
+                          "Имя -> Перевод | пол: женский/мужской\n"
+                          "К каждой реплике подставляются только нужные строки (говорящий и упомянутые имена).\n"
+                          "В режиме DUAL обычный текст из этого файла НЕ читается — описание игры пишите в файл ниже.")
         fl = QHBoxLayout(gbLore)
-        fl.addWidget(QLabel("Файл лора:"))
+        fl.addWidget(QLabel("Файл:"))
         fl.addWidget(self.edLore, 1)
         fl.addWidget(self.btnLore)
         formHome.addWidget(gbLore)
 
         # Phrasebook
-        gbPB = QGroupBox("Фразеологический словарик (phrasebook)")
+        gbPB = QGroupBox("Описание игры и правила перевода")
+        gbPB.setToolTip("Свободный текст, который модель видит ЦЕЛИКОМ при каждом переводе:\n"
+                        "о чём игра, кто главные герои и как они связаны, кто к кому на «ты» / «вы»,\n"
+                        "как переводить отдельные слова и знаки.\n"
+                        "Пишите коротко: текст занимает место в контексте модели (до 15 000 символов).")
         fpb = QHBoxLayout(gbPB)
-        fpb.addWidget(QLabel("Файл phrasebook:"))
+        fpb.addWidget(QLabel("Файл:"))
         fpb.addWidget(self.edPB, 1)
         fpb.addWidget(self.btnPB)
         formHome.addWidget(gbPB)
@@ -3701,10 +4579,7 @@ class ConfigWindow(QWidget):
         fk = QFormLayout(gbK)
         fk.addRow("FPS захвата:", self.spFps)
         fk.addRow(self.cbSmartNameRemoval)
-        fk.addRow("Проверок EN до фиксации:", self.spCanonHits)
-        fk.addRow("Ширина рамки:", self.spBorder)
-        fk.addRow("Ширина разделителя:", self.spSplit)
-        fk.addRow("Плавный вывод:", self.cbSmooth)
+        fk.addRow("Ширина рамки и разделителя:", self.spBorder)
         fk.addRow("Overlay по боксам:", self.cbOverlayBoxes)
         fk.addRow("Скрыть консоль:", self.cbHideConsole)
         fk.addRow("Память нейросети:", self.cbMemory)
@@ -3786,7 +4661,23 @@ class ConfigWindow(QWidget):
         self.gbGlobalOpt = QGroupBox("Оптимизация (действует на все режимы)")
         fgo = QFormLayout(self.gbGlobalOpt)
         fgo.addRow(self.cbFlashAttn)  # Flash Attention уже был
-        fgo.addRow(self.cbCache)
+        fgo.addRow(self.cbDraft)
+
+        self.cbSingle = QCheckBox("Одна модель на распознавание и перевод (DUAL)")
+        self.cbSingle.setChecked(True)
+        self.cbSingle.setToolTip("Включено: одна модель с глазами делает и распознавание, и перевод —\n"
+                                 "один сервер на два запроса, второй сервер и вторая модель не нужны.\n"
+                                 "Выключено: распознаёт одна модель, переводит другая, у каждой свой сервер.")
+        self.cbSingle.toggled.connect(self._reflow_mode_ui)
+        fgo.addRow(self.cbSingle)
+
+        self.cbAdvanced = QCheckBox("Расширенные настройки")
+        self.cbAdvanced.setChecked(False)
+        self.cbAdvanced.setToolTip("Показывает batch, ubatch и temperature.\n"
+                                   f"Пока галочка снята, действуют значения по умолчанию: batch {BASE_BATCH}, "
+                                   f"ubatch {BASE_UBATCH}, temperature {BASE_TEMP}.")
+        self.cbAdvanced.toggled.connect(self._reflow_mode_ui)
+        fgo.addRow(self.cbAdvanced)
 
         # --- НОВОЕ: Выбор квантования кэша ---
         self.cbCacheType = QComboBox()
@@ -3815,58 +4706,47 @@ class ConfigWindow(QWidget):
         formModel.addWidget(self.gbGlobalOpt)
 
         # OCR-сервер (DUAL)
-        self.gbOCR = QGroupBox("OCR-сервер (vision)")
+        self.gbOCR = QGroupBox("Распознавание (OCR)")
         self.edHost1 = QLineEdit("127.0.0.1")
         self.spPort1 = QSpinBox(); self.spPort1.setRange(1,65535); self.spPort1.setValue(8080)
-        self.spCtx1  = QSpinBox(); self.spCtx1.setRange(1024,65536); self.spCtx1.setValue(4096)
-        self.spBatch1= QSpinBox(); self.spBatch1.setRange(1,4096); self.spBatch1.setValue(256)
-        self.spUB1   = QSpinBox(); self.spUB1.setRange(1,4096); self.spUB1.setValue(64)
-        self.spPar1  = QSpinBox(); self.spPar1.setRange(1,16); self.spPar1.setValue(1)
+        self.spCtx1  = QSpinBox(); self.spCtx1.setRange(1024,65536); self.spCtx1.setValue(DEF_CTX_OCR)
+        self.spBatch1= QSpinBox(); self.spBatch1.setRange(1,4096); self.spBatch1.setValue(BASE_BATCH)
+        self.spUB1   = QSpinBox(); self.spUB1.setRange(1,4096); self.spUB1.setValue(BASE_UBATCH)
         self.spNGL1  = QSpinBox(); self.spNGL1.setRange(0,999); self.spNGL1.setValue(999)
-        self.spSeed1 = QSpinBox(); self.spSeed1.setRange(0, 2_000_000_000); self.spSeed1.setValue(0)
-        self.spSlot1 = QSpinBox(); self.spSlot1.setRange(0,7); self.spSlot1.setValue(0)
         self.spMaxTok1 = QSpinBox()
         self.spMaxTok1.setRange(64, 16384)
         self.spMaxTok1.setSingleStep(64)
-        self.spMaxTok1.setValue(512)
+        self.spMaxTok1.setValue(DEF_OCR_MAX_TOKENS)
 
-        f1 = QFormLayout(self.gbOCR)
+        # Раньше таймаут распознавания брался из поля блока SOLO, скрытого в этом режиме
+        self.spTO1 = QDoubleSpinBox(); self.spTO1.setRange(1.0, 600.0); self.spTO1.setSingleStep(1.0); self.spTO1.setDecimals(1); self.spTO1.setValue(30.0)
+        self.spMaxTok1.setToolTip("Лимит длины ответа при распознавании. Для перевода лимит вдвое больше — "
+                                  "русский текст длиннее английского.")
+
+        f1 = self._fOCR = QFormLayout(self.gbOCR)
         f1.addRow("host:", self.edHost1)
         f1.addRow("port:", self.spPort1)
         f1.addRow("max_tokens:", self.spMaxTok1)
+        f1.addRow("timeout, сек:", self.spTO1)
         f1.addRow("ctx-size:", self.spCtx1)
         f1.addRow("batch-size:", self.spBatch1)
         f1.addRow("ubatch-size:", self.spUB1)
-        f1.addRow("parallel:", self.spPar1)
         f1.addRow("ngl:", self.spNGL1)
-        f1.addRow("seed:", self.spSeed1)
-        f1.addRow("slot_id:", self.spSlot1)
         f1.addRow(self.btnEditOCR)
-        f1.addRow(self.btnPrevOCR)
         f1.addRow(self.btnPrevOCR)
         formModel.addWidget(self.gbOCR)
 
         # Переводчик (DUAL)
-        self.gbTR = QGroupBox("Перевод-сервер (text)")
+        self.gbTR = QGroupBox("Перевод")
         self.edHost2 = QLineEdit("127.0.0.1")
         self.spPort2 = QSpinBox(); self.spPort2.setRange(1,65535); self.spPort2.setValue(8081)
-        self.spCtx2  = QSpinBox(); self.spCtx2.setRange(1024,65536); self.spCtx2.setValue(4096)
-        self.spBatch2= QSpinBox(); self.spBatch2.setRange(1,4096); self.spBatch2.setValue(256)
-        self.spUB2   = QSpinBox(); self.spUB2.setRange(1,4096); self.spUB2.setValue(64)
-        self.spPar2  = QSpinBox(); self.spPar2.setRange(1,16); self.spPar2.setValue(1)
+        self.spCtx2  = QSpinBox(); self.spCtx2.setRange(1024,65536); self.spCtx2.setValue(DEF_CTX_TR)
+        self.spBatch2= QSpinBox(); self.spBatch2.setRange(1,4096); self.spBatch2.setValue(BASE_BATCH)
+        self.spUB2   = QSpinBox(); self.spUB2.setRange(1,4096); self.spUB2.setValue(BASE_UBATCH)
         self.spNGL2  = QSpinBox(); self.spNGL2.setRange(0,999); self.spNGL2.setValue(999)
-        self.spSeed2 = QSpinBox(); self.spSeed2.setRange(0, 2_000_000_000); self.spSeed2.setValue(0)
-        self.spSlot2 = QSpinBox(); self.spSlot2.setRange(0,7); self.spSlot2.setValue(1)
-        self.spMaxTok2 = QSpinBox()
-        self.spMaxTok2.setRange(64, 16384)
-        self.spMaxTok2.setSingleStep(64)
-        self.spMaxTok2.setValue(1024)
         
         self.spTO2 = QDoubleSpinBox();   self.spTO2.setRange(1.0, 600.0);  self.spTO2.setSingleStep(1.0);  self.spTO2.setDecimals(1);  self.spTO2.setValue(float(getattr(llm_cfg, 'timeout_s', 60.0)))
         self.spTemp2 = QDoubleSpinBox(); self.spTemp2.setRange(0.0, 2.0);  self.spTemp2.setSingleStep(0.05); self.spTemp2.setDecimals(2); self.spTemp2.setValue(float(getattr(llm_cfg, 'temp', 0.2)))
-        self.spTopP2 = QDoubleSpinBox(); self.spTopP2.setRange(0.0, 1.0);  self.spTopP2.setSingleStep(0.05); self.spTopP2.setDecimals(2); self.spTopP2.setValue(float(getattr(llm_cfg, 'top_p', 0.9)))
-        self.spTopK2 = QSpinBox();       self.spTopK2.setRange(0, 10000);  self.spTopK2.setValue(int(getattr(llm_cfg, 'top_k', 0)))
-        self.spRP2   = QDoubleSpinBox(); self.spRP2.setRange(0.1, 2.0);    self.spRP2.setSingleStep(0.05);  self.spRP2.setDecimals(2);  self.spRP2.setValue(float(getattr(llm_cfg, 'repeat_penalty', 1.0)))
 
         self.cbMode.currentIndexChanged.connect(self._reflow_mode_ui)
 
@@ -3875,50 +4755,32 @@ class ConfigWindow(QWidget):
         self.btnEditTR.clicked.connect(self._edit_tr_prompt)
         self.btnPrevTR.clicked.connect(self._preview_tr)
 
-        f2 = QFormLayout(self.gbTR)
+        f2 = self._fTR = QFormLayout(self.gbTR)
         f2.addRow("host:", self.edHost2)
         f2.addRow("port:", self.spPort2)
-        f2.addRow("max_tokens:", self.spMaxTok2)
         f2.addRow("timeout, сек:", self.spTO2)
         f2.addRow("temperature:", self.spTemp2)
-        f2.addRow("top_p:", self.spTopP2)
-        f2.addRow("top_k:", self.spTopK2)
-        f2.addRow("repeat_penalty:", self.spRP2)
         f2.addRow("ctx-size:", self.spCtx2)
         f2.addRow("batch-size:", self.spBatch2)
         f2.addRow("ubatch-size:", self.spUB2)
-        f2.addRow("parallel:", self.spPar2)
         f2.addRow("ngl:", self.spNGL2)
-        f2.addRow("seed:", self.spSeed2)
-        f2.addRow("slot_id:", self.spSlot2)
         f2.addRow(self.btnEditTR)
         f2.addRow(self.btnPrevTR)
         formModel.addWidget(self.gbTR)
 
         # Настройки модели (SOLO)
         self.gbLLM = QGroupBox("Настройки модели (SOLO)")
-        flm = QFormLayout(self.gbLLM)
+        flm = self._fLLM = QFormLayout(self.gbLLM)
         flm.addRow("max_tokens:", self.spMaxTok)
         flm.addRow("timeout, сек:", self.spTO)
         flm.addRow("temperature:", self.spTemp)
-        flm.addRow("top_p:", self.spTopP)
         formModel.addWidget(self.gbLLM)
 
-        # Доп. параметры генерации (SOLO)
-        self.gbGen = QGroupBox("Доп. параметры генерации (SOLO)")
-        fgen = QFormLayout(self.gbGen)
-        fgen.addRow("top_k:", self.spTopK)
-        fgen.addRow("repeat_penalty:", self.spRP)
-        fgen.addRow("seed:", self.spSeed)
-        fgen.addRow("slot_id:", self.spSlot)
-        formModel.addWidget(self.gbGen)
-
         self.gbSrv = QGroupBox("Сервер (llama.cpp)")
-        fsrv = QFormLayout(self.gbSrv)
+        fsrv = self._fSrv = QFormLayout(self.gbSrv)
         fsrv.addRow("ctx-size:", self.spCtx)
         fsrv.addRow("batch-size:", self.spBatch)
         fsrv.addRow("ubatch-size:", self.spUBatch)
-        fsrv.addRow("parallel:", self.spPar)
         fsrv.addRow("ngl:", self.spNGL)
 
         rowSrv = QWidget()
@@ -3963,8 +4825,8 @@ class ConfigWindow(QWidget):
         self.btnStartFS.clicked.connect(self._start_fullscreen)
         self.cbModeFS = QComboBox()
         self.cbModeFS.addItems([
-            "SOLO (Все в одной модели)",
-            "DUAL (Две нейросети)",
+            "SOLO (один запрос на всё, упрощённый)",
+            "DUAL (распознавание и перевод отдельно)",
             "ONLINE (OCR + Google)"
         ])
         self.cbModeFS.currentIndexChanged.connect(self._reflow_mode_ui)
@@ -4073,6 +4935,7 @@ class ConfigWindow(QWidget):
         self._fill_windows()
         self._load_prefs_into_ui()
         self._reflow_mode_ui()
+        self._init_tray()
     
     def _reset_hotkeys(self):
         """Вернуть сочетания по умолчанию."""
@@ -4160,6 +5023,29 @@ class ConfigWindow(QWidget):
                 QMessageBox.warning(self, "Внимание", "Полноэкранный режим всё еще в процессе разработки и может не работать должным образом.")
                 self._fs_warning_shown = True
     
+    def _adv(self, widget, base):
+        """Значение поля из «Расширенных настроек»; пока они выключены — значение по умолчанию."""
+        if self.cbAdvanced.isChecked():
+            return float(widget.value()) if isinstance(base, float) else int(widget.value())
+        return base
+
+    def _single_model(self) -> bool:
+        """DUAL на одной модели: распознавание и перевод делает один сервер в два слота."""
+        return self.cbMode.currentIndex() == 1 and self.cbSingle.isChecked()
+
+    def _ocr_parallel(self) -> int:
+        # полноэкранный режим шлёт много коротких запросов разом — ему нужно больше слотов
+        if getattr(self, "_fs_parallel", 0):
+            return int(self._fs_parallel)
+        return 2 if self._single_model() else 1
+
+    def _tr_ctx(self) -> int:
+        """Контекст, доступный переводчику (по нему считается бюджет истории диалога).
+        У одной модели контекст сервера делится между двумя слотами поровну."""
+        if self._single_model():
+            return int(self.spCtx1.value()) // 2
+        return int(self.spCtx2.value())
+
     def _reflow_mode_ui(self, *_):
         """Управление видимостью настроек в зависимости от режима."""
         mode = self.cbMode.currentIndex() # 0=SOLO, 1=DUAL, 2=ONLINE
@@ -4194,8 +5080,10 @@ class ConfigWindow(QWidget):
         self.cbMmprojOCR.setVisible(needs_separate_ocr)
 
         # 3. Блок выбора модели TR (только Dual)
-        self.lblTrModel.setVisible(needs_local_tr)
-        self.cbModelTR.setVisible(needs_local_tr)
+        # одна модель на всё — вторую выбирать незачем
+        single = is_dual and hasattr(self, "cbSingle") and self.cbSingle.isChecked()
+        self.lblTrModel.setVisible(needs_local_tr and not single)
+        self.cbModelTR.setVisible(needs_local_tr and not single)
 
         # 4. Лор и Фразбук (Скрываем в Online, так как Google их не понимает)
         # Нам нужно найти виджеты gbLore и gbPB. 
@@ -4234,6 +5122,21 @@ class ConfigWindow(QWidget):
         # 3. Группа TR (gbTR) - нужна ТОЛЬКО для Dual
         if getattr(self, "gbTR", None):
             self.gbTR.setVisible(needs_local_tr)
+
+        # 4. Строки внутри групп: второй сервер и расширенные настройки
+        if hasattr(self, "_fSrv"):
+            adv = self.cbAdvanced.isChecked()
+            self.cbSingle.setVisible(is_dual)
+            for w in (self.edHost2, self.spPort2, self.spCtx2, self.spNGL2):
+                self._fTR.setRowVisible(w, not single)
+            for w in (self.spBatch2, self.spUB2):
+                self._fTR.setRowVisible(w, adv and not single)
+            self._fTR.setRowVisible(self.spTemp2, adv)
+            for w in (self.spBatch1, self.spUB1):
+                self._fOCR.setRowVisible(w, adv)
+            self._fLLM.setRowVisible(self.spTemp, adv)
+            for w in (self.spBatch, self.spUBatch):
+                self._fSrv.setRowVisible(w, adv)
         
         self.cbMemory.setEnabled(not is_online)
             
@@ -4261,8 +5164,9 @@ class ConfigWindow(QWidget):
             self.lblOcrMmprojFS.setVisible(needs_separate_ocr_fs)
             self.cbMmprojOCR_FS.setVisible(needs_separate_ocr_fs)
 
-            self.lblTrModelFS.setVisible(needs_local_tr_fs)
-            self.cbModelTR_FS.setVisible(needs_local_tr_fs)
+            single_fs = needs_local_tr_fs and hasattr(self, "cbSingle") and self.cbSingle.isChecked()
+            self.lblTrModelFS.setVisible(needs_local_tr_fs and not single_fs)
+            self.cbModelTR_FS.setVisible(needs_local_tr_fs and not single_fs)
     
     def _load_prefs_into_ui(self):
         p = _load_prefs()
@@ -4295,9 +5199,11 @@ class ConfigWindow(QWidget):
             self.cbMode.setCurrentIndex(int(saved_mode))
             if hasattr(self, "cbModeFS"): self.cbModeFS.setCurrentIndex(int(saved_mode))
         else:
-            # Если параметра нет, конвертируем старый флаг dual
-            self.cbMode.setCurrentIndex(1 if old_dual else 0)
-            if hasattr(self, "cbModeFS"): self.cbModeFS.setCurrentIndex(1 if old_dual else 0)
+            # Параметра нет. Старый конфиг с флагом dual — конвертируем его;
+            # настроек нет вовсе (первый запуск) — DUAL, это основной режим.
+            _mode = (1 if old_dual else 0) if "dual_enabled" in p else 1
+            self.cbMode.setCurrentIndex(_mode)
+            if hasattr(self, "cbModeFS"): self.cbModeFS.setCurrentIndex(_mode)
         # шрифт
         fam = p.get("font_family")
         if fam:
@@ -4327,12 +5233,6 @@ class ConfigWindow(QWidget):
         self.spMaxTok.setValue(int(p.get("max_tokens", 1024)))
         self.spTO.setValue(float(p.get("timeout_s", 30.0)))
         self.spTemp.setValue(float(p.get("temp", 0.2)))
-        self.spTopP.setValue(float(p.get("top_p", 0.9)))
-        self.spTopK.setValue(int(p.get("top_k", 0)))
-        self.spRP.setValue(float(p.get("repeat_penalty", 1.0)))
-        self.spSeed.setValue(int(p.get("seed", 0)))
-        self.spSlot.setValue(int(p.get("slot_id", 0)))
-        self.cbCache.setChecked(bool(p.get("use_prompt_cache", True)))
 
         # Где крутить EasyOCR (страж кадров). "auto" | true | false
         global EASYOCR_GPU
@@ -4348,12 +5248,12 @@ class ConfigWindow(QWidget):
                 _ed.setKeySequence(QKeySequence.fromString(HOTKEYS[_k],
                                                            QKeySequence.PortableText))
 
-        self.spCtx.setValue(int(p.get("ctx", 4096)))
-        self.spBatch.setValue(int(p.get("batch", 256)))
-        self.spUBatch.setValue(int(p.get("ubatch", 64)))
-        self.spPar.setValue(int(p.get("parallel", 1)))
+        self.spCtx.setValue(int(p.get("ctx", DEF_CTX_SOLO)))
+        self.spBatch.setValue(int(p.get("batch", BASE_BATCH)))
+        self.spUBatch.setValue(int(p.get("ubatch", BASE_UBATCH)))
         self.spNGL.setValue(int(p.get("ngl", 999)))
         self.cbFlashAttn.setChecked(bool(p.get("use_flash_attn", False)))
+        self.cbDraft.setChecked(bool(p.get("use_draft", True)))
         dev = p.get("gpu_device", "")
         if dev:
             i = self.cbDevice.findData(dev)
@@ -4381,15 +5281,12 @@ class ConfigWindow(QWidget):
         self.edHost1.setText(p.get("dual_ocr_host","127.0.0.1"))
         try: self.spPort1.setValue(int(p.get("dual_ocr_port",8080)))
         except: pass
-        try: self.spMaxTok1.setValue(int(p.get("dual_ocr_max_tokens", 512)))
+        try: self.spMaxTok1.setValue(int(p.get("dual_ocr_max_tokens", DEF_OCR_MAX_TOKENS)))
         except: pass
-        self.spCtx1.setValue(int(p.get("dual_ocr_ctx",4096)))
-        self.spBatch1.setValue(int(p.get("dual_ocr_batch",256)))
-        self.spUB1.setValue(int(p.get("dual_ocr_ubatch",64)))
-        self.spPar1.setValue(int(p.get("dual_ocr_parallel",1)))
+        self.spCtx1.setValue(int(p.get("dual_ocr_ctx", DEF_CTX_OCR)))
+        self.spBatch1.setValue(int(p.get("dual_ocr_batch", BASE_BATCH)))
+        self.spUB1.setValue(int(p.get("dual_ocr_ubatch", BASE_UBATCH)))
         self.spNGL1.setValue(int(p.get("dual_ocr_ngl",999)))
-        self.spSeed1.setValue(int(p.get("dual_ocr_seed",0)))
-        self.spSlot1.setValue(int(p.get("dual_ocr_slot",0)))
         self._ocr_prompt_override = p.get("dual_ocr_system_override","")
         # TR
         if (m := p.get("dual_tr_model","")):
@@ -4398,27 +5295,29 @@ class ConfigWindow(QWidget):
         self.edHost2.setText(p.get("dual_tr_host","127.0.0.1"))
         try: self.spPort2.setValue(int(p.get("dual_tr_port",8081)))  
         except: pass
-        try: self.spMaxTok2.setValue(int(p.get("dual_tr_max_tokens", 1024)))
-        except: pass
-        self.spCtx2.setValue(int(p.get("dual_tr_ctx",4096)))
-        self.spBatch2.setValue(int(p.get("dual_tr_batch",256)))
-        self.spUB2.setValue(int(p.get("dual_tr_ubatch",64)))
-        self.spPar2.setValue(int(p.get("dual_tr_parallel",1)))
+        self.spCtx2.setValue(int(p.get("dual_tr_ctx", DEF_CTX_TR)))
+        self.spBatch2.setValue(int(p.get("dual_tr_batch", BASE_BATCH)))
+        self.spUB2.setValue(int(p.get("dual_tr_ubatch", BASE_UBATCH)))
         self.spNGL2.setValue(int(p.get("dual_tr_ngl",999)))
-        self.spSeed2.setValue(int(p.get("dual_tr_seed",0)))
-        self.spSlot2.setValue(int(p.get("dual_tr_slot",1)))
         self.spTO2.setValue(float(p.get("dual_tr_timeout_s", p.get("timeout_s", 30.0))))
+        self.spTO1.setValue(float(p.get("dual_ocr_timeout_s", p.get("timeout_s", 30.0))))
+        self.cbAdvanced.setChecked(bool(p.get("advanced_settings", False)))
+        # «Одна модель»: в старых настройках такой галочки не было — считаем её включённой,
+        # если оба сервера смотрели в один адрес. У новых пользователей включена.
+        if "dual_single_model" in p:
+            _single = bool(p["dual_single_model"])
+        elif "dual_tr_port" in p:
+            _single = ((p.get("dual_ocr_host", "127.0.0.1"), int(p.get("dual_ocr_port", 8080))) ==
+                       (p.get("dual_tr_host", "127.0.0.1"), int(p.get("dual_tr_port", 8081))))
+        else:
+            _single = True
+        self.cbSingle.setChecked(_single)
         self.spTemp2.setValue(float(p.get("dual_tr_temp",      p.get("temp", 0.2))))
-        self.spTopP2.setValue(float(p.get("dual_tr_top_p",     p.get("top_p", 0.9))))
-        self.spTopK2.setValue(int(p.get("dual_tr_top_k",       p.get("top_k", 0))))
-        self.spRP2.setValue(float(p.get("dual_tr_repeat_penalty", p.get("repeat_penalty", 1.0))))
         self._tr_prompt_override = p.get("dual_tr_system_override","")
         # константы
-        self.spFps.setValue(float(p.get("fps", 1.0)))
-        self.spCanonHits.setValue(int(p.get("en_canon_hits", 2)))
+        self.spFps.setValue(float(p.get("fps", MAX_OCR_FPS)))
         self.cbSmartNameRemoval.setChecked(bool(p.get("smart_name_removal", True)))
-        self.cbSmooth.setChecked(p.get("render_mode", "smooth") == "smooth")
-        self.cbOverlayBoxes.setChecked(bool(p.get("draw_over_original", False)))
+        self.cbOverlayBoxes.setChecked(bool(p.get("draw_over_original", True)))
         
         hide_c = bool(p.get("hide_console", False))
         self.cbHideConsole.setChecked(hide_c)
@@ -4433,7 +5332,6 @@ class ConfigWindow(QWidget):
                 print("[UI] set_memory_enabled load error:", e)
         self.spHandle.setValue(int(p.get("handle", 15)))
         self.spBorder.setValue(int(p.get("border_w", BORDER_WIDTH)))
-        self.spSplit.setValue(int(p.get("split_border_w", SPLIT_BORDER_WIDTH)))
         
         bg_mode = p.get("bg_mode", PANEL_BG_MODE)
         idx = self.cbBgMode.findData(bg_mode)
@@ -4565,13 +5463,13 @@ class ConfigWindow(QWidget):
             "max_tokens": int(self.spMaxTok.value()),
             "timeout_s": float(self.spTO.value()),
             "temp": float(self.spTemp.value()),
-            "top_p": float(self.spTopP.value()),
             "fps": float(self.spFps.value()),
-            "en_canon_hits": int(self.spCanonHits.value()),
             "smart_name_removal": bool(self.cbSmartNameRemoval.isChecked()),
             "border_w": int(self.spBorder.value()),
-            "split_border_w": int(self.spSplit.value()),
-            "render_mode": "smooth" if self.cbSmooth.isChecked() else "instant",
+            "render_mode": "instant",
+            "advanced_settings": bool(self.cbAdvanced.isChecked()),
+            "dual_single_model": bool(self.cbSingle.isChecked()),
+            "dual_ocr_timeout_s": float(self.spTO1.value()),
             "draw_over_original": bool(self.cbOverlayBoxes.isChecked()),
             "hide_console": bool(self.cbHideConsole.isChecked()),
             "memory_enabled": bool(self.cbMemory.isChecked()),
@@ -4582,18 +5480,13 @@ class ConfigWindow(QWidget):
             "box_bg_alpha": int(round(max(1, min(10, self.spBoxBgAlpha.value())) / 10.0 * 255)),
             "window_title": self.cbWindow.currentText().strip(),
             "system_override": llm_cfg.system_override or "",
-            "top_k": int(self.spTopK.value()),
-            "repeat_penalty": float(self.spRP.value()),
-            "seed": int(self.spSeed.value()),
-            "slot_id": int(self.spSlot.value()),
-            "use_prompt_cache": bool(self.cbCache.isChecked()),
             "easyocr_gpu": EASYOCR_GPU,
             "ctx": int(self.spCtx.value()),
             "batch": int(self.spBatch.value()),
             "ubatch": int(self.spUBatch.value()),
-            "parallel": int(self.spPar.value()),
             "ngl": int(self.spNGL.value()),
             "use_flash_attn": self.cbFlashAttn.isChecked(),
+            "use_draft": self.cbDraft.isChecked(),
             "cache_type_k": self.cbCacheType.currentData(),
             "gpu_device": self.cbDevice.currentData() or "",
             "hotkeys": hk_now,
@@ -4612,28 +5505,18 @@ class ConfigWindow(QWidget):
         prefs["dual_ocr_ctx"]    = int(self.spCtx1.value())
         prefs["dual_ocr_batch"]  = int(self.spBatch1.value())
         prefs["dual_ocr_ubatch"] = int(self.spUB1.value())
-        prefs["dual_ocr_parallel"]=int(self.spPar1.value())
         prefs["dual_ocr_ngl"]    = int(self.spNGL1.value())
-        prefs["dual_ocr_seed"]   = int(self.spSeed1.value())
-        prefs["dual_ocr_slot"]   = int(self.spSlot1.value())
         prefs["dual_ocr_system_override"] = getattr(self, "_ocr_prompt_override", "")
 
         prefs["dual_tr_model"]  = self.cbModelTR.currentText().strip()
         prefs["dual_tr_host"]   = self.edHost2.text().strip()
         prefs["dual_tr_port"]   = int(self.spPort2.value())
-        prefs["dual_tr_max_tokens"]  = int(self.spMaxTok2.value())
         prefs["dual_tr_ctx"]    = int(self.spCtx2.value())
         prefs["dual_tr_batch"]  = int(self.spBatch2.value())
         prefs["dual_tr_ubatch"] = int(self.spUB2.value())
-        prefs["dual_tr_parallel"]=int(self.spPar2.value())
         prefs["dual_tr_ngl"]    = int(self.spNGL2.value())
-        prefs["dual_tr_seed"]   = int(self.spSeed2.value())
-        prefs["dual_tr_slot"]   = int(self.spSlot2.value())
         prefs["dual_tr_timeout_s"]       = float(self.spTO2.value())
         prefs["dual_tr_temp"]            = float(self.spTemp2.value())
-        prefs["dual_tr_top_p"]           = float(self.spTopP2.value())
-        prefs["dual_tr_top_k"]           = int(self.spTopK2.value())
-        prefs["dual_tr_repeat_penalty"]  = float(self.spRP2.value())
         prefs["dual_tr_system_override"] = getattr(self, "_tr_prompt_override", "")
 
         # регионы
@@ -4678,20 +5561,29 @@ class ConfigWindow(QWidget):
             QMessageBox.warning(self,"Список окон",f"Ошибка: {e}")
 
     def _rescan_models(self):
-        self.cbModel.clear(); self.cbMmproj.clear()
+        """Перечитывает папки моделей во все выпадающие списки. Вызывается и на старте,
+        и после каждой загрузки, поэтому списки чистятся целиком, а выбор сохраняется."""
         roots = [BASE_DIR/"models"/"lmm", BASE_DIR/"models"/"llm"]
         models, projs = scan_gguf(roots)
-        for p in models:
-            self.cbModel.addItem(p); self.cbModelOCR.addItem(p); self.cbModelTR.addItem(p)
-            if hasattr(self, "cbModelFS"):
-                self.cbModelFS.addItem(p); self.cbModelOCR_FS.addItem(p); self.cbModelTR_FS.addItem(p)
-        for p in projs:
-            self.cbMmproj.addItem(p);  self.cbMmprojOCR.addItem(p)
-            if hasattr(self, "cbMmprojFS"):
-                self.cbMmprojFS.addItem(p); self.cbMmprojOCR_FS.addItem(p)
+
+        def refill(name, items):
+            cb = getattr(self, name, None)    # FS-списков на старте ещё может не быть
+            if cb is None:
+                return
+            keep = cb.currentText()
+            cb.clear()
+            cb.addItems(items)
+            i = cb.findText(keep)
+            if i >= 0:
+                cb.setCurrentIndex(i)
+
+        for name in ("cbModel", "cbModelOCR", "cbModelTR", "cbModelFS", "cbModelOCR_FS", "cbModelTR_FS"):
+            refill(name, models)
+        for name in ("cbMmproj", "cbMmprojOCR", "cbMmprojFS", "cbMmprojOCR_FS"):
+            refill(name, projs)
 
     def _browse_lore(self):
-        path,_ = QFileDialog.getOpenFileName(self,"Выберите файл лора", str(BASE_DIR), "Text (*.txt);;All (*.*)")
+        path,_ = QFileDialog.getOpenFileName(self,"Выберите файл имён и терминов", str(BASE_DIR), "Text (*.txt);;All (*.*)")
         if path:
             try:
                 p = Path(path)
@@ -4701,7 +5593,7 @@ class ConfigWindow(QWidget):
                 self.edLore.setText(path)
         
     def _browse_phrasebook(self):
-        path,_ = QFileDialog.getOpenFileName(self, "Выберите phrasebook", str(BASE_DIR), "Text (*.txt);;All (*.*)")
+        path,_ = QFileDialog.getOpenFileName(self, "Выберите файл описания игры и правил перевода", str(BASE_DIR), "Text (*.txt);;All (*.*)")
         if path:
             try:
                 p = Path(path)
@@ -4808,7 +5700,134 @@ class ConfigWindow(QWidget):
         btn=QPushButton("Закрыть"); lay.addWidget(btn); btn.clicked.connect(dlg.close)
         dlg.exec()
     
+    # ---------- значок возле часов ----------
+    def _init_tray(self):
+        """Значок программы в трее: пока идёт перевод, окна настроек на экране нет, и без
+        значка вернуться можно было только клавишей Pause (на многих ноутбуках её нет),
+        а закрыть программу — только диспетчером задач."""
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("[UI] системный трей недоступен — значка программы не будет")
+            return
+        icon = QIcon(str(BASE_DIR / "icons" / "app.ico"))
+        self.setWindowIcon(icon)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip(f"GameTranslator {APP_VERSION}")
+        menu = QMenu()
+        menu.addAction("Настройки (остановить перевод)", self._tray_to_settings)
+        menu.addSeparator()
+        menu.addAction("Выход", self._quit_app)
+        self._tray_menu = menu      # держим ссылку, иначе меню удалится
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_click)
+        self.tray.show()
+
+    def _on_tray_click(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._tray_to_settings()
+
+    def _tray_to_settings(self):
+        """То же, что клавиша возврата в настройки: остановить перевод и показать окно."""
+        fs = getattr(self, "fs_overlay", None)
+        if fs is not None and fs.isVisible():
+            fs.quit_app()
+        elif not self.isVisible():
+            self.overlay.quit_to_config()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def _quit_app(self):
+        self._shutdown()
+        QApplication.quit()
+
+    def _shutdown(self):
+        """Останавливает захват и серверы моделей. Вызывается и крестиком окна, и «Выходом» из трея."""
+        try:
+            _save_prefs(self._collect_prefs())
+        except Exception as ex:
+            print("[UI] save on close error:", ex)
+
+        # аккуратно останавливаем захват и сервера при выходе из программы
+        try:
+            if getattr(self, "overlay", None) is not None:
+                self.overlay.stop_worker()
+        except Exception as ex:
+            print("[UI] overlay.stop_worker on close error:", ex)
+
+        try:
+            if getattr(self, "fs_overlay", None) is not None:
+                self.fs_overlay.stop_worker()
+                self.fs_overlay.close()
+        except Exception as ex:
+            print("[UI] fs_overlay close error:", ex)
+
+        try:
+            stop_all_llama_servers()
+        except Exception as ex:
+            print("[UI] stop_all_llama_servers on close error:", ex)
+
+        if getattr(self, "tray", None) is not None:
+            self.tray.hide()
+
+    # ---------- запуск серверов из окна настроек ----------
+    def _abort_start(self):
+        """Запуск не удался: гасим то, что успело подняться, и остаёмся в настройках."""
+        self._fs_parallel = 0
+        stop_all_llama_servers()
+
+    def _server_ready(self, cmd, url, field: str, mmproj=None, second: bool = False) -> bool:
+        """Поднимает сервер модели и отвечает, можно ли запускать перевод. При любой неудаче
+        человек получает окно с объяснением и остаётся в настройках. Раньше окно настроек
+        пряталось в любом случае, и без модели программа выглядела закрывшейся: на экране
+        ничего, захват грузит процессор, перевода нет.
+        field — подпись поля модели в окне; mmproj — выбранные «глаза» (None = модели они не нужны)."""
+        if _model_arg(cmd) and mmproj is not None and not mmproj and not _ping_llama(url):
+            QMessageBox.warning(
+                self, "Не выбраны «глаза» модели",
+                f"Для модели в поле «{field}» не выбран файл mmproj («глаза»), без него она не "
+                "видит картинку и не сможет прочитать текст с экрана.\n\n"
+                "Откройте вкладку «Скачать модели» и нажмите «Скачать глаза» в строке этой модели.")
+            self._abort_start()
+            self._switch_page(2)
+            return False
+
+        status = (_ensure_llama_server2 if second else _ensure_llama_server)(cmd, url)
+        if status == "ok":
+            return True
+        self._abort_start()
+        if status == "no_model":
+            no_files = self.cbModel.count() == 0
+            QMessageBox.warning(
+                self, "Модель не выбрана",
+                f"Не выбрана модель в поле «{field}», поэтому переводить нечем.\n\n"
+                + ("В папке программы пока нет ни одной модели. Скачайте её на вкладке "
+                   "«Скачать модели» — она откроется после этого окна."
+                   if no_files else
+                   "Выберите модель в блоке «Модели» и нажмите «Начать перевод» ещё раз.")
+                + f"\n\nЕсли модель работает на другом компьютере: сервер по адресу {url} "
+                  "не отвечает — проверьте, что он запущен и адрес указан верно.")
+            if no_files:
+                self._switch_page(2)
+        return False
+
+    def _announce_start(self, fullscreen: bool):
+        """Подсказка после запуска: программа работает, вот как вернуться."""
+        key = "Pause" if fullscreen else (HOTKEYS.get("quit_to_config") or "Pause")
+        text = (f"Перевод запущен.  Вернуться в настройки — клавиша {key}\n"
+                "или значок программы возле часов.")
+        if not fullscreen:
+            edit = HOTKEYS.get("toggle_edit") or "Alt+="
+            text += f"\nПередвинуть область перевода — {edit}."
+            self.overlay.hint_until = time.time() + START_HINT_SEC
+            self.overlay.update()
+            QTimer.singleShot(int(START_HINT_SEC * 1000) + 100, self.overlay.update)
+        self._start_hint = StartHint(text)
+        self._start_hint.show()
+
     def _start(self):
+        self._fs_parallel = 0     # слоты «как для полноэкранного» действуют только на его запуск
         # применяем настройки
         global MAX_OCR_FPS, RENDER_MODE, HANDLE, SERVER_EXE, DRAW_OVER_ORIGINAL, PANEL_BG_MODE, PANEL_BG_ALPHA
         
@@ -4816,13 +5835,13 @@ class ConfigWindow(QWidget):
 
         llm_cfg.max_tokens = int(self.spMaxTok.value())
         llm_cfg.timeout_s  = float(self.spTO.value())
-        llm_cfg.temp       = float(self.spTemp.value())
-        llm_cfg.top_p      = float(self.spTopP.value())
-        llm_cfg.top_k          = int(self.spTopK.value())
-        llm_cfg.repeat_penalty = float(self.spRP.value())
-        llm_cfg.seed           = int(self.spSeed.value())
-        llm_cfg.slot_id        = int(self.spSlot.value())
-        llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        llm_cfg.temp       = self._adv(self.spTemp, BASE_TEMP)
+        llm_cfg.top_p      = GEN_TOP_P
+        llm_cfg.top_k          = GEN_TOP_K
+        llm_cfg.repeat_penalty = GEN_REPEAT_PENALTY
+        llm_cfg.seed           = GEN_SEED
+        llm_cfg.slot_id        = 0
+        llm_cfg.use_prompt_cache = True
         llm_cfg.n_ctx          = int(self.spCtx.value())
         llm_cfg.source_lang    = self.cbSourceLang.currentData()
         self.overlay.source_lang = self.cbSourceLang.currentData()
@@ -4831,7 +5850,7 @@ class ConfigWindow(QWidget):
         mode_idx = self.cbMode.currentIndex()
 
         MAX_OCR_FPS    = float(self.spFps.value())
-        RENDER_MODE    = "smooth" if self.cbSmooth.isChecked() else "instant"
+        RENDER_MODE    = "instant"
         HANDLE         = int(self.spHandle.value())
         DRAW_OVER_ORIGINAL = bool(self.cbOverlayBoxes.isChecked())
         
@@ -4849,8 +5868,8 @@ class ConfigWindow(QWidget):
         self._apply_box_bg_settings()
         
         self.overlay.border_w = int(self.spBorder.value())
-        self.overlay.split_border_w = int(self.spSplit.value())
-        self.overlay.en_canon_hits = int(self.spCanonHits.value())
+        self.overlay.split_border_w = int(self.spBorder.value())
+        self.overlay.en_canon_hits = EN_CANON_HITS
         self.overlay.smart_name_removal = bool(self.cbSmartNameRemoval.isChecked())
         self.overlay.draw_over_original = bool(self.cbOverlayBoxes.isChecked())
 
@@ -4883,6 +5902,8 @@ class ConfigWindow(QWidget):
         sel_dev = self.cbDevice.currentData() or ""
         
         use_fa = getattr(self, "cbFlashAttn", None) and self.cbFlashAttn.isChecked()
+        global USE_DRAFT
+        USE_DRAFT = self.cbDraft.isChecked()
         
         model_path  = self.cbModel.currentText().strip()
         mmproj_path = self.cbMmproj.currentText().strip()
@@ -4890,9 +5911,9 @@ class ConfigWindow(QWidget):
             SERVER_EXE, model_path, mmproj_path,
             host=host, port=port,
             ctx=int(self.spCtx.value()),
-            batch=int(self.spBatch.value()),
-            ubatch=int(self.spUBatch.value()),
-            parallel=int(self.spPar.value()),
+            batch=self._adv(self.spBatch, BASE_BATCH),
+            ubatch=self._adv(self.spUBatch, BASE_UBATCH),
+            parallel=1,
             ngl=int(self.spNGL.value()),
             use_fa=use_fa,
             cache_type=sel_cache, device=sel_dev
@@ -4915,9 +5936,9 @@ class ConfigWindow(QWidget):
                 SERVER_EXE, model_path, mmproj_path,
                 host=host, port=port,
                 ctx=int(self.spCtx.value()),
-                batch=int(self.spBatch.value()),
-                ubatch=int(self.spUBatch.value()),
-                parallel=int(self.spPar.value()),
+                batch=self._adv(self.spBatch, BASE_BATCH),
+                ubatch=self._adv(self.spUBatch, BASE_UBATCH),
+                parallel=1,
                 ngl=int(self.spNGL.value()),
                 use_fa=use_fa,
                 cache_type=sel_cache, device=sel_dev
@@ -4927,12 +5948,13 @@ class ConfigWindow(QWidget):
             print("[LLM] mmproj:", mmproj_path)
 
             llm_cfg.server = f"http://{host}:{port}"
-            _ensure_llama_server(cmd, llm_cfg.server)
+            if not self._server_ready(cmd, llm_cfg.server, "SOLO .gguf", mmproj=mmproj_path):
+                return
 
             # прогрев single
             try:
                 if llm_cfg.enabled and llm_cfg.use_prompt_cache:
-                    preload_prompt_cache(llm_cfg)
+                    _run_waiting(lambda: preload_prompt_cache(llm_cfg), "Прогреваю модель…")
             except Exception as e:
                 print("[LLM] warmup error:", e)
             
@@ -4948,14 +5970,17 @@ class ConfigWindow(QWidget):
             ocr_model   = self.cbModelOCR.currentText().strip()
             ocr_mmproj  = self.cbMmprojOCR.currentText().strip()
             tr_model    = self.cbModelTR.currentText().strip()
+            single = self._single_model()
+            if single:
+                host2, port2, tr_model = host1, port1, ocr_model
 
             cmd1 = rebuild_server_cmd(
                 SERVER_EXE, ocr_model, ocr_mmproj,
                 host=host1, port=port1,
                 ctx=int(self.spCtx1.value()),
-                batch=int(self.spBatch1.value()),
-                ubatch=int(self.spUB1.value()),
-                parallel=int(self.spPar1.value()),
+                batch=self._adv(self.spBatch1, BASE_BATCH),
+                ubatch=self._adv(self.spUB1, BASE_UBATCH),
+                parallel=self._ocr_parallel(),
                 ngl=int(self.spNGL1.value()),
                 use_fa=use_fa,
                 cache_type=sel_cache, device=sel_dev
@@ -4964,9 +5989,9 @@ class ConfigWindow(QWidget):
                 SERVER_EXE, tr_model, "",          # <- переводчик БЕЗ mmproj
                 host=host2, port=port2,
                 ctx=int(self.spCtx2.value()),
-                batch=int(self.spBatch2.value()),
-                ubatch=int(self.spUB2.value()),
-                parallel=int(self.spPar2.value()),
+                batch=self._adv(self.spBatch2, BASE_BATCH),
+                ubatch=self._adv(self.spUB2, BASE_UBATCH),
+                parallel=1,
                 ngl=int(self.spNGL2.value()),
                 use_fa=use_fa,
                 cache_type=sel_cache, device=sel_dev
@@ -4975,15 +6000,17 @@ class ConfigWindow(QWidget):
             print("[LLM] spawn OCR:", cmd1)
             print("[LLM] spawn TR :", cmd2)
 
-            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
-            _ensure_llama_server2(cmd2, f"http://{host2}:{port2}")
+            if not self._server_ready(cmd1, f"http://{host1}:{port1}", "DUAL OCR .gguf", mmproj=ocr_mmproj):
+                return
+            if not single and not self._server_ready(cmd2, f"http://{host2}:{port2}", "DUAL TR .gguf", second=True):
+                return
             
             self.overlay.ocr_cfg_dual = LLMConfigDual(
                 server=f"http://{host1}:{port1}",
                 model=ocr_model,
-                timeout_s=float(self.spTO.value()),
+                timeout_s=float(self.spTO1.value()),
                 max_tokens=int(self.spMaxTok1.value()),
-                slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
+                slot_id=0, seed=GEN_SEED,
                 system_override=(getattr(self,"_ocr_prompt_override","") or None),
                 source_lang=self.overlay.source_lang,
                 mode=llm_cfg.mode,
@@ -4992,16 +6019,16 @@ class ConfigWindow(QWidget):
                 server=f"http://{host2}:{port2}",
                 model=tr_model,
                 timeout_s=float(self.spTO2.value()),
-                max_tokens=int(self.spMaxTok2.value()),
-                slot_id=int(self.spSlot2.value()), seed=int(self.spSeed2.value()),
-                temp=float(self.spTemp2.value()), top_p=float(self.spTopP2.value()),
-                top_k=int(self.spTopK2.value()), repeat_penalty=float(self.spRP2.value()),
+                max_tokens=int(self.spMaxTok1.value()) * TR_MAX_TOKENS_FACTOR,
+                slot_id=0, seed=GEN_SEED,
+                temp=self._adv(self.spTemp2, BASE_TEMP), top_p=GEN_TOP_P,
+                top_k=GEN_TOP_K, repeat_penalty=GEN_REPEAT_PENALTY,
                 system_override=(getattr(self,"_tr_prompt_override","") or None),
                 lore_path=llm_cfg.lore_path,
                 phrasebook_path=llm_cfg.phrasebook_path,
                 source_lang=self.overlay.source_lang,
-                use_prompt_cache=bool(self.cbCache.isChecked()),
-                n_ctx=int(self.spCtx2.value()),
+                use_prompt_cache=True,
+                n_ctx=self._tr_ctx(),
                 mode=llm_cfg.mode,
             )
             
@@ -5028,22 +6055,23 @@ class ConfigWindow(QWidget):
                 SERVER_EXE, ocr_model, ocr_mmproj,
                 host=host1, port=port1,
                 ctx=int(self.spCtx1.value()),
-                batch=int(self.spBatch1.value()),
-                ubatch=int(self.spUB1.value()),
-                parallel=int(self.spPar1.value()),
+                batch=self._adv(self.spBatch1, BASE_BATCH),
+                ubatch=self._adv(self.spUB1, BASE_UBATCH),
+                parallel=self._ocr_parallel(),
                 ngl=int(self.spNGL1.value()),
                 cache_type=sel_cache, device=sel_dev
             )
             print("[LLM] spawn OCR (Online mode):", cmd1)
-            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
+            if not self._server_ready(cmd1, f"http://{host1}:{port1}", "DUAL OCR .gguf", mmproj=ocr_mmproj):
+                return
             
             # Настраиваем OCR конфиг (используем тот же класс из dual)
             self.overlay.ocr_cfg_dual = LLMConfigDual(
                 server=f"http://{host1}:{port1}",
                 model=ocr_model,
-                timeout_s=float(self.spTO.value()),
+                timeout_s=float(self.spTO1.value()),
                 max_tokens=int(self.spMaxTok1.value()),
-                slot_id=int(self.spSlot1.value()), seed=int(self.spSeed1.value()),
+                slot_id=0, seed=GEN_SEED,
                 system_override=(getattr(self,"_ocr_prompt_override","") or None),
                 mode=llm_cfg.mode,
             )
@@ -5063,7 +6091,7 @@ class ConfigWindow(QWidget):
                 print("[UI] Failed to preload LORE for Online splitter:", e)
 
             # Прогрев только OCR
-            try: preload_prompt_cache_ocr(self.overlay.ocr_cfg_dual)
+            try: _run_waiting(lambda: preload_prompt_cache_ocr(self.overlay.ocr_cfg_dual), "Прогреваю модель…")
             except Exception as e: print("[ONLINE] OCR warmup error:", e)
             
         
@@ -5080,34 +6108,13 @@ class ConfigWindow(QWidget):
         self.overlay.update()
         try:
             _save_prefs(self._collect_prefs())
-            self.hide()
         except Exception as e:
             print("[UI] save on start error:", e)
+        self.hide()
+        self._announce_start(fullscreen=False)
             
     def closeEvent(self, e):
-        try:
-            _save_prefs(self._collect_prefs())
-        except Exception as ex:
-            print("[UI] save on close error:", ex)
-
-        # аккуратно останавливаем захват и сервера при выходе из программы
-        try:
-            if getattr(self, "overlay", None) is not None:
-                self.overlay.stop_worker()
-        except Exception as ex:
-            print("[UI] overlay.stop_worker on close error:", ex)
-
-        try:
-            if getattr(self, "fs_overlay", None) is not None:
-                self.fs_overlay.stop_worker()
-                self.fs_overlay.close()
-        except Exception: pass
-
-        try:
-            stop_all_llama_servers()
-        except Exception as ex:
-            print("[UI] stop_all_llama_servers on close error:", ex)
-
+        self._shutdown()
         super().closeEvent(e)
 
 
@@ -5138,13 +6145,13 @@ class ConfigWindow(QWidget):
 
         llm_cfg.max_tokens = int(self.spMaxTok.value())
         llm_cfg.timeout_s  = float(self.spTO.value())
-        llm_cfg.temp       = float(self.spTemp.value())
-        llm_cfg.top_p      = float(self.spTopP.value())
-        llm_cfg.top_k          = int(self.spTopK.value())
-        llm_cfg.repeat_penalty = float(self.spRP.value())
-        llm_cfg.seed           = int(self.spSeed.value())
-        llm_cfg.slot_id        = int(self.spSlot.value())
-        llm_cfg.use_prompt_cache = bool(self.cbCache.isChecked())
+        llm_cfg.temp       = self._adv(self.spTemp, BASE_TEMP)
+        llm_cfg.top_p      = GEN_TOP_P
+        llm_cfg.top_k          = GEN_TOP_K
+        llm_cfg.repeat_penalty = GEN_REPEAT_PENALTY
+        llm_cfg.seed           = GEN_SEED
+        llm_cfg.slot_id        = 0
+        llm_cfg.use_prompt_cache = True
         llm_cfg.n_ctx          = int(self.spCtx.value())
         llm_cfg.source_lang    = self.cbSourceLang.currentData()
         llm_cfg.mode = "wiki" if self.cbTextType.currentIndex() == 1 else "game"
@@ -5176,6 +6183,9 @@ class ConfigWindow(QWidget):
         llm_cfg.server = f"http://{host}:{port}"
 
         # 2. Запуск серверов (копируем логику _start)
+        # В DUAL/ONLINE сервер распознавания поднимаем с четырьмя слотами: блоки экрана
+        # переводятся отдельными короткими запросами, и они идут параллельно.
+        self._fs_parallel = FS_PARALLEL if mode_idx in (1, 2) else 0
         if SERVER_EXE is None:
             QMessageBox.critical(self, "Error", "llama-server.exe not found")
             return
@@ -5183,6 +6193,8 @@ class ConfigWindow(QWidget):
         sel_cache = self.cbCacheType.currentData() or "q8_0"
         sel_dev = self.cbDevice.currentData() or ""
         use_fa = getattr(self, "cbFlashAttn", None) and self.cbFlashAttn.isChecked()
+        global USE_DRAFT
+        USE_DRAFT = self.cbDraft.isChecked()
         
         _stop_llama_server()
         _stop_llama_server2()
@@ -5196,6 +6208,10 @@ class ConfigWindow(QWidget):
         self.fs_overlay.source_lang = self.cbSourceLang.currentData()
         self.fs_overlay.work_mode_idx = mode_idx
         self.fs_overlay.capture_fps = float(self.spFps.value()) # Передаем FPS
+        # тот же EasyOCR, что в обычном режиме: на видеокарте, без второй копии в памяти
+        self.fs_overlay.ocr_reader_factory = get_easyocr_reader
+        # столько запросов сервер держит одновременно: два слота у одной модели в DUAL, иначе один
+        self.fs_overlay.parallel = FS_PARALLEL if mode_idx in (1, 2) else 1
         if hwnd: self.fs_overlay.bound_hwnd = hwnd
 
         # Визуал
@@ -5216,37 +6232,43 @@ class ConfigWindow(QWidget):
             model_path  = self.cbModel.currentText().strip()
             mmproj_path = self.cbMmproj.currentText().strip()
             cmd = rebuild_server_cmd(SERVER_EXE, model_path, mmproj_path, host=host, port=port,
-                ctx=int(self.spCtx.value()), batch=int(self.spBatch.value()), ubatch=int(self.spUBatch.value()),
-                parallel=int(self.spPar.value()), ngl=int(self.spNGL.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
-            _ensure_llama_server(cmd, llm_cfg.server)
-            try: preload_prompt_cache(llm_cfg)
-            except: pass
+                ctx=int(self.spCtx.value()), batch=self._adv(self.spBatch, BASE_BATCH), ubatch=self._adv(self.spUBatch, BASE_UBATCH),
+                parallel=1, ngl=int(self.spNGL.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
+            if not self._server_ready(cmd, llm_cfg.server, "SOLO .gguf", mmproj=mmproj_path):
+                return
+            try: _run_waiting(lambda: preload_prompt_cache(llm_cfg), "Прогреваю модель…")
+            except Exception as e: print("[LLM] warmup error:", e)
             
         elif mode_idx == 1: # DUAL
             host1, port1 = (self.edHost1.text() or "127.0.0.1").strip(), int(self.spPort1.value())
             host2, port2 = (self.edHost2.text() or "127.0.0.1").strip(), int(self.spPort2.value())
             ocr_model, ocr_mmproj = self.cbModelOCR.currentText().strip(), self.cbMmprojOCR.currentText().strip()
             tr_model = self.cbModelTR.currentText().strip()
+            single = self._single_model()
+            if single:
+                host2, port2, tr_model = host1, port1, ocr_model
 
             cmd1 = rebuild_server_cmd(SERVER_EXE, ocr_model, ocr_mmproj, host=host1, port=port1,
-                ctx=int(self.spCtx1.value()), batch=int(self.spBatch1.value()), ubatch=int(self.spUB1.value()),
-                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
+                ctx=int(self.spCtx1.value()), batch=self._adv(self.spBatch1, BASE_BATCH), ubatch=self._adv(self.spUB1, BASE_UBATCH),
+                parallel=self._ocr_parallel(), ngl=int(self.spNGL1.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
             cmd2 = rebuild_server_cmd(SERVER_EXE, tr_model, "", host=host2, port=port2,
-                ctx=int(self.spCtx2.value()), batch=int(self.spBatch2.value()), ubatch=int(self.spUB2.value()),
-                parallel=int(self.spPar2.value()), ngl=int(self.spNGL2.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
+                ctx=int(self.spCtx2.value()), batch=self._adv(self.spBatch2, BASE_BATCH), ubatch=self._adv(self.spUB2, BASE_UBATCH),
+                parallel=1, ngl=int(self.spNGL2.value()), use_fa=use_fa, cache_type=sel_cache, device=sel_dev)
             
-            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
-            _ensure_llama_server2(cmd2, f"http://{host2}:{port2}")
+            if not self._server_ready(cmd1, f"http://{host1}:{port1}", "DUAL OCR .gguf", mmproj=ocr_mmproj):
+                return
+            if not single and not self._server_ready(cmd2, f"http://{host2}:{port2}", "DUAL TR .gguf", second=True):
+                return
 
             self.fs_overlay.ocr_cfg_dual = LLMConfigDual(server=f"http://{host1}:{port1}", model=ocr_model,
-                timeout_s=float(self.spTO.value()), max_tokens=int(self.spMaxTok1.value()), slot_id=int(self.spSlot1.value()),
+                timeout_s=float(self.spTO1.value()), max_tokens=int(self.spMaxTok1.value()), slot_id=0,
                 system_override=(getattr(self,"_ocr_prompt_override","") or None), source_lang=self.fs_overlay.source_lang, mode=llm_cfg.mode,
                 disable_name_split=llm_cfg.disable_name_split)
             self.fs_overlay.tr_cfg_dual = LLMConfigDual(server=f"http://{host2}:{port2}", model=tr_model,
-                timeout_s=float(self.spTO2.value()), max_tokens=int(self.spMaxTok2.value()), slot_id=int(self.spSlot2.value()),
-                temp=float(self.spTemp2.value()), top_p=float(self.spTopP2.value()), system_override=(getattr(self,"_tr_prompt_override","") or None),
+                timeout_s=float(self.spTO2.value()), max_tokens=int(self.spMaxTok1.value()) * TR_MAX_TOKENS_FACTOR, slot_id=0,
+                temp=self._adv(self.spTemp2, BASE_TEMP), top_p=GEN_TOP_P, system_override=(getattr(self,"_tr_prompt_override","") or None),
                 lore_path=llm_cfg.lore_path, phrasebook_path=llm_cfg.phrasebook_path, source_lang=self.fs_overlay.source_lang, mode=llm_cfg.mode,
-                n_ctx=int(self.spCtx2.value()),
+                n_ctx=self._tr_ctx(),
                 disable_name_split=llm_cfg.disable_name_split)
 
         elif mode_idx == 2: # ONLINE
@@ -5254,12 +6276,13 @@ class ConfigWindow(QWidget):
             ocr_model, ocr_mmproj = self.cbModelOCR.currentText().strip(), self.cbMmprojOCR.currentText().strip()
             
             cmd1 = rebuild_server_cmd(SERVER_EXE, ocr_model, ocr_mmproj, host=host1, port=port1,
-                ctx=int(self.spCtx1.value()), batch=int(self.spBatch1.value()), ubatch=int(self.spUB1.value()),
-                parallel=int(self.spPar1.value()), ngl=int(self.spNGL1.value()), cache_type=sel_cache, device=sel_dev)
-            _ensure_llama_server(cmd1, f"http://{host1}:{port1}")
+                ctx=int(self.spCtx1.value()), batch=self._adv(self.spBatch1, BASE_BATCH), ubatch=self._adv(self.spUB1, BASE_UBATCH),
+                parallel=self._ocr_parallel(), ngl=int(self.spNGL1.value()), cache_type=sel_cache, device=sel_dev)
+            if not self._server_ready(cmd1, f"http://{host1}:{port1}", "DUAL OCR .gguf", mmproj=ocr_mmproj):
+                return
 
             self.fs_overlay.ocr_cfg_dual = LLMConfigDual(server=f"http://{host1}:{port1}", model=ocr_model,
-                timeout_s=float(self.spTO.value()), max_tokens=int(self.spMaxTok1.value()), slot_id=int(self.spSlot1.value()),
+                timeout_s=float(self.spTO1.value()), max_tokens=int(self.spMaxTok1.value()), slot_id=0,
                 system_override=(getattr(self,"_ocr_prompt_override","") or None), mode=llm_cfg.mode,
                 disable_name_split=llm_cfg.disable_name_split)
             self.fs_overlay.tr_cfg_dual = None
@@ -5269,12 +6292,14 @@ class ConfigWindow(QWidget):
             self.overlay.close()
 
         # 2. Теперь запускаем полноэкранный режим (он успешно займет хоткеи)
+        self._fs_parallel = 0
         self.fs_overlay.show()
         self.fs_overlay.start_worker()
         
         self.hide()
         try: _save_prefs(self._collect_prefs())
-        except: pass
+        except Exception as e: print("[UI] save on start error:", e)
+        self._announce_start(fullscreen=True)
 
 # ========================= main ==========================
 
