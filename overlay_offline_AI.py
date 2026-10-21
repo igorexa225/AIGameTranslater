@@ -265,7 +265,7 @@ def _save_prefs(d: dict):
 
 # Версия приложения. Держим ОДНОЙ константой: раньше она была зашита в HTML
 # на странице «Информация», и при выпуске о ней забывали.
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 # llama.cpp server — ищем EXE и в models\lmm\llama.cpp, и в models\llm\llama.cpp
 SERVER_CANDIDATES = [
@@ -1010,7 +1010,12 @@ def _filter_boxes_by_llm_text(
                 ratio_name = SequenceMatcher(None, t_c, name_c).ratio()
                 # Умный порог: для коротких имен (Taki) требуем больше совпадений, чтобы не "съедало" слова вроде Thank
                 threshold = 0.6 if len(name_c) >= 6 else 0.75
-                if ratio_name > threshold or (t_c and t_c in name_c and len(t_c) >= 2) or (name_c in t_c and len(name_c) >= 2):
+                # «Имя внутри текста рамки» считается табличкой, только если рамка короткая
+                # ("IIl Leva", "Soppo:"). Когда имя стоит в одной строке с репликой
+                # ("Robella:(Extreme cold confirmed…") или персонаж называет себя сам, рамка —
+                # это реплика: раньше её выбрасывало, и перевод уезжал к остатку строки.
+                name_inside = name_c in t_c and len(name_c) >= 2 and len(t_c) <= len(name_c) * 2 + 4
+                if ratio_name > threshold or (t_c and t_c in name_c and len(t_c) >= 2) or name_inside:
                     is_name_box = True
                 elif _RE_MYSTERY.fullmatch(txt) and _RE_MYSTERY.fullmatch(name_line or ""):
                     is_name_box = True
@@ -1062,10 +1067,19 @@ def _filter_boxes_by_llm_text(
                     matched_chars = len(t_c)
                 else:
                     # Частичное совпадение (порог 0.5)
-                    s = SequenceMatcher(None, t_c, body_c)
+                    s = SequenceMatcher(None, t_c, body_c, autojunk=False)
                     m = s.find_longest_match(0, len(t_c), 0, len(body_c))
                     if m.size > len(t_c) * 0.4:
                         matched_chars = m.size
+                    else:
+                        # Одного длинного куска нет, но рамка может совпадать с репликой по
+                        # частям: EasyOCR читает "!" как "l" ("Mel Mel What about me?l Kalin"),
+                        # и пара таких букв режет совпадение на куски короче 40%. Рамку реплики
+                        # тогда выбрасывало, а перевод уезжал к оставшейся — на середину строки.
+                        # Считаем сумму кусков от трёх букв; у мусора интерфейса она мала.
+                        covered = sum(b.size for b in s.get_matching_blocks() if b.size >= 3)
+                        if covered > len(t_c) * 0.6:
+                            matched_chars = covered
             
             # Более строгая логика для коротких боксов, чтобы отсечь шум типа "I..."
             if total_chars > 0:
@@ -2342,6 +2356,31 @@ class CaptureWorker(QThread):
     def stop(self):
         self._stop = True
 
+    def _drop_ru_nameplate(self, en: str, ru: str) -> str:
+        """Если в оригинале есть отдельная строка с именем, первая строка перевода тоже может
+        быть табличкой с именем — выбрасываем её. Работает и на недописанном переводе."""
+        if not (getattr(self.overlay, "smart_name_removal", True) and getattr(self.overlay, "dual_mode", False)):
+            return ru
+        name_line, _body = safe_split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
+        if not name_line:
+            return ru
+        ru_lines = ru.splitlines()
+        if len(ru_lines) < 2:
+            return ru
+        # убираем ведущие точки/многоточие/пробелы и висящее двоеточие в конце
+        cand = re.sub(r"^[.…\s]+", "", ru_lines[0].strip())
+        cand_core = cand[:-1].strip() if cand.endswith(":") else cand
+        if not cand_core:
+            return ru
+        tokens = cand_core.split()
+        # 1–3 слова, без знаков конца предложения, каждое с заглавной буквы
+        looks_like_ru_label = (
+            1 <= len(tokens) <= 3
+            and not re.search(r"[.,!?;:]", cand_core)
+            and all(t and t[0].isupper() for t in tokens)
+        )
+        return "\n".join(ru_lines[1:]).lstrip("\n") if looks_like_ru_label else ru
+
     def run(self):
         # Поднимаем и прогреваем EasyOCR ДО цикла. Иначе разовая инициализация
         # (~1.5 с) плюс прогрев уезжают внутрь первого detect_text_boxes и
@@ -2748,120 +2787,117 @@ class CaptureWorker(QThread):
                         # Текст ИЗМЕНИЛСЯ (новый диалог) -> Конечно переводим.
                         need_translate = True
 
+                # Куда ставить перевод (рамки текста на кадре). От перевода это не зависит,
+                # поэтому считается функцией: при показе по мере генерации она вызывается
+                # перед первым черновиком, иначе — после перевода, как раньше (чтобы старый
+                # перевод не переезжал на новое место, пока новый ещё не готов).
+                _boxes_applied = [False]
+
+                def _apply_boxes():
+                    if _boxes_applied[0]:
+                        return
+                    _boxes_applied[0] = True
+                    if getattr(self.overlay, "draw_over_original", False) and boxes_with_text:
+                        try:
+                            boxes_px = _filter_boxes_by_llm_text(boxes_with_text, en)
+                            if len(boxes_px) != len(boxes_with_text):
+                                print(
+                                    f"[BOXES-FIX] region {idx}: filtered overlay boxes; "
+                                    f"{len(boxes_with_text)} -> {len(boxes_px)}"
+                                )
+
+                            # Оверлей рисуется по ОБЪЕДИНЕНИЮ боксов, поэтому один
+                            # далёкий выживший бокс утаскивает перевод вверх или вбок.
+                            # Оставляем только те, что входят в блок диалога.
+                            #
+                            # ВАЖНО: блок берём готовый — тот, что выбран выше ПО ТЕКСТУ.
+                            # Пересчитывать его здесь нельзя: после фильтра у боксов
+                            # остаются голые координаты, вес считается по площади, и на
+                            # короткой реплике ("Groza!") куча фоновых глифов перевешивает
+                            # её по площади — перевод уезжал к ним.
+                            _allowed = {(int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                                        for b in (_dialog_block or ())}
+                            if _allowed:
+                                _kept = [b for b in boxes_px
+                                         if (int(b[0]), int(b[1]), int(b[2]), int(b[3])) in _allowed]
+                                if _kept:
+                                    if len(_kept) != len(boxes_px):
+                                        print(f"[BOXES-FIX] region {idx}: вне блока диалога отброшено "
+                                              f"{len(boxes_px) - len(_kept)} боксов")
+                                    boxes_px = _kept
+                            h, w = gray.shape[:2]
+                            if boxes_px:
+                                r.text_boxes = [
+                                    (x / float(w), y / float(h), bw / float(w), bh / float(h))
+                                    for (x, y, bw, bh) in boxes_px
+                                ]
+                                # Запоминаем левый верхний угол блока: отрисовка ставит перевод именно туда
+                                _top = min(boxes_px, key=lambda b: b[1])
+                                r.body_anchor = (min(b[0] for b in boxes_px) / float(w), _top[1] / float(h),
+                                                 _top[2] / float(w), _top[3] / float(h))
+                            elif en:
+                                # Рамок реплики нет, хотя VLM её прочитал: EasyOCR не замечает слишком
+                                # короткий текст ("...", "Haha...") и отдаёт одну табличку с именем,
+                                # которую фильтр справедливо выбрасывает. С пустым списком перевод
+                                # уезжал в угол области без фона. В диалоговом окне реплики начинаются
+                                # в одной точке — ставим перевод туда, где была прошлая.
+                                if r.body_anchor is not None:
+                                    r.text_boxes = [r.body_anchor]
+                                    _where = "на место прошлой реплики"
+                                else:
+                                    # Прошлой реплики ещё не было — ставим под самой верхней рамкой (именем)
+                                    nx, ny, nbw, nbh = min(boxes_with_text, key=lambda b: b[1])[:4]
+                                    r.text_boxes = [(nx / float(w), min(0.9, (ny + 1.6 * nbh) / float(h)),
+                                                     nbw / float(w), nbh / float(h))]
+                                    _where = "под табличкой с именем"
+                                print(f"[BOXES-FIX] region {idx}: рамки реплики нет (EasyOCR её не увидел) "
+                                      f"— ставлю перевод {_where}")
+                            else:
+                                r.text_boxes = []
+                        except Exception as e:
+                            print("[OCR-BOXES] error:", e)
+                            # НЕ обнуляем r.text_boxes, чтобы оверлей не пропадал из-за временной ошибки
+                            # просто оставляем предыдущие боксы
+                            # r.text_boxes = []
+                            pass
+
                 # 3. ВЫЗОВ ПЕРЕВОДЧИКА (Только если need_translate = True)
+                _stream_last = [None]      # последний черновик, показанный на экране
                 if need_translate and (mode_idx == 1 or mode_idx == 2) and en:
                     if mode_idx == 1: # DUAL
-                        ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual)
-                    
+                        _on_partial = None
+                        if getattr(self.overlay, "stream_tr", False):
+                            def _on_partial(part, _idx=idx, _en=en):
+                                # перевод показывается по мере генерации, не дожидаясь конца ответа
+                                part = self._drop_ru_nameplate(_en, part) if part else part
+                                if part != _stream_last[0]:
+                                    _apply_boxes()
+                                    _stream_last[0] = part
+                                    self.textReady.emit(_idx, part)
+                        ru = translate_en_to_ru_text(en, self.overlay.tr_cfg_dual, on_partial=_on_partial)
+
                     elif mode_idx == 2: # ONLINE
                         # --- УЛУЧШЕНИЕ: Отделяем имя, чтобы Гугл его не испортил ---
                         nm, bd = safe_split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
                         text_to_send = bd if bd else en
-                        
+
                         # Переводим только тело диалога
                         ru = online_adapter.translate_text(text_to_send)
-                
-                    
-                if getattr(self.overlay, "draw_over_original", False) and boxes_with_text:
-                    try:
-                        boxes_px = _filter_boxes_by_llm_text(boxes_with_text, en)
-                        if len(boxes_px) != len(boxes_with_text):
-                            print(
-                                f"[BOXES-FIX] region {idx}: filtered overlay boxes; "
-                                f"{len(boxes_with_text)} -> {len(boxes_px)}"
-                            )
 
-                        # Оверлей рисуется по ОБЪЕДИНЕНИЮ боксов, поэтому один
-                        # далёкий выживший бокс утаскивает перевод вверх или вбок.
-                        # Оставляем только те, что входят в блок диалога.
-                        #
-                        # ВАЖНО: блок берём готовый — тот, что выбран выше ПО ТЕКСТУ.
-                        # Пересчитывать его здесь нельзя: после фильтра у боксов
-                        # остаются голые координаты, вес считается по площади, и на
-                        # короткой реплике ("Groza!") куча фоновых глифов перевешивает
-                        # её по площади — перевод уезжал к ним.
-                        _allowed = {(int(b[0]), int(b[1]), int(b[2]), int(b[3]))
-                                    for b in (_dialog_block or ())}
-                        if _allowed:
-                            _kept = [b for b in boxes_px
-                                     if (int(b[0]), int(b[1]), int(b[2]), int(b[3])) in _allowed]
-                            if _kept:
-                                if len(_kept) != len(boxes_px):
-                                    print(f"[BOXES-FIX] region {idx}: вне блока диалога отброшено "
-                                          f"{len(boxes_px) - len(_kept)} боксов")
-                                boxes_px = _kept
-                        h, w = gray.shape[:2]
-                        if boxes_px:
-                            r.text_boxes = [
-                                (x / float(w), y / float(h), bw / float(w), bh / float(h))
-                                for (x, y, bw, bh) in boxes_px
-                            ]
-                            # Запоминаем левый верхний угол блока: отрисовка ставит перевод именно туда
-                            _top = min(boxes_px, key=lambda b: b[1])
-                            r.body_anchor = (min(b[0] for b in boxes_px) / float(w), _top[1] / float(h),
-                                             _top[2] / float(w), _top[3] / float(h))
-                        elif en:
-                            # Рамок реплики нет, хотя VLM её прочитал: EasyOCR не замечает слишком
-                            # короткий текст ("...", "Haha...") и отдаёт одну табличку с именем,
-                            # которую фильтр справедливо выбрасывает. С пустым списком перевод
-                            # уезжал в угол области без фона. В диалоговом окне реплики начинаются
-                            # в одной точке — ставим перевод туда, где была прошлая.
-                            if r.body_anchor is not None:
-                                r.text_boxes = [r.body_anchor]
-                                _where = "на место прошлой реплики"
-                            else:
-                                # Прошлой реплики ещё не было — ставим под самой верхней рамкой (именем)
-                                nx, ny, nbw, nbh = min(boxes_with_text, key=lambda b: b[1])[:4]
-                                r.text_boxes = [(nx / float(w), min(0.9, (ny + 1.6 * nbh) / float(h)),
-                                                 nbw / float(w), nbh / float(h))]
-                                _where = "под табличкой с именем"
-                            print(f"[BOXES-FIX] region {idx}: рамки реплики нет (EasyOCR её не увидел) "
-                                  f"— ставлю перевод {_where}")
-                        else:
-                            r.text_boxes = []
-                    except Exception as e:
-                        print("[OCR-BOXES] error:", e)
-                        # НЕ обнуляем r.text_boxes, чтобы оверлей не пропадал из-за временной ошибки
-                        # просто оставляем предыдущие боксы
-                        # r.text_boxes = []
-                        pass
+                _apply_boxes()
 
                 # --- DUAL: вырезаем строку с именем из RU, если в EN оно есть ---
-                name_line = None
-                if getattr(self.overlay, "smart_name_removal", True) and getattr(self.overlay, "dual_mode", False) and en and ru:
-                    name_line, _body = safe_split_name_and_body(en, getattr(self.overlay, "source_lang", "en"))
+                if en and ru:
+                    ru = self._drop_ru_nameplate(en, ru)
 
-                    # Если в EN вообще есть отдельная строка с именем —
-                    # считаем, что первая строка RU тоже может быть неймплейтом.
-                    if name_line:
-                        ru_lines = ru.splitlines()
-                        if len(ru_lines) >= 2:
-                            raw_first = ru_lines[0].strip()
+                # На экране мог остаться черновик, который отличается от итога (итог прошёл
+                # полную чистку или был забракован) — приводим экран к итогу.
+                if _stream_last[0] is not None and _stream_last[0] != (ru or ""):
+                    self.textReady.emit(idx, ru or "")
+                    if not ru:
+                        r.last_sent_ru_raw = ""
+                        r.last_sent_ru_canon = ""
 
-                            # убираем ведущие точки/многоточие/пробелы
-                            cand = re.sub(r"^[.…\s]+", "", raw_first)
-
-                            # сносим висящий двоеточие в конце
-                            if cand.endswith(":"):
-                                cand_core = cand[:-1].strip()
-                            else:
-                                cand_core = cand
-
-                            if cand_core:
-                                tokens = cand_core.split()
-
-                                # 1–3 слова, без знаков конца предложения,
-                                # каждое слово начинается с заглавной буквы
-                                looks_like_ru_label = (
-                                    1 <= len(tokens) <= 3
-                                    and not re.search(r"[.,!?;:]", cand_core)
-                                    and all(t and t[0].isupper() for t in tokens)
-                                )
-
-                                if looks_like_ru_label:
-                                    # считаем, что это именно строка с именем → выбрасываем её
-                                    ru = "\n".join(ru_lines[1:]).lstrip("\n")
-                
                 if ru:
                     # канонизируем перевод
                     try:
@@ -3034,6 +3070,12 @@ _QT_TO_VK = {
 }
 MOD_SHIFT, MOD_WIN = 0x0004, 0x0008
 
+# Поле сочетания на русской раскладке записывает букву ("Ё", "Й"), а Windows нужна
+# физическая клавиша. Раньше такие сочетания молча пропускались. Сопоставляем по
+# положению на клавиатуре (ЙЦУКЕН над QWERTY).
+_CYR_KEYS = dict(zip("ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ",
+                     "QWERTYUIOP[]ASDFGHJKL;'ZXCVBNM,.`"))
+
 
 def parse_hotkey(seq_text: str):
     """'Alt+-' -> (модификаторы, виртуальный код) либо None, если не разобрали."""
@@ -3062,6 +3104,8 @@ def parse_hotkey(seq_text: str):
     if mods_qt & QT_SHIFT: mods |= MOD_SHIFT
     if mods_qt & QT_META:  mods |= MOD_WIN
 
+    if key < 0x110000 and chr(key) in _CYR_KEYS:
+        key = ord(_CYR_KEYS[chr(key)])                  # русская буква -> клавиша под ней
     if 0x41 <= key <= 0x5A or 0x30 <= key <= 0x39:      # A-Z, 0-9
         vk = key
     elif 0x01000030 <= key <= 0x01000047:               # F1..F24
@@ -3479,23 +3523,32 @@ class Overlay(QWidget):
         try:
             ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11)
         except Exception: pass
-        # Сочетания берём из настроек (вкладка «Кастомизация»), а не из констант:
-        # на коротких клавиатурах может не быть Pause, на других раскладках —
-        # своих занятых клавиш. Умолчания живут в HOTKEY_ACTIONS.
+        self.register_hotkeys()
+        for r in self.regions:
+            if r.panel is None:
+                r.panel = RegionPanel(self); r.panel.show(); r.panel.apply_acrylic()
+            r.panel.set_geometry(r.display_rect); r.panel.sync_text(r.display_text)
+
+    def register_hotkeys(self):
+        """Регистрирует горячие клавиши из HOTKEYS, сначала сняв прежние.
+        Сочетания берём из настроек (вкладка «Кастомизация»), а не из констант: на коротких
+        клавиатурах может не быть Pause. Раньше регистрация шла один раз — при первом показе
+        оверлея, ДО загрузки настроек, — и свои сочетания не работали никогда, а повторная
+        регистрация отказывала: номера были заняты этим же окном."""
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd = int(self.winId())
         for hid, key, label, default in HOTKEY_ACTIONS:
+            u32.UnregisterHotKey(hwnd, hid)
             seq = HOTKEYS.get(key) or default
             parsed = parse_hotkey(seq)
             if not parsed:
                 print(f"[HOTKEY] не разобрал сочетание {seq!r} для «{label}» — пропускаю")
                 continue
             mods, vk = parsed
-            if not ctypes.windll.user32.RegisterHotKey(hwnd, hid, mods, vk):
-                print(f"[HOTKEY] НЕ удалось зарегистрировать {seq} — «{label}» "
-                      f"(занята другим приложением?)")
-        for r in self.regions:
-            if r.panel is None:
-                r.panel = RegionPanel(self); r.panel.show(); r.panel.apply_acrylic()
-            r.panel.set_geometry(r.display_rect); r.panel.sync_text(r.display_text)
+            if not u32.RegisterHotKey(hwnd, hid, mods, vk):
+                err = ctypes.get_last_error()
+                why = "занята другим приложением" if err == 1409 else f"ошибка Windows {err}"
+                print(f"[HOTKEY] НЕ удалось зарегистрировать {seq} — «{label}» ({why})")
 
     def closeEvent(self,e:QEvent):
         hwnd=int(self.winId())
@@ -3647,6 +3700,10 @@ TR_MAX_TOKENS_FACTOR = 2   # лимит ответа переводчика = л
 # Значения, которые действуют, пока не включены «Расширенные настройки»
 BASE_BATCH = 512
 BASE_UBATCH = 256
+# Gemma 4 обрабатывает токены картинки одним куском, и он обязан влезть в ubatch, иначе
+# llama-server падает ("non-causal attention requires n_ubatch >= n_tokens"). Область
+# 1846x693 уже не влезала в 256 — проверено 2026-10-15, с 512 работает.
+MMPROJ_MIN_UBATCH = 512
 BASE_TEMP = 0.2
 # Значения при первом запуске (когда файла настроек ещё нет)
 DEF_CTX_OCR = 10000        # DUAL на одной модели: сервер делит это на два слота, по 5000 на запрос
@@ -3788,6 +3845,11 @@ def rebuild_server_cmd(exe, model, mmproj, *, host, port, ctx, batch, ubatch, pa
         cmd += ["--device", str(device)]
     if mmproj:
         cmd += ["--mmproj", mmproj]
+        if int(ubatch) < MMPROJ_MIN_UBATCH:
+            print(f"[LLM] ubatch {ubatch} -> {MMPROJ_MIN_UBATCH}: серверу с глазами меньше нельзя, "
+                  f"большая картинка его роняет")
+            ubatch = MMPROJ_MIN_UBATCH
+        batch = max(int(batch), int(ubatch))      # batch не может быть меньше ubatch
 
     # === ОПТИМИЗАЦИЯ КЭША (Выбор пользователя) ===
     # q8_0 - стандарт (хорошее сжатие, почти без потерь)
@@ -3903,6 +3965,9 @@ def diagnose_llama_failure(returncode, output: str) -> tuple[str, str]:
     low = (output or "").lower()
     code = (returncode or 0) & 0xFFFFFFFF
 
+    if "non-causal attention requires n_ubatch" in low:
+        return ("Картинка из области захвата оказалась слишком большой для настройки ubatch сервера.",
+                "Уменьшите область захвата или поставьте ubatch побольше (галочка «Расширенные настройки»).")
     if "doesn't contain mtp layers" in low or "failed to create mtp context" in low:
         return ("Модель не поддерживает ускоритель: в ней нет встроенного MTP, а отдельный файл ускорителя не задан.",
                 "Снимите галочку «Ускоритель (драфт / MTP)» в настройках модели и запустите снова.")
@@ -4032,19 +4097,20 @@ def _spawn(cmd_list):
     return proc
 
 
-def _explain_server_exit(proc, tag: str = ""):
-    """Сервер умер, не поднявшись: объясняем почему — в лог и окном."""
+def _explain_server_exit(proc, tag: str = "", during_work: bool = False):
+    """Сервер умер (не поднявшись или посреди перевода): объясняем почему — в лог и окном."""
     pump = getattr(proc, "gt_pump", None)
     if pump is not None:
         pump.join(timeout=2.0)      # дочитать последние строки
     lines = [ln for ln in getattr(proc, "gt_tail", []) if ln.strip()]
     reason, advice = diagnose_llama_failure(proc.returncode, "\n".join(lines))
-    print(f"[LLM]{tag} llama-server не запустился (код {proc.returncode}): {reason} {advice}")
+    what = "упал во время перевода" if during_work else "не запустился"
+    print(f"[LLM]{tag} llama-server {what} (код {proc.returncode}): {reason} {advice}")
     text = (f"{reason}\n\n{advice}\n\n"
             "Последние строки сервера:\n" + "\n".join(ln[:160] for ln in lines[-6:]) +
             f"\n\nПолный вывод: {getattr(proc, 'gt_log', '')}")
     try:
-        QMessageBox.critical(None, "Сервер модели не запустился", text)
+        QMessageBox.critical(None, f"Сервер модели {what}", text)
     except Exception as e:
         print("[LLM] не удалось показать окно с причиной:", e)
 
@@ -4608,6 +4674,7 @@ class ConfigWindow(QWidget):
             ed.setKeySequence(QKeySequence.fromString(HOTKEYS.get(_key, _default),
                                                       QKeySequence.PortableText))
             ed.setMaximumSequenceLength(1)      # одна комбинация, не аккорд
+            ed.editingFinished.connect(self._apply_hotkeys_now)   # новое сочетание действует сразу
             self.hkEdits[_key] = ed
             fhk.addRow(_label + ":", ed)
 
@@ -4670,6 +4737,14 @@ class ConfigWindow(QWidget):
                                  "Выключено: распознаёт одна модель, переводит другая, у каждой свой сервер.")
         self.cbSingle.toggled.connect(self._reflow_mode_ui)
         fgo.addRow(self.cbSingle)
+        self.cbStreamTR = QCheckBox("Показывать перевод сразу, пока он пишется (DUAL)")
+        self.cbStreamTR.setToolTip("Включено: перевод появляется на экране, пока модель его ещё пишет —\n"
+                                   "первые слова видны раньше, особенно на длинных репликах и больших моделях.\n"
+                                   "Изредка строка может поменяться в конце, если модель ошиблась и ответ был переделан.\n"
+                                   "Выключено: перевод показывается целиком, когда готов.")
+        # Это про то, как выглядит вывод, а не про модель, — живёт во вкладке «Кастомизация»,
+        # сразу после «Overlay по боксам». Видна всегда; действует только в DUAL.
+        fk.insertRow(4, self.cbStreamTR)
 
         self.cbAdvanced = QCheckBox("Расширенные настройки")
         self.cbAdvanced.setChecked(False)
@@ -4934,6 +5009,7 @@ class ConfigWindow(QWidget):
         self._rescan_models()
         self._fill_windows()
         self._load_prefs_into_ui()
+        self.overlay.register_hotkeys()     # оверлей уже показан с умолчаниями — ставим свои
         self._reflow_mode_ui()
         self._init_tray()
     
@@ -4943,6 +5019,17 @@ class ConfigWindow(QWidget):
             ed = self.hkEdits.get(key)
             if ed is not None:
                 ed.setKeySequence(QKeySequence.fromString(default, QKeySequence.PortableText))
+
+    def _apply_hotkeys_now(self):
+        """Сочетания из полей -> HOTKEYS -> заново в Windows. Без окна о дублях: оно
+        появится при сохранении настроек (_collect_hotkeys)."""
+        for _hid, key, _label, default in HOTKEY_ACTIONS:
+            ed = self.hkEdits.get(key)
+            if ed is not None:
+                HOTKEYS[key] = ed.keySequence().toString(QKeySequence.PortableText) or default
+        ov = getattr(self, "overlay", None)
+        if ov is not None:
+            ov.register_hotkeys()
 
     def _collect_hotkeys(self) -> dict:
         """Снять сочетания из полей и предупредить о дублях."""
@@ -5312,6 +5399,7 @@ class ConfigWindow(QWidget):
         else:
             _single = True
         self.cbSingle.setChecked(_single)
+        self.cbStreamTR.setChecked(bool(p.get("stream_translation", True)))
         self.spTemp2.setValue(float(p.get("dual_tr_temp",      p.get("temp", 0.2))))
         self._tr_prompt_override = p.get("dual_tr_system_override","")
         # константы
@@ -5469,6 +5557,7 @@ class ConfigWindow(QWidget):
             "render_mode": "instant",
             "advanced_settings": bool(self.cbAdvanced.isChecked()),
             "dual_single_model": bool(self.cbSingle.isChecked()),
+            "stream_translation": bool(self.cbStreamTR.isChecked()),
             "dual_ocr_timeout_s": float(self.spTO1.value()),
             "draw_over_original": bool(self.cbOverlayBoxes.isChecked()),
             "hide_console": bool(self.cbHideConsole.isChecked()),
@@ -5527,7 +5616,35 @@ class ConfigWindow(QWidget):
 
         return prefs
 
+    def _start_server_watch(self):
+        """Пока идёт перевод, раз в 2 с проверяем, живы ли серверы, которые запустила программа.
+        Раньше упавший сервер замечали только по логу: программа молча стучалась в пустоту,
+        а перевод просто переставал появляться."""
+        if getattr(self, "_srv_watch", None) is None:
+            self._srv_watch = QTimer(self)
+            self._srv_watch.timeout.connect(self._check_servers_alive)
+        self._srv_watch.start(2000)
+
+    def _stop_server_watch(self):
+        if getattr(self, "_srv_watch", None) is not None:
+            self._srv_watch.stop()
+
+    def _check_servers_alive(self):
+        for proc, tag in ((_LLAMA_PROC, ""), (_LLAMA_PROC2, "[2]")):
+            if proc is None or proc.poll() is None:
+                continue
+            self._stop_server_watch()
+            # останавливаем перевод и возвращаемся в настройки, потом объясняем причину
+            fs = getattr(self, "fs_overlay", None)
+            if fs is not None and fs.isVisible():
+                fs.quit_app()
+            elif not self.isVisible():
+                self.overlay.quit_to_config()
+            _explain_server_exit(proc, tag, during_work=True)
+            return
+
     def _back_from_overlay(self):
+        self._stop_server_watch()
         try:
             p = _load_prefs()
             p.update(self._collect_prefs())
@@ -5768,6 +5885,7 @@ class ConfigWindow(QWidget):
         except Exception as ex:
             print("[UI] stop_all_llama_servers on close error:", ex)
 
+        self._stop_server_watch()
         if getattr(self, "tray", None) is not None:
             self.tray.hide()
 
@@ -5871,6 +5989,7 @@ class ConfigWindow(QWidget):
         self.overlay.split_border_w = int(self.spBorder.value())
         self.overlay.en_canon_hits = EN_CANON_HITS
         self.overlay.smart_name_removal = bool(self.cbSmartNameRemoval.isChecked())
+        self.overlay.stream_tr = bool(self.cbStreamTR.isChecked())
         self.overlay.draw_over_original = bool(self.cbOverlayBoxes.isChecked())
 
         # применим лор
@@ -6110,8 +6229,10 @@ class ConfigWindow(QWidget):
             _save_prefs(self._collect_prefs())
         except Exception as e:
             print("[UI] save on start error:", e)
+        self.overlay.register_hotkeys()     # сочетания могли поменять в настройках
         self.hide()
         self._announce_start(fullscreen=False)
+        self._start_server_watch()
             
     def closeEvent(self, e):
         self._shutdown()
@@ -6300,6 +6421,7 @@ class ConfigWindow(QWidget):
         try: _save_prefs(self._collect_prefs())
         except Exception as e: print("[UI] save on start error:", e)
         self._announce_start(fullscreen=True)
+        self._start_server_watch()
 
 # ========================= main ==========================
 

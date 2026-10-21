@@ -702,18 +702,20 @@ def _build_tr_system(lore_text: str, phrasebook_text: str, lang_code: str = "en"
         "TRANSLATION GUIDELINES:\n"
         "1. Output ONLY the Russian translation. Do not add notes, comments, or XML tags.\n"
         "2. The 'Dialogue History' is provided ONLY for context. Translate ONLY the final User message.\n"
-        "3. REGISTER: Match the exact intensity of the original text, including slang, humor and profanity.\n"
-        "   - Translation must be neither softer NOR harsher than the source.\n"
-        "   - If the source is explicit (f-word and the like), the Russian must be equally explicit, "
-        "up to and including obscene register (мат). Published localisations habitually tone such "
-        "lines down — do NOT follow that habit.\n"
-        "   - Specifically: do NOT downgrade explicit profanity to mild fillers "
-        "('чёрт', 'блин', 'проклятье', 'дьявол').\n"
-        "   - Never censor, never mask letters with asterisks, never use euphemisms.\n"
-        "   - If the source is mild or neutral, keep it mild — do not add profanity that is not there.\n"
-        "   - KEEP THE CONSTRUCTION: an intensifying adjective + noun (\"you fucking bastard\") must "
-        "stay adjective + noun in Russian, agreeing in gender with the addressee. Do NOT split it "
-        "into two separate insults joined by commas.\n"
+        # Порядок строк важен. Раньше правило начиналось с пяти строк про мат, а «не добавляй
+        # ругань» стояло в конце: на раздражённой, но чистой реплике ("Why're you streaming
+        # with my flip phone?") 31B в половине случаев выдавала «какого хера». Проверено
+        # 2026-10-11: с нейтральным случаем в начале добавленная ругань пропала (0 из 48
+        # против 4 из 48), а матерные реплики переводятся с той же силой.
+        "3. REGISTER: Match the exact intensity of the source — never softer, never harsher.\n"
+        "   - Most lines contain no profanity: translate them WITHOUT profanity, even when the speaker "
+        "is annoyed or angry. Do not add swearing that is not in the source.\n"
+        "   - Only when the source itself contains profanity (fuck, shit and the like), render it with "
+        "equally strong Russian profanity, obscene register (мат) included. Do not censor it, do not "
+        "mask letters, do not replace it with mild fillers ('чёрт', 'блин', 'проклятье').\n"
+        "   - KEEP THE CONSTRUCTION: an intensifying adjective + noun (\"you fucking bastard\") must stay "
+        "adjective + noun in Russian, agreeing in gender with the addressee. Do NOT split it into two "
+        "separate insults joined by commas.\n"
         "4. INCOMPLETE SENTENCES: If a sentence is cut off (e.g., ends with '-' or '...'), translate it exactly as is. Do NOT attempt to finish the thought or predict the next words.\n"
         "5. ALREADY-RUSSIAN FRAGMENTS: If part of the source is already written in Cyrillic "
         "(e.g., \"Блин! Did the suit break down?\"), copy that part CHARACTER FOR CHARACTER into "
@@ -812,6 +814,10 @@ def _split_name_and_body_cjk(text: str) -> tuple[str | None, str]:
     # (он сработает внутри основной функции, так что тут просто возвращаем None)
     return None, text
 
+# служебные слова, которые в длинном имени пишутся со строчной ("Knight of the Round")
+_NAME_CONNECTORS = {"of", "the", "and", "de", "von", "van", "&"}
+
+
 def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, str]:
     """
     Делим сырой OCR-текст на Name и Body.
@@ -885,7 +891,10 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
                 try:
                     cn_sec = _canon_name(sec)
                     with _LORE_DB_LOCK:
-                        if cn_sec in _CHAR_DB: is_sec_known = True
+                        # Табличка с именем — это голое имя. "Commander..." или "Commander!"
+                        # отдельной строкой — уже реплика (обращение), её выбрасывать нельзя.
+                        if cn_sec in _CHAR_DB and not re.search(r"[.…!?,;:~—-]\s*$", sec):
+                            is_sec_known = True
                 except: pass
                 
                 # Если вторая строка тоже похожа на имя (есть в базе ИЛИ короткая/без знаков/с большой буквы)
@@ -907,6 +916,24 @@ def _split_name_and_body(en_text: str, lang: str = "en") -> tuple[str | None, st
             if len(lines) > 1:
                 body_part += "\n" + "\n".join(lines[1:])
             # --------------------------------------------------------------
+            return candidate, body_part
+
+    # А2. Длинное имя до двоеточия ("Iron-Sanded Orphan Member: …", "Mangi Security Team
+    # Leader: …"). В правило А оно не проходит по длине, и дальше эвристика Г отрезала как имя
+    # одно первое слово, а остаток ("Orphan Member: Hey…") уходил в перевод как реплика.
+    # Чтобы не принять за имя обычную фразу с двоеточием ("I told you before: …"), требуем,
+    # чтобы каждое слово было с заглавной буквы и внутри не было знаков препинания.
+    long_match = re.match(r"^([^:]{2,40}):\s+(.*)", full_line)
+    if long_match:
+        candidate = long_match.group(1).strip()
+        cand_words = candidate.split()
+        if (1 <= len(cand_words) <= 5
+                and not re.search(r"[.!?;,]", candidate)
+                and all(w[0].isupper() or w[0].isdigit() or w.lower() in _NAME_CONNECTORS
+                        for w in cand_words)):
+            body_part = long_match.group(2)
+            if len(lines) > 1:
+                body_part += "\n" + "\n".join(lines[1:])
             return candidate, body_part
 
     # Б. Поиск по базе имен + Эвристики
@@ -1245,8 +1272,103 @@ def extract_en_from_image(region_png_b64: str, cfg: LLMConfig) -> str:
         
     return ""
 
-def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
-    """Вызов на сервер перевода: EN -> RU (текст -> текст)."""
+# Сколько символов перевода ждём, прежде чем начать показывать его по мере генерации.
+# За это время в ответе успевает появиться всё, что чистится в начале: эхо служебных тегов,
+# имя говорящего, «Имя: ». Иначе они мелькали бы на экране и тут же исчезали.
+_STREAM_HOLD_CHARS = 24
+
+
+def _looks_like_name_label(label: str, name_line: str | None = None, ru_name: str | None = None) -> bool:
+    """Похоже ли начало ответа «…: » на табличку с именем, которую модель дописала сама.
+    Табличка — это 1–3 слова, каждое с заглавной буквы («Робелла», «Мисс Калина»). Обычное
+    начало фразы с двоеточием («Я же тебе говорила: …») табличкой не считается: раньше оно
+    срезалось вместе с половиной реплики. Если русское имя говорящего известно, ярлык должен
+    быть ещё и похож на него — так «Внимание: …» у известного персонажа остаётся на месте."""
+    tokens = label.split()
+    if not (1 <= len(tokens) <= 3):
+        return False
+    if not all(t[0].isupper() or t[0].isdigit() for t in tokens):
+        return False
+    if ru_name:
+        low = label.strip().lower()
+        return any(SequenceMatcher(None, low, n.strip().lower()).ratio() >= 0.6
+                   for n in (ru_name, name_line) if n)
+    return True
+
+
+def _stream_preview(raw: str, name_line: str | None, ru_name: str | None) -> str:
+    """Что можно показать на экране, пока модель ещё пишет ответ. Делает ту же чистку начала,
+    что и разбор готового ответа ниже, чтобы черновик не отличался от итога. Пустая строка —
+    показывать пока нечего. Проверки ответа целиком (смешанный язык, утечка истории, эхо)
+    здесь невозможны: они сработают в конце, и тогда черновик на экране будет заменён."""
+    s = _RE_SPECIAL_TOKENS.sub("", raw)
+    s = _RE_PROMPT_ECHO_BLOCK.sub("", s)
+    lt = s.rfind("<")
+    if lt != -1 and ">" not in s[lt:]:
+        s = s[:lt]                                   # недописанный тег в конце
+    if re.match(r"\s*<(?:speaker|lore|instructions|context)>", s, re.IGNORECASE):
+        return ""                                    # блок-эхо ещё не закрыт
+    s = _RE_PROMPT_ECHO_TAG.sub("", s).strip()
+    s = _strip_leading_gender_tag(s)
+    m = re.match(r"^.*?(?:перевод|перевести|translation|translate).*?:\s*(.*)", s, re.IGNORECASE | re.DOTALL)
+    if m and m.group(1).strip():
+        s = m.group(1).strip()
+    s = re.sub(r"</?(?:text|translation|ru|output)>", "", s, flags=re.IGNORECASE).strip()
+    if len(s) < _STREAM_HOLD_CHARS:
+        return ""
+    for nm in (ru_name, name_line):
+        if nm:
+            m = re.match(r"^[\s\W]*" + re.escape(nm) + r"[\s:,\.\-\n]+", s, re.IGNORECASE)
+            if m:
+                s = s[m.end():].strip()
+    if name_line and re.fullmatch(r"[?？]+", name_line.strip()):
+        m = re.match(r"^[\s]*[?？]+[\s:,\.\-\n]+", s)
+        if m:
+            s = s[m.end():].strip()
+    if "  >>>  " in s:
+        s = s.split("  >>>  ")[-1].strip()
+    if name_line:
+        m = re.match(r"^[\*\_]*([а-яА-ЯёЁa-zA-Z0-9_\- ]{2,20})[\*\_]*:\s+(.*)", s)
+        if m and _looks_like_name_label(m.group(1), name_line, ru_name):
+            s = m.group(2)
+    if "(затуп)" in s or not re.search(r"[а-яА-ЯёЁ]", s):
+        return ""                                    # русского текста ещё нет — не показываем
+    return s
+
+
+def _read_stream(resp, on_raw, deadline: float) -> tuple[str, dict]:
+    """Читает потоковый ответ llama-server (строки «data: {...}»). На каждый новый кусок
+    вызывает on_raw(весь текст на этот момент). Возвращает (текст целиком, {usage, timings})."""
+    raw, meta = "", {}
+    try:
+        for line in resp.iter_lines():
+            if time.perf_counter() > deadline:
+                raise TimeoutError("ответ не уложился в таймаут")
+            if not line or not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                break
+            ev = json.loads(data.decode("utf-8"))
+            if ev.get("usage"):
+                meta["usage"] = ev["usage"]
+            if ev.get("timings"):
+                meta["timings"] = ev["timings"]
+            choices = ev.get("choices") or []
+            piece = (choices[0].get("delta") or {}).get("content") if choices else None
+            if piece:
+                raw += piece
+                on_raw(raw)
+    finally:
+        resp.close()
+    return raw.strip(), meta
+
+
+def translate_en_to_ru_text(en_text: str, cfg: LLMConfig, on_partial=None) -> str:
+    """Вызов на сервер перевода: EN -> RU (текст -> текст).
+    on_partial — если передан, ответ читается по мере генерации, и в on_partial(текст)
+    уходит уже очищенный черновик перевода. Итог всё равно проходит все проверки ниже
+    и возвращается как обычно; он может отличаться от последнего черновика."""
     if not en_text or not en_text.strip():
         return ""
 
@@ -1423,10 +1545,37 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
     current_seed = int(cfg.seed)
     max_retries = 1 
 
+    # Последний показанный черновик: первый пустой не шлём, чтобы старый перевод не пропадал
+    # с экрана раньше, чем появится новый.
+    _shown = [None]
+
+    def _push(raw: str) -> None:
+        part = _stream_preview(raw, name_line, target_ru_name_for_cleaning)
+        if part != _shown[0] and (part or _shown[0]):
+            _shown[0] = part
+            on_partial(part)
+
+    # Что дописать к запросу при повторе. Раньше повтор отличался только зерном и температурой
+    # (+0.1), и модель отвечала буква в букву так же: «…как Митиль entered the Yellow Zone!»
+    # дважды подряд. Теперь при ошибке языка ей показывают её ответ и говорят, что не так.
+    # Сообщения дописываются в конец, начало запроса не меняется — кэш промпта цел.
+    retry_tail: list = []
+
+    def _ask_again(bad_answer: str, complaint: str) -> None:
+        retry_tail[:] = [
+            {"role": "assistant", "content": bad_answer},
+            {"role": "user", "content": f"{complaint}\nTranslate the same line again, entirely in Russian. "
+                                        f"Output ONLY the translation.\n\n{body}"},
+        ]
+
     for attempt in range(max_retries + 1):
+        if attempt > 0 and on_partial is not None and _shown[0]:
+            # прошлая попытка забракована — убираем её черновик с экрана
+            _shown[0] = ""
+            on_partial("")
         payload = {
             "model": cfg.model,
-            "messages": messages,
+            "messages": messages + retry_tail,
             "temperature": current_temp,
             "top_p": cfg.top_p,
             "top_k": int(cfg.top_k),
@@ -1444,9 +1593,14 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
             "chat_template_kwargs": {"enable_thinking": False},
         }
         
+        streaming = on_partial is not None
+        if streaming:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
         t0 = time.perf_counter()
         try:
-            r = _SESSION.post(url, json=payload, timeout=cfg.timeout_s)
+            r = _SESSION.post(url, json=payload, timeout=cfg.timeout_s, stream=streaming)
         except Exception as e:
             print(f"[DUAL][TR] connection error: {e}")
             return ""
@@ -1455,11 +1609,19 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         if r.status_code != 200:
             print("[DUAL][TR] http", r.status_code, "in", f"{dt:.0f} ms", (r.text or "")[:180])
             return ""
-            
-        js = r.json()
-        out = (js.get("choices", [{}])[0]
-                  .get("message", {})
-                  .get("content") or "").strip()
+
+        if streaming:
+            try:
+                out, js = _read_stream(r, _push, t0 + float(cfg.timeout_s))
+            except Exception as e:
+                print(f"[DUAL][TR] поток ответа оборвался: {e}")
+                return ""
+            dt = (time.perf_counter() - t0) * 1000.0
+        else:
+            js = r.json()
+            out = (js.get("choices", [{}])[0]
+                      .get("message", {})
+                      .get("content") or "").strip()
 
         # --- Замер промпта и попадания в кэш (по факту, а не на глазок) ---
         global _LAST_PROMPT_TOKENS
@@ -1580,6 +1742,7 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         if _normalize_homoglyphs(out.strip()) == _normalize_homoglyphs(en_text.strip()):
              print(f"[DUAL][TR] Output equals Input (homoglyph echo), retrying...")
              if attempt < max_retries:
+                 _ask_again(out, "Your previous answer repeated the source text instead of translating it.")
                  current_temp = min(1.0, current_temp + 0.2) # Делаем модель "креативнее"
                  current_seed += 333
                  continue
@@ -1596,6 +1759,7 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         if has_letters and not has_cyrillic and not re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', out): # И не CJK
             print(f"[DUAL][TR] No Cyrillic chars found (lazy english). Cleaned output was: {repr(out)} -> retrying...")
             if attempt < max_retries:
+                _ask_again(out, "Your previous answer was not in Russian.")
                 current_temp = min(0.9, current_temp + 0.15)
                 current_seed += 444
                 continue
@@ -1608,6 +1772,7 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         if has_cjk and not has_cyrillic:
              print(f"[DUAL][TR] CJK chars detected in output (wrong language), retrying...")
              if attempt < max_retries:
+                 _ask_again(out, "Your previous answer was not in Russian.")
                  current_temp = min(0.9, current_temp + 0.15)
                  current_seed += 888
                  continue
@@ -1635,6 +1800,9 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
              if attempt < max_retries:
                  _bad = _RE_LATIN_LOWER_WORD.findall(out)[:3]
                  print(f"[DUAL][TR] Смешанный язык (英/рус): {_bad or 'три слова подряд'} — ретрай")
+                 _left = ", ".join(_RE_LATIN_LOWER_WORD.findall(out)[:8])
+                 _ask_again(out, "Your previous answer left part of the text in English"
+                                 + (f": {_left}." if _left else "."))
                  current_temp = min(0.7, current_temp + 0.1)
                  current_seed += 999
                  continue
@@ -1642,7 +1810,7 @@ def translate_en_to_ru_text(en_text: str, cfg: LLMConfig) -> str:
         # FIX: Улучшенный анти-эхо фильтр: Фильтр "Самозванца" (резервный)
         # Если модель сама добавила "Имя: " в начало, хотя его не было в EN
         rp_match = re.match(r"^[\*\_]*([а-яА-ЯёЁa-zA-Z0-9_\- ]{2,20})[\*\_]*:\s+(.*)", out)
-        if rp_match:
+        if rp_match and _looks_like_name_label(rp_match.group(1), name_line, target_ru_name_for_cleaning):
             found_label_ru = rp_match.group(1)
             clean_text = rp_match.group(2)
             if name_line:
